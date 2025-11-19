@@ -1,0 +1,16 @@
+# Core dependencies
+numpy==1.24.3
+opencv-python==4.8.1.78
+Pillow==10.2.0
+
+# ONNX for InsightFace (compatible versions)
+protobuf==3.20.1
+onnx==1.12.0
+onnxruntime==1.16.0
+
+# InsightFace for face detection
+insightface==0.7.3
+
+# Modern GUI styling
+customtkinter==5.2.2
+ttkthemes==3.2.2
