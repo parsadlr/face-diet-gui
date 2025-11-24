@@ -1,16 +1,22 @@
 # Core dependencies
-numpy==1.24.3
-opencv-python==4.8.1.78
-Pillow==10.2.0
+numpy<2  # InsightFace requires NumPy 1.x
+opencv-python>=4.8.0
+Pillow>=10.0.0
 
-# ONNX for InsightFace (compatible versions)
-protobuf==3.20.1
-onnx==1.12.0
-onnxruntime==1.16.0
+# ONNX for InsightFace (specific versions required)
+protobuf>=3.20.0
+onnx==1.16.1
+onnxruntime-gpu==1.18.1  # Compatible with CUDA 11.8 and cuDNN 8.x
 
-# InsightFace for face detection
-insightface==0.7.3
+# InsightFace for face detection (install from .whl file)
+# insightface>=0.7.3  # Install manually: pip install whls/insightface-0.7.3-cp312-cp312-win_amd64.whl
 
-# Modern GUI styling
-customtkinter==5.2.2
-ttkthemes==3.2.2
+# DeepFace for attribute analysis
+deepface>=0.0.79
+
+# Scikit-learn for clustering
+scikit-learn>=1.3.0
+
+# Modern GUI styling (for gui.py only)
+customtkinter>=5.2.0
+ttkthemes>=3.2.0

@@ -100,6 +100,8 @@ celerybeat.pid
 .venv
 env/
 venv/
+venv_tf210/
+
 ENV/
 env.bak/
 venv.bak/
@@ -165,3 +167,6 @@ Temporary Items
 *.h5
 *.pb
 
+# Example images and videos
+examples/
+demo/
