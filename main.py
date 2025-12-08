@@ -156,6 +156,12 @@ def parse_arguments():
         help='Disable DeepFace batch processing (use parallel processing instead)'
     )
     
+    parser.add_argument(
+        '--staged',
+        action='store_true',
+        help='Use staged pipeline: Stage 1 (InsightFace) then Stage 2 (DeepFace). Better for large videos and GPU utilization.'
+    )
+    
     return parser.parse_args()
 
 
@@ -244,6 +250,7 @@ def validate_config(args) -> Dict:
         'max_workers': args.max_workers,
         'batch_size': args.batch_size,
         'use_batch': not args.no_batch,
+        'use_staged': args.staged,
     }
     
     return config
@@ -275,6 +282,7 @@ def print_config(config: Dict) -> None:
         print(f"DBSCAN eps:         {config['dbscan_eps']:.2f}")
         print(f"DBSCAN min samples: {config['dbscan_min_samples']}")
     print(f"GPU acceleration:   {'Yes' if config['use_gpu'] else 'No'}")
+    print(f"Pipeline mode:      {'Staged (Stage 1 + Stage 2)' if config.get('use_staged', False) else 'Legacy (interleaved)'}")
     print(f"Parallel workers:   {config.get('max_workers', 4)}")
     if config.get('use_batch', True):
         print(f"Batch processing:   Enabled (batch size: {config.get('batch_size', 8)})")

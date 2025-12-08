@@ -1,6 +1,7 @@
 # Core dependencies
 numpy<2  # InsightFace requires NumPy 1.x
 opencv-python>=4.8.0
+pandas>=2.0.0
 Pillow>=10.0.0
 
 # ONNX for InsightFace (specific versions required)
@@ -16,6 +17,13 @@ deepface>=0.0.79
 
 # Scikit-learn for clustering
 scikit-learn>=1.3.0
+
+# FAISS for efficient similarity search (Stage 3 advanced clustering)
+# Windows (pip): Only faiss-cpu available
+faiss-cpu>=1.7.0
+# Linux (pip): Can use faiss-gpu instead
+# Conda (all platforms): Can use faiss-gpu via conda-forge
+#   conda install -c conda-forge faiss-gpu
 
 # Modern GUI styling (for gui.py only)
 customtkinter>=5.2.0
