@@ -103,7 +103,7 @@ def stage2_extract_attributes(
     print("=" * 80)
     print(f"Output: {output_csv}")
     print(f"Processed faces: {result['processed_faces']}")
-    print("\nNext: Run stage3_combine_sessions.py to assign global face IDs")
+    print("\nNext: Run stage3_graph_clustering.py to assign global face IDs")
     print("=" * 80)
     
     return {
