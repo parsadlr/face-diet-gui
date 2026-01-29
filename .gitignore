@@ -102,6 +102,7 @@ celerybeat.pid
 env/
 venv/
 venv_tf210/
+venv_gui/
 
 ENV/
 env.bak/
