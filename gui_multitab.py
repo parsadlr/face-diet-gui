@@ -2159,18 +2159,28 @@ class ManualReviewTab(ctk.CTkFrame):
         )
         checkbox.pack(side="left", padx=5)
         
-        # Thumbnail container
-        thumbnail_container = ctk.CTkFrame(row_frame, width=100)
+        # Thumbnail container - adjust width based on number of thumbnails
+        thumbnails = info.get('thumbnails', [])
+        if not thumbnails:
+            # Fallback to single thumbnail for backward compatibility
+            thumb = info.get('thumbnail')
+            if thumb:
+                thumbnails = [thumb]
+        
+        # Calculate container width (80px per thumbnail + padding)
+        num_thumbs = len(thumbnails)
+        container_width = max(100, min(500, num_thumbs * 90))
+        thumbnail_container = ctk.CTkFrame(row_frame, width=container_width)
         thumbnail_container.pack(side="left", padx=5)
         
-        # Display thumbnail
-        thumb = info.get('thumbnail')
-        if thumb:
-            thumb_tk = ImageTk.PhotoImage(thumb)
-            thumb_label = ctk.CTkLabel(thumbnail_container, image=thumb_tk, text="")
-            thumb_label.image = thumb_tk
-            thumb_label.pack(side="left", padx=2)
-            thumb_label.bind("<Double-Button-1>", lambda e: self._open_gallery_popup(face_id))
+        # Display thumbnails horizontally
+        for thumb in thumbnails:
+            if thumb:
+                thumb_tk = ImageTk.PhotoImage(thumb)
+                thumb_label = ctk.CTkLabel(thumbnail_container, image=thumb_tk, text="")
+                thumb_label.image = thumb_tk  # Keep reference
+                thumb_label.pack(side="left", padx=2)
+                thumb_label.bind("<Double-Button-1>", lambda e: self._open_gallery_popup(face_id))
         
         # Face ID label
         original_ids = info.get('original_ids', [face_id])
@@ -2256,20 +2266,44 @@ class ManualReviewTab(ctk.CTkFrame):
         counts = {fid: self.face_groups[fid]['count'] for fid in selected_list}
         merged_id = max(counts, key=counts.get)
         
-        # Collect all original IDs
+        # Collect all original IDs and thumbnails
         all_original_ids = []
         total_count = 0
+        all_thumbnails = []
         
         for fid in selected_list:
             original_ids = self.face_groups[fid].get('original_ids', [fid])
             all_original_ids.extend(original_ids)
             total_count += self.face_groups[fid]['count']
+            
+            # Collect thumbnails from all selected IDs
+            thumb = self.face_groups[fid].get('thumbnail')
+            if thumb:
+                all_thumbnails.append(thumb)
+            # Also check for multiple thumbnails if they exist
+            thumbs = self.face_groups[fid].get('thumbnails', [])
+            if thumbs:
+                all_thumbnails.extend(thumbs)
+        
+        # Remove duplicates while preserving order (keep first occurrence)
+        seen = set()
+        unique_thumbnails = []
+        for thumb in all_thumbnails:
+            # Use id() as a simple way to check uniqueness
+            thumb_id = id(thumb)
+            if thumb_id not in seen:
+                seen.add(thumb_id)
+                unique_thumbnails.append(thumb)
+        
+        # Limit to max 6 thumbnails to avoid UI overflow
+        unique_thumbnails = unique_thumbnails[:6]
         
         # Create merged group
         merged_info = {
             'count': total_count,
             'representative': self.face_groups[merged_id]['representative'],
-            'thumbnail': self.face_groups[merged_id]['thumbnail'],
+            'thumbnail': self.face_groups[merged_id]['thumbnail'],  # Keep for backward compatibility
+            'thumbnails': unique_thumbnails,  # List of all thumbnails
             'original_ids': all_original_ids
         }
         
@@ -2339,8 +2373,18 @@ class ManualReviewTab(ctk.CTkFrame):
         if face_id not in self.face_groups:
             return
         
-        # Get all instances of this face ID
-        face_instances = self.df[self.df['face_id'] == face_id]
+        # Check if this is a merged group
+        info = self.face_groups[face_id]
+        original_ids = info.get('original_ids', [face_id])
+        
+        # Get all instances - if merged, get from all original IDs
+        if len(original_ids) > 1:
+            face_instances = self.df[self.df['face_id'].isin(original_ids)]
+            is_merged = True
+        else:
+            face_instances = self.df[self.df['face_id'] == face_id]
+            is_merged = False
+        
         num_instances = len(face_instances)
         
         # Create popup window
@@ -2349,12 +2393,72 @@ class ManualReviewTab(ctk.CTkFrame):
         popup.geometry("900x700")
         popup.grab_set()  # Modal
         
-        # Title
+        # Title - show merged status if applicable
+        if is_merged:
+            title_text = f"Face ID: {face_id} ({num_instances} instances, merged from {len(original_ids)} IDs)"
+        else:
+            title_text = f"Face ID: {face_id} ({num_instances} instances)"
+        
         ctk.CTkLabel(
             popup,
-            text=f"Face ID: {face_id} ({num_instances} instances)",
+            text=title_text,
             font=ctk.CTkFont(size=18, weight="bold")
         ).pack(pady=10)
+        
+        # Pagination parameters
+        batch_size = 100
+        total_pages = (num_instances + batch_size - 1) // batch_size if num_instances > 0 else 1
+        
+        # Store pagination state in popup
+        popup.current_page = 0
+        popup.total_pages = total_pages
+        popup.batch_size = batch_size
+        popup.face_instances = face_instances
+        popup.face_id = face_id
+        popup.num_instances = num_instances
+        
+        # Pagination controls frame
+        pagination_controls_frame = ctk.CTkFrame(popup)
+        pagination_controls_frame.pack(pady=5)
+        
+        # Batch size input
+        batch_size_frame = ctk.CTkFrame(pagination_controls_frame)
+        batch_size_frame.pack(side="left", padx=5)
+        
+        ctk.CTkLabel(
+            batch_size_frame,
+            text="Instances per page:",
+            font=ctk.CTkFont(size=11)
+        ).pack(side="left", padx=5)
+        
+        batch_size_entry = ctk.CTkEntry(
+            batch_size_frame,
+            width=80,
+            font=ctk.CTkFont(size=11)
+        )
+        batch_size_entry.insert(0, str(batch_size))
+        batch_size_entry.pack(side="left", padx=5)
+        
+        # Load button
+        load_btn = ctk.CTkButton(
+            batch_size_frame,
+            text="Load",
+            width=80,
+            height=30,
+            font=ctk.CTkFont(size=12),
+            command=lambda: self._gallery_load_page(popup, gallery_frame, loading_label, 
+                                                   batch_size_entry, load_btn, page_numbers_frame)
+        )
+        load_btn.pack(side="left", padx=5)
+        
+        # Page numbers frame (will be populated dynamically)
+        page_numbers_frame = ctk.CTkFrame(pagination_controls_frame)
+        page_numbers_frame.pack(side="left", padx=10)
+        
+        # Store references in popup for later access
+        popup.batch_size_entry = batch_size_entry
+        popup.load_btn = load_btn
+        popup.page_numbers_frame = page_numbers_frame
         
         # Loading message
         loading_label = ctk.CTkLabel(
@@ -2364,8 +2468,8 @@ class ManualReviewTab(ctk.CTkFrame):
         )
         loading_label.pack(pady=20)
         
-        # Scrollable gallery
-        gallery_frame = ctk.CTkScrollableFrame(popup, width=850, height=550)
+        # Scrollable gallery (responsive width)
+        gallery_frame = ctk.CTkScrollableFrame(popup, height=550)
         gallery_frame.pack(fill="both", expand=True, padx=10, pady=10)
         
         # Close button
@@ -2378,31 +2482,66 @@ class ManualReviewTab(ctk.CTkFrame):
             font=ctk.CTkFont(size=14)
         ).pack(pady=10)
         
-        # Load images in background
-        thread = threading.Thread(
-            target=self._load_gallery_images,
-            args=(face_instances, gallery_frame, loading_label),
-            daemon=True
-        )
-        thread.start()
+        # Initialize page numbers and load first page
+        self._update_gallery_page_numbers(popup, page_numbers_frame, gallery_frame, loading_label, load_btn)
+        self._gallery_load_page(popup, gallery_frame, loading_label, batch_size_entry, load_btn, page_numbers_frame)
     
-    def _load_gallery_images(self, face_instances: pd.DataFrame, gallery_frame, loading_label):
-        """Load all face crops for gallery (in background thread)."""
+    def _calculate_images_per_row(self, gallery_frame):
+        """Calculate number of images per row based on gallery frame width."""
         try:
-            images = []
-            images_per_row = 6
+            # Get gallery frame width
+            gallery_frame.update_idletasks()
+            frame_width = gallery_frame.winfo_width()
             
-            for idx, row in face_instances.iterrows():
+            # If width is 1 (not yet rendered), use default
+            if frame_width <= 1:
+                frame_width = 850  # Default width
+            
+            # Image frame width: 130px + padding (5px each side) = 140px per image
+            image_width = 140
+            images_per_row = max(1, frame_width // image_width)
+            
+            return images_per_row
+        except:
+            return 6  # Default fallback
+    
+    def _load_gallery_images(self, face_instances: pd.DataFrame, gallery_frame, loading_label, 
+                            current_page: int = 0, batch_size: int = 100, total_pages: int = 1,
+                            load_btn=None):
+        """Load face crops for gallery page (in background thread)."""
+        try:
+            # Calculate slice for current page
+            start_idx = current_page * batch_size
+            end_idx = min(start_idx + batch_size, len(face_instances))
+            page_instances = face_instances.iloc[start_idx:end_idx]
+            
+            images = []
+            
+            # Show loading message and update button
+            self.after(0, lambda: loading_label.configure(text=f"Loading page {current_page + 1} of {total_pages}..."))
+            self.after(0, lambda: loading_label.pack(pady=20))
+            if load_btn:
+                self.after(0, lambda: load_btn.configure(text="Loading...", state="disabled"))
+            
+            # Clear existing images
+            self.after(0, lambda: self._clear_gallery_frame(gallery_frame))
+            
+            for idx, row in page_instances.iterrows():
                 crop = self._extract_face_crop(row.to_dict())
                 if crop:
                     # Resize to larger size for gallery
                     crop = crop.resize((120, 120), Image.LANCZOS)
                     images.append(crop)
             
+            # Calculate images per row based on frame width
+            images_per_row = self._calculate_images_per_row(gallery_frame)
+            
             # Update UI with images
             self.after(0, lambda: loading_label.pack_forget())
+            if load_btn:
+                self.after(0, lambda: load_btn.configure(text="Load", state="normal"))
             
-            # Create grid
+            # Create grid with responsive layout
             for idx, img in enumerate(images):
                 row_idx = idx // images_per_row
                 col_idx = idx % images_per_row
@@ -2416,9 +2555,243 @@ class ManualReviewTab(ctk.CTkFrame):
                 img_label = ctk.CTkLabel(img_frame, image=img_tk, text="")
                 img_label.image = img_tk  # Keep reference
                 img_label.pack(padx=5, pady=5)
+            
+            # Store images_per_row and images in gallery_frame for resize handling
+            gallery_frame.images_per_row = images_per_row
+            gallery_frame.images = images  # Keep reference to images
+            gallery_frame.image_tk_objects = []  # Store PhotoImage objects to prevent garbage collection
+            
+            # Store PhotoImage references
+            for img in images:
+                img_tk = ImageTk.PhotoImage(img)
+                gallery_frame.image_tk_objects.append(img_tk)
+            
+            # Bind resize event to regenerate layout
+            def on_resize(event=None):
+                if not hasattr(gallery_frame, 'images') or not gallery_frame.images:
+                    return
+                
+                new_images_per_row = self._calculate_images_per_row(gallery_frame)
+                if new_images_per_row != gallery_frame.images_per_row:
+                    # Regenerate grid layout
+                    self._clear_gallery_frame(gallery_frame)
+                    for idx, img_tk in enumerate(gallery_frame.image_tk_objects):
+                        row_idx = idx // new_images_per_row
+                        col_idx = idx % new_images_per_row
+                        
+                        img_frame = ctk.CTkFrame(gallery_frame, width=130, height=130)
+                        img_frame.grid(row=row_idx, column=col_idx, padx=5, pady=5)
+                        
+                        img_label = ctk.CTkLabel(img_frame, image=img_tk, text="")
+                        img_label.image = img_tk  # Keep reference
+                        img_label.pack(padx=5, pady=5)
+                    
+                    gallery_frame.images_per_row = new_images_per_row
+            
+            # Bind resize event to popup window (only once)
+            popup_window = gallery_frame.winfo_toplevel()
+            if not hasattr(popup_window, '_gallery_resize_bound'):
+                popup_window.bind('<Configure>', on_resize)
+                popup_window._gallery_resize_bound = True
         
         except Exception as e:
             self.after(0, lambda: loading_label.configure(text=f"Error loading images: {e}"))
+            if load_btn:
+                self.after(0, lambda: load_btn.configure(text="Load", state="normal"))
+    
+    def _clear_gallery_frame(self, gallery_frame):
+        """Clear all widgets from gallery frame."""
+        for widget in gallery_frame.winfo_children():
+            widget.destroy()
+    
+    def _gallery_load_page(self, popup, gallery_frame, loading_label, batch_size_entry, load_btn, page_numbers_frame):
+        """Load current page with potentially updated batch size."""
+        try:
+            # Get batch size from entry
+            new_batch_size = int(batch_size_entry.get())
+            if new_batch_size < 1:
+                new_batch_size = 100
+                batch_size_entry.delete(0, "end")
+                batch_size_entry.insert(0, "100")
+            
+            # Recalculate total pages
+            num_instances = len(popup.face_instances)
+            total_pages = (num_instances + new_batch_size - 1) // new_batch_size if num_instances > 0 else 1
+            
+            # Check if batch size changed
+            batch_size_changed = (new_batch_size != popup.batch_size)
+            
+            # Update popup state
+            popup.batch_size = new_batch_size
+            popup.total_pages = total_pages
+            
+            # If batch size changed, reset to page 0; otherwise ensure current page is valid
+            if batch_size_changed:
+                popup.current_page = 0
+            elif popup.current_page >= total_pages:
+                popup.current_page = max(0, total_pages - 1)
+            
+            # Update page numbers
+            self._update_gallery_page_numbers(popup, page_numbers_frame, gallery_frame, loading_label, load_btn)
+            
+            # Load images for current page
+            thread = threading.Thread(
+                target=self._load_gallery_images,
+                args=(popup.face_instances, gallery_frame, loading_label, 
+                      popup.current_page, popup.batch_size, popup.total_pages, load_btn),
+                daemon=True
+            )
+            thread.start()
+            
+        except ValueError:
+            # Invalid batch size, reset to default
+            batch_size_entry.delete(0, "end")
+            batch_size_entry.insert(0, str(popup.batch_size))
+            messagebox.showerror("Invalid Input", "Please enter a valid number for instances per page.")
+    
+    def _gallery_go_to_page(self, popup, page_num, gallery_frame, loading_label, batch_size_entry, load_btn, page_numbers_frame):
+        """Go to a specific page number."""
+        if 0 <= page_num < popup.total_pages:
+            popup.current_page = page_num
+            self._update_gallery_page_numbers(popup, page_numbers_frame, gallery_frame, loading_label, load_btn)
+            self._gallery_load_page(popup, gallery_frame, loading_label, batch_size_entry, load_btn, page_numbers_frame)
+    
+    def _update_gallery_page_numbers(self, popup, page_numbers_frame, gallery_frame, loading_label, load_btn):
+        """Update the clickable page number labels."""
+        # Clear existing page elements
+        for widget in page_numbers_frame.winfo_children():
+            widget.destroy()
+        
+        total_pages = popup.total_pages
+        current_page = popup.current_page
+        
+        if total_pages == 0:
+            return
+        
+        # First page button (<<)
+        first_label = ctk.CTkLabel(
+            page_numbers_frame,
+            text="<<",
+            font=ctk.CTkFont(size=12),
+            cursor="hand2"
+        )
+        first_label.pack(side="left", padx=3)
+        if current_page > 0:
+            first_label.bind("<Button-1>", lambda e: self._gallery_go_to_page(
+                popup, 0, gallery_frame, loading_label, 
+                popup.batch_size_entry, popup.load_btn, page_numbers_frame
+            ))
+            first_label.configure(text_color="#3b8ed0")
+        else:
+            first_label.configure(text_color="gray")
+        
+        # Previous page label (<)
+        prev_label = ctk.CTkLabel(
+            page_numbers_frame,
+            text="<",
+            font=ctk.CTkFont(size=12),
+            cursor="hand2"
+        )
+        prev_label.pack(side="left", padx=3)
+        if current_page > 0:
+            prev_label.bind("<Button-1>", lambda e: self._gallery_go_to_page(
+                popup, current_page - 1, gallery_frame, loading_label, 
+                popup.batch_size_entry, popup.load_btn, page_numbers_frame
+            ))
+            prev_label.configure(text_color="#3b8ed0")
+        else:
+            prev_label.configure(text_color="gray")
+        
+        # Show page numbers (limit to reasonable number to avoid UI overflow)
+        max_visible_pages = 15
+        if total_pages <= max_visible_pages:
+            # Show all pages
+            pages_to_show = list(range(total_pages))
+        else:
+            # Show first few, current area, and last few
+            pages_to_show = []
+            # Always show first page
+            pages_to_show.append(0)
+            
+            # Show pages around current
+            start = max(1, current_page - 2)
+            end = min(total_pages - 1, current_page + 2)
+            for p in range(start, end + 1):
+                if p not in pages_to_show:
+                    pages_to_show.append(p)
+            
+            # Always show last page
+            if total_pages - 1 not in pages_to_show:
+                pages_to_show.append(total_pages - 1)
+            
+            # Add ellipsis if needed
+            if pages_to_show[1] > 1:
+                pages_to_show.insert(1, None)  # None indicates ellipsis
+            if pages_to_show[-2] < total_pages - 2:
+                pages_to_show.insert(-1, None)
+        
+        # Create page number labels
+        for page_num in pages_to_show:
+            if page_num is None:
+                # Ellipsis
+                ctk.CTkLabel(
+                    page_numbers_frame,
+                    text="...",
+                    font=ctk.CTkFont(size=12)
+                ).pack(side="left", padx=2)
+            else:
+                # Page number label (clickable)
+                is_current = (page_num == current_page)
+                page_label = ctk.CTkLabel(
+                    page_numbers_frame,
+                    text=str(page_num + 1),
+                    font=ctk.CTkFont(size=12, weight="bold" if is_current else "normal"),
+                    cursor="hand2"
+                )
+                page_label.pack(side="left", padx=3)
+                
+                if is_current:
+                    page_label.configure(text_color="#3b8ed0")
+                else:
+                    page_label.configure(text_color="#3b8ed0")
+                    page_label.bind("<Button-1>", lambda e, p=page_num: self._gallery_go_to_page(
+                        popup, p, gallery_frame, loading_label, 
+                        popup.batch_size_entry, popup.load_btn, page_numbers_frame
+                    ))
+        
+        # Next page label (>)
+        next_label = ctk.CTkLabel(
+            page_numbers_frame,
+            text=">",
+            font=ctk.CTkFont(size=12),
+            cursor="hand2"
+        )
+        next_label.pack(side="left", padx=3)
+        if current_page < total_pages - 1:
+            next_label.bind("<Button-1>", lambda e: self._gallery_go_to_page(
+                popup, current_page + 1, gallery_frame, loading_label, 
+                popup.batch_size_entry, popup.load_btn, page_numbers_frame
+            ))
+            next_label.configure(text_color="#3b8ed0")
+        else:
+            next_label.configure(text_color="gray")
+        
+        # Last page label (>>)
+        last_label = ctk.CTkLabel(
+            page_numbers_frame,
+            text=">>",
+            font=ctk.CTkFont(size=12),
+            cursor="hand2"
+        )
+        last_label.pack(side="left", padx=3)
+        if current_page < total_pages - 1:
+            last_label.bind("<Button-1>", lambda e: self._gallery_go_to_page(
+                popup, total_pages - 1, gallery_frame, loading_label, 
+                popup.batch_size_entry, popup.load_btn, page_numbers_frame
+            ))
+            last_label.configure(text_color="#3b8ed0")
+        else:
+            last_label.configure(text_color="gray")
     
     def _save_results(self):
         """Save merged results to CSV with merged_face_id column."""
