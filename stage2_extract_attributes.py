@@ -44,9 +44,9 @@ def stage2_extract_attributes(
     
     video_path = str(video_files[0])
     
-    # Input/Output paths
-    input_csv = session_path / "stage1_detections.csv"
-    output_csv = session_path / "stage2_attributes.csv"
+    # Input/Output paths (same file - will be updated with new columns)
+    input_csv = session_path / "face_detections.csv"
+    output_csv = session_path / "face_detections.csv"
     
     if not input_csv.exists():
         raise FileNotFoundError(
@@ -75,7 +75,7 @@ def stage2_extract_attributes(
         df_full = pd.read_csv(input_csv)
         df_limited = df_full.head(limit)
         
-        temp_csv = session_path / "stage1_detections_limited.csv"
+        temp_csv = session_path / "face_detections_limited.csv"
         df_limited.to_csv(temp_csv, index=False)
         
         stage1_csv_to_use = str(temp_csv)
@@ -143,7 +143,7 @@ if __name__ == "__main__":
             limit=args.limit,
         )
     except Exception as e:
-        print(f"\n❌ Error: {e}", file=sys.stderr)
+        print(f"\n[ERROR] Error: {e}", file=sys.stderr)
         import traceback
         traceback.print_exc()
         sys.exit(1)

@@ -65,16 +65,16 @@ def load_all_sessions(participant_dir: str, min_confidence: float = 0.0) -> Tupl
     for session_dir in sorted(participant_path.iterdir()):
         if not session_dir.is_dir():
             continue
-        stage2_csv = session_dir / "stage2_attributes.csv"
-        if stage2_csv.exists():
+        face_csv = session_dir / "face_detections.csv"
+        if face_csv.exists():
             session_csvs.append({
                 'session_name': session_dir.name,
                 'session_dir': session_dir,
-                'csv_path': stage2_csv,
+                'csv_path': face_csv,
             })
     
     if not session_csvs:
-        raise FileNotFoundError("No stage2_attributes.csv files found")
+        raise FileNotFoundError("No face_detections.csv files found")
     
     print(f"Found {len(session_csvs)} sessions")
     
@@ -210,7 +210,7 @@ def build_knn_graph(
         if (i + 1) % 10000 == 0:
             print(f"    [{100*(i+1)//n:3d}%] Processed {i+1:,}/{n:,} faces, {len(edge_sources):,} edges")
     
-    print(f"  ✓ Graph built: {len(edge_sources):,} edges")
+    print(f"  [OK] Graph built: {len(edge_sources):,} edges")
     
     return edge_sources, edge_targets, edge_weights
 
@@ -240,7 +240,7 @@ def detect_communities_leiden(edge_sources, edge_targets, edge_weights, n_nodes)
     communities = partition.membership
     num_communities = len(set(communities))
     
-    print(f"  ✓ Found {num_communities} communities")
+    print(f"  [OK] Found {num_communities} communities")
     print(f"  Modularity: {partition.modularity:.4f}")
     
     return communities
@@ -271,7 +271,7 @@ def detect_communities_louvain(edge_sources, edge_targets, edge_weights, n_nodes
     
     num_communities = len(communities_dict)
     
-    print(f"  ✓ Found {num_communities} communities")
+    print(f"  [OK] Found {num_communities} communities")
     
     return communities
 
@@ -401,7 +401,7 @@ def refine_small_clusters(
     final_cluster_sizes = pd.Series(face_ids).value_counts()
     final_small_clusters = final_cluster_sizes[final_cluster_sizes <= min_cluster_size]
     
-    print(f"  ✓ Reassigned {reassigned_count} faces")
+    print(f"  [OK] Reassigned {reassigned_count} faces")
     print(f"  Small clusters remaining: {len(final_small_clusters)} (was {len(small_clusters)})")
     print(f"  Unique IDs after refinement: {len(final_cluster_sizes)}")
     
@@ -469,7 +469,7 @@ def stage3_graph_clustering(
     
     combined_df, embeddings, metadata = load_all_sessions(participant_dir, min_confidence)
     
-    print(f"\n✓ Loaded {len(combined_df):,} faces from {metadata['num_sessions']} sessions")
+    print(f"\n[OK] Loaded {len(combined_df):,} faces from {metadata['num_sessions']} sessions")
     
     # STEP 2: Build k-NN graph
     print("\n" + "=" * 80)
@@ -555,7 +555,7 @@ def stage3_graph_clustering(
     
     # Save combined CSV
     combined_df.to_csv(output_csv, index=False)
-    print(f"  ✓ Saved: {output_csv}")
+    print(f"  [OK] Saved: {output_csv}")
     
     # Save per-session CSVs
     for session_name in combined_df['session_name'].unique():
@@ -564,7 +564,7 @@ def stage3_graph_clustering(
         if session_dirs:
             session_output = session_dirs[0] / "stage3_global_ids.csv"
             session_df.to_csv(session_output, index=False)
-            print(f"  ✓ {session_name}: {len(session_df):,} faces")
+            print(f"  [OK] {session_name}: {len(session_df):,} faces")
     
     # Get final unique ID count after refinement
     final_num_unique_ids = combined_df['face_id'].nunique()
@@ -615,11 +615,11 @@ def stage3_graph_clustering(
             
             f.write(f"{face_id}: {count} instances across {len(sessions_present)} session(s) ({attended_count} attended)\n")
     
-    print(f"  ✓ Stats saved: {stats_file}")
+    print(f"  [OK] Stats saved: {stats_file}")
     
     # Final summary
     print("\n" + "=" * 80)
-    print("✓ STAGE 3 COMPLETE")
+    print("[OK] STAGE 3 COMPLETE")
     print("=" * 80)
     print(f"Total faces: {len(combined_df):,}")
     print(f"Unique global IDs: {final_num_unique_ids}")
@@ -680,7 +680,7 @@ if __name__ == "__main__":
             reassign_threshold=args.reassign_threshold,
         )
     except Exception as e:
-        print(f"\n❌ Error: {e}", file=sys.stderr)
+        print(f"\n[ERROR] Error: {e}", file=sys.stderr)
         import traceback
         traceback.print_exc()
         sys.exit(1)

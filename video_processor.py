@@ -313,7 +313,7 @@ def process_video_stage2(
                             }
                             chunk_attributes.append(attrs)
                         else:
-                            print(f"      ❌ Warning: Result {idx} in batch is not a dict")
+                            print(f"      [WARNING] Result {idx} in batch is not a dict")
                             chunk_attributes.append({'age': None, 'gender': None, 'race': None, 'emotion': None})
                     
                     # Show progress only every 5 batches or first/last batch
@@ -321,7 +321,7 @@ def process_video_stage2(
                         print(f"      Batch {batch_idx+1}/{num_batches_in_chunk}: Processed {batch_end}/{len(face_crops)} faces in chunk")
                 
                 except Exception as e:
-                    print(f"    ❌ ERROR: Batch {batch_start}-{batch_end} failed: {e}")
+                    print(f"    [ERROR] Batch {batch_start}-{batch_end} failed: {e}")
                     import traceback
                     traceback.print_exc()
                     # Add empty attributes for failed batch
@@ -343,7 +343,7 @@ def process_video_stage2(
         del chunk_df
     
     cap.release()
-    print(f"\n✓ All {len(df)} faces processed with DeepFace")
+    print(f"\n[OK] All {len(df)} faces processed with DeepFace")
     
     # Update dataframe with attributes
     print("\nUpdating CSV with attributes...")
@@ -363,7 +363,7 @@ def process_video_stage2(
     print(f"  Updated {updated_count}/{len(df_sorted)} faces with attributes")
     
     if updated_count < len(df_sorted):
-        print(f"  ⚠️  {len(df_sorted) - updated_count} faces had invalid crops and were skipped")
+        print(f"  [WARNING] {len(df_sorted) - updated_count} faces had invalid crops and were skipped")
     
     # Write output CSV (use df_sorted to maintain all rows)
     if progress_callback:

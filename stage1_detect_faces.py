@@ -26,6 +26,7 @@ def stage1_detect_faces(
     start_time: float = None,
     end_time: float = None,
     use_gpu: bool = False,
+    min_confidence: float = 0.0,
 ):
     """
     Stage 1: Detect faces in a single session.
@@ -42,6 +43,8 @@ def stage1_detect_faces(
         End time in seconds (or duration if start_time is None)
     use_gpu : bool
         Whether to use GPU
+    min_confidence : float
+        Minimum detection confidence (0.0-1.0), filters out low-confidence detections
     """
     session_path = Path(session_dir).resolve()
     
@@ -56,7 +59,7 @@ def stage1_detect_faces(
     eye_tracking_path = session_path / "eye_tracking.tsv"
     if not eye_tracking_path.exists():
         eye_tracking_path = None
-        print("⚠️  No eye_tracking.tsv found. 'attended' flag will be False for all faces.")
+        print("WARNING: No eye_tracking.tsv found. 'attended' flag will be False for all faces.")
     else:
         eye_tracking_path = str(eye_tracking_path)
     
@@ -77,13 +80,13 @@ def stage1_detect_faces(
             if max_start > 0:
                 start_time = random.uniform(0, max_start)
                 end_time = start_time + test_duration
-                print(f"🎲 Randomly selected test window: {start_time:.1f}s - {end_time:.1f}s")
+                print(f"[RANDOM] Randomly selected test window: {start_time:.1f}s - {end_time:.1f}s")
             else:
                 start_time = 0.0
                 end_time = video_duration
     
     # Output path
-    output_csv = str(session_path / "stage1_detections.csv")
+    output_csv = str(session_path / "face_detections.csv")
     
     print("=" * 80)
     print("STAGE 1: FACE DETECTION")
@@ -96,6 +99,7 @@ def stage1_detect_faces(
     if start_time is not None and end_time is not None:
         print(f"Time range: {start_time:.1f}s - {end_time:.1f}s")
     print(f"GPU: {'Enabled' if use_gpu else 'Disabled'}")
+    print(f"Min confidence: {min_confidence}")
     print()
     
     # Initialize detector
@@ -114,7 +118,13 @@ def stage1_detect_faces(
         eye_tracking_path=eye_tracking_path,
     )
     
-    print(f"\n✓ Detected {len(detections)} face instances")
+    print(f"\n[OK] Detected {len(detections)} face instances")
+    
+    # Filter by confidence if threshold > 0
+    if min_confidence > 0.0:
+        detections_before = len(detections)
+        detections = [d for d in detections if d.get('confidence', 0.0) >= min_confidence]
+        print(f"[OK] Filtered by confidence >= {min_confidence}: {detections_before} -> {len(detections)} faces")
     
     # Write CSV
     print(f"Writing to {output_csv}...")
@@ -128,7 +138,10 @@ def stage1_detect_faces(
     
     if eye_tracking_path:
         attended_count = sum(1 for d in detections if d.get('attended', False))
-        print(f"Attended faces: {attended_count} ({100*attended_count/len(detections):.1f}%)")
+        if len(detections) > 0:
+            print(f"Attended faces: {attended_count} ({100*attended_count/len(detections):.1f}%)")
+        else:
+            print(f"Attended faces: {attended_count} (0.0%)")
     
     print("\nNext: Run stage2_extract_attributes.py on this session")
     print("=" * 80)
@@ -175,6 +188,12 @@ if __name__ == "__main__":
         action='store_true',
         help='Use GPU for processing'
     )
+    parser.add_argument(
+        '--min-confidence',
+        type=float,
+        default=0.0,
+        help='Minimum detection confidence (0.0-1.0, default: 0.0)'
+    )
     
     args = parser.parse_args()
     
@@ -190,9 +209,10 @@ if __name__ == "__main__":
             start_time=args.start_time,
             end_time=end_time,
             use_gpu=args.gpu,
+            min_confidence=args.min_confidence,
         )
     except Exception as e:
-        print(f"\n❌ Error: {e}", file=sys.stderr)
+        print(f"\n[ERROR] Error: {e}", file=sys.stderr)
         import traceback
         traceback.print_exc()
         sys.exit(1)
