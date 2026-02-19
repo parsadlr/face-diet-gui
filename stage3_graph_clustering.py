@@ -49,9 +49,19 @@ if not LEIDEN_AVAILABLE and not NETWORKX_AVAILABLE:
     sys.exit(1)
 
 
-def load_all_sessions(participant_dir: str, min_confidence: float = 0.0) -> Tuple[pd.DataFrame, np.ndarray, Dict]:
+def load_all_sessions(participant_dir: str, min_confidence: float = 0.0, reviewer: str = None) -> Tuple[pd.DataFrame, np.ndarray, Dict]:
     """
     Load all session data into one combined dataset.
+    
+    Parameters
+    ----------
+    participant_dir : str
+        Path to participant directory
+    min_confidence : float
+        Minimum confidence threshold
+    reviewer : str, optional
+        Reviewer name to load face instance annotations from.
+        If provided, filters out instances marked as non-face by this reviewer.
     
     Returns
     -------
@@ -77,15 +87,44 @@ def load_all_sessions(participant_dir: str, min_confidence: float = 0.0) -> Tupl
         raise FileNotFoundError("No face_detections.csv files found")
     
     print(f"Found {len(session_csvs)} sessions")
+    if reviewer:
+        print(f"Applying face instance annotations from reviewer: {reviewer}")
     
     # Load all sessions
     all_dfs = []
     all_embeddings = []
+    total_filtered_by_annotations = 0
     
     for session_idx, session in enumerate(session_csvs):
         print(f"  Loading {session['session_name']}...")
         
         df = pd.read_csv(session['csv_path'])
+        original_count = len(df)
+        
+        # Load face instance annotations if reviewer is specified
+        if reviewer:
+            annotation_dir = session['session_dir'] / "annotations"
+            annotation_file = annotation_dir / f"{reviewer}.csv"
+            
+            if annotation_file.exists():
+                try:
+                    ann_df = pd.read_csv(annotation_file)
+                    # Create mapping: instance_index -> is_face
+                    is_face_map = dict(zip(ann_df['instance_index'], ann_df['is_face']))
+                    
+                    # Filter out instances marked as non-face
+                    # Keep instances that are either:
+                    # 1. Not in annotation file (not reviewed = assumed valid)
+                    # 2. Marked as is_face=True
+                    valid_mask = df.index.map(lambda idx: is_face_map.get(idx, True))
+                    df = df[valid_mask].reset_index(drop=True)
+                    
+                    filtered_count = original_count - len(df)
+                    if filtered_count > 0:
+                        print(f"    Filtered {filtered_count} non-face instances based on {reviewer}'s annotations")
+                        total_filtered_by_annotations += filtered_count
+                except Exception as e:
+                    print(f"    Warning: Could not load annotations from {annotation_file}: {e}")
         
         # Parse embeddings
         embeddings = []
@@ -131,7 +170,11 @@ def load_all_sessions(participant_dir: str, min_confidence: float = 0.0) -> Tupl
     metadata = {
         'num_sessions': len(session_csvs),
         'session_names': [s['session_name'] for s in session_csvs],
+        'total_filtered_by_annotations': total_filtered_by_annotations,
     }
+    
+    if total_filtered_by_annotations > 0:
+        print(f"\nTotal instances filtered by annotations: {total_filtered_by_annotations}")
     
     return combined_df, embeddings_array, metadata
 
@@ -420,6 +463,7 @@ def stage3_graph_clustering(
     k_voting: int = 10,
     min_votes: int = 5,
     reassign_threshold: float = None,
+    reviewer: str = None,
 ):
     """
     Stage 3: Graph-based community detection for global face IDs.
@@ -448,6 +492,9 @@ def stage3_graph_clustering(
         Minimum votes needed to reassign a face (default: 5)
     reassign_threshold : float
         Similarity threshold for reassignment (default: similarity_threshold + 0.05)
+    reviewer : str, optional
+        Reviewer name to load face instance annotations from.
+        If provided, filters out instances marked as non-face.
     """
     participant_path = Path(participant_dir).resolve()
     output_csv = participant_path / output_name
@@ -467,7 +514,7 @@ def stage3_graph_clustering(
     print("STEP 1: LOADING DATA")
     print("=" * 80)
     
-    combined_df, embeddings, metadata = load_all_sessions(participant_dir, min_confidence)
+    combined_df, embeddings, metadata = load_all_sessions(participant_dir, min_confidence, reviewer)
     
     print(f"\n[OK] Loaded {len(combined_df):,} faces from {metadata['num_sessions']} sessions")
     
@@ -662,6 +709,8 @@ if __name__ == "__main__":
                         help='Minimum votes needed to reassign a face (default: 5)')
     parser.add_argument('--reassign-threshold', type=float, default=None,
                         help='Similarity threshold for reassignment (default: threshold + 0.05)')
+    parser.add_argument('--reviewer', type=str, default=None,
+                        help='Reviewer name to load face instance annotations from (optional)')
     
     args = parser.parse_args()
     
@@ -678,6 +727,7 @@ if __name__ == "__main__":
             k_voting=args.k_voting,
             min_votes=args.min_votes,
             reassign_threshold=args.reassign_threshold,
+            reviewer=args.reviewer,
         )
     except Exception as e:
         print(f"\n[ERROR] Error: {e}", file=sys.stderr)

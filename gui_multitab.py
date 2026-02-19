@@ -2,9 +2,10 @@
 Face-Diet Multi-Tab GUI
 
 A comprehensive GUI for the entire face processing pipeline:
-- Tab 1: Video Processing (Stages 1 & 2)
-- Tab 2: Face ID Assignment (Stage 3)
-- Tab 3: Manual Review & Merging
+- Tab 1: Face Detection (Stages 1 & 2)
+- Tab 2: Face Instance Review - Manual detection verification
+- Tab 3: Face ID Clustering (Stage 3)
+- Tab 4: Face ID Review - Manual ID merging
 """
 
 import os
@@ -283,7 +284,8 @@ def _run_stage3_via_subprocess(
     min_cluster_size: int,
     k_voting: int,
     min_votes: int,
-    reporter
+    reporter,
+    reviewer: str = None
 ):
     """Run stage3_graph_clustering via subprocess using venv_tf210, streaming output in real-time."""
     import time
@@ -314,6 +316,9 @@ def _run_stage3_via_subprocess(
         cmd.extend(["--min-cluster-size", str(min_cluster_size)])
         cmd.extend(["--k-voting", str(k_voting)])
         cmd.extend(["--min-votes", str(min_votes)])
+    
+    if reviewer:
+        cmd.extend(["--reviewer", reviewer])
     
     # Use Popen to stream output in real-time
     # Set encoding to UTF-8 to handle Unicode characters properly on Windows
@@ -1016,8 +1021,1068 @@ class VideoProcessingTab(ctk.CTkFrame):
             self.is_processing = False
 
 
+class FaceInstanceReviewTab(ctk.CTkFrame):
+    """Tab 2: Face Instance Review - Manual review of detected faces before clustering."""
+    
+    def __init__(self, master, settings_manager: SettingsManager):
+        super().__init__(master)
+        self.settings = settings_manager
+        
+        # Data storage
+        self.session_dir: Optional[Path] = None
+        self.df: Optional[pd.DataFrame] = None
+        self.annotations: Dict = {}  # instance_index -> {'is_face': bool, 'reviewed_at': str}
+        self.current_page = 0
+        self.items_per_page = 100
+        self.selected_instances = set()
+        
+        # Image cache
+        self.image_cache: Dict[int, Image.Image] = {}
+        
+        self._setup_ui()
+        self._load_settings()
+    
+    def _setup_ui(self):
+        """Setup UI components."""
+        # Title
+        ctk.CTkLabel(
+            self,
+            text="Face Instance Review - Manual Detection Verification",
+            font=ctk.CTkFont(size=20, weight="bold")
+        ).pack(pady=(10, 20))
+        
+        # Session selection
+        dir_frame = ctk.CTkFrame(self)
+        dir_frame.pack(fill="x", padx=20, pady=(0, 10))
+        
+        ctk.CTkLabel(
+            dir_frame,
+            text="Session Folder:",
+            font=ctk.CTkFont(size=14, weight="bold")
+        ).pack(side="left", padx=10)
+        
+        self.path_entry = ctk.CTkEntry(
+            dir_frame,
+            placeholder_text="Select session directory...",
+            width=500,
+            state="readonly"
+        )
+        self.path_entry.pack(side="left", padx=10)
+        
+        ctk.CTkButton(
+            dir_frame,
+            text="Browse",
+            command=self._browse_session,
+            width=100,
+            height=35
+        ).pack(side="left", padx=5)
+        
+        # Reviewer name
+        reviewer_frame = ctk.CTkFrame(self)
+        reviewer_frame.pack(fill="x", padx=20, pady=(0, 10))
+        
+        ctk.CTkLabel(
+            reviewer_frame,
+            text="Reviewer Name:",
+            font=ctk.CTkFont(size=13)
+        ).pack(side="left", padx=10)
+        
+        self.reviewer_entry = ctk.CTkEntry(
+            reviewer_frame,
+            placeholder_text="Enter your name...",
+            width=200
+        )
+        self.reviewer_entry.pack(side="left", padx=10)
+        
+        self.load_btn = ctk.CTkButton(
+            reviewer_frame,
+            text="Load Session",
+            command=self._load_session,
+            width=120,
+            height=35,
+            state="disabled"
+        )
+        self.load_btn.pack(side="left", padx=10)
+        
+        # Statistics panel
+        self.stats_frame = ctk.CTkFrame(self)
+        self.stats_frame.pack(fill="x", padx=20, pady=(0, 10))
+        
+        self.stats_label = ctk.CTkLabel(
+            self.stats_frame,
+            text="No session loaded",
+            font=ctk.CTkFont(size=12)
+        )
+        self.stats_label.pack(pady=10)
+        
+        # Control panel
+        self._create_control_panel()
+        
+        # Pagination controls
+        self._create_pagination_controls()
+        
+        # Gallery frame
+        self.gallery_container = ctk.CTkFrame(self)
+        self.gallery_container.pack(fill="both", expand=True, padx=20, pady=(0, 10))
+        
+        self.gallery_frame = ctk.CTkScrollableFrame(self.gallery_container, height=400)
+        self.gallery_frame.pack(fill="both", expand=True, padx=5, pady=5)
+        
+        # Action buttons
+        self._create_action_buttons()
+    
+    def _create_control_panel(self):
+        """Create control panel with filters and settings."""
+        panel = ctk.CTkFrame(self)
+        panel.pack(fill="x", padx=20, pady=(0, 10))
+        
+        # Items per page
+        ctk.CTkLabel(
+            panel,
+            text="Items per page:",
+            font=ctk.CTkFont(size=13)
+        ).pack(side="left", padx=(10, 5))
+        
+        self.items_per_page_var = ctk.IntVar(value=100)
+        self.items_per_page_entry = ctk.CTkEntry(
+            panel,
+            width=80,
+            textvariable=self.items_per_page_var
+        )
+        self.items_per_page_entry.pack(side="left", padx=(0, 5))
+        
+        ctk.CTkButton(
+            panel,
+            text="Load",
+            command=self._on_items_per_page_changed,
+            width=80,
+            height=30
+        ).pack(side="left", padx=(0, 15))
+        
+        # Confidence filter
+        ctk.CTkLabel(
+            panel,
+            text="Min Confidence:",
+            font=ctk.CTkFont(size=13)
+        ).pack(side="left", padx=(10, 5))
+        
+        self.min_confidence_var = ctk.DoubleVar(value=0.0)
+        ctk.CTkEntry(
+            panel,
+            width=80,
+            textvariable=self.min_confidence_var
+        ).pack(side="left", padx=(0, 5))
+        
+        ctk.CTkButton(
+            panel,
+            text="Apply Filter",
+            command=self._apply_filter,
+            width=100,
+            height=30
+        ).pack(side="left", padx=(10, 5))
+    
+    def _create_pagination_controls(self):
+        """Create pagination controls (matching popup gallery style)."""
+        self.pagination_frame = ctk.CTkFrame(self)
+        self.pagination_frame.pack(fill="x", padx=20, pady=(0, 10))
+        
+        # Page info label (showing current range)
+        self.page_info_label = ctk.CTkLabel(
+            self.pagination_frame,
+            text="",
+            font=ctk.CTkFont(size=11),
+            text_color="gray"
+        )
+        self.page_info_label.pack(pady=(5, 5))
+        
+        # Page numbers frame (will be populated dynamically)
+        self.page_numbers_frame = ctk.CTkFrame(self.pagination_frame)
+        self.page_numbers_frame.pack(padx=10, pady=5)
+    
+    def _create_action_buttons(self):
+        """Create action buttons at bottom."""
+        action_frame = ctk.CTkFrame(self)
+        action_frame.pack(fill="x", padx=20, pady=(0, 10))
+        
+        # Selection info
+        self.selection_label = ctk.CTkLabel(
+            action_frame,
+            text="0 instances selected",
+            font=ctk.CTkFont(size=12)
+        )
+        self.selection_label.pack(side="left", padx=10)
+        
+        # Mark as non-face button
+        self.mark_nonface_btn = ctk.CTkButton(
+            action_frame,
+            text="Mark as Non-Face",
+            command=self._mark_as_nonface,
+            width=160,
+            height=40,
+            font=ctk.CTkFont(size=13, weight="bold"),
+            fg_color="#dc3545",
+            hover_color="#c82333",
+            state="disabled"
+        )
+        self.mark_nonface_btn.pack(side="left", padx=5)
+        
+        # Mark as face button (restore mistakenly marked non-faces)
+        self.mark_face_btn = ctk.CTkButton(
+            action_frame,
+            text="Mark as Face",
+            command=self._mark_as_face,
+            width=140,
+            height=40,
+            font=ctk.CTkFont(size=13, weight="bold"),
+            fg_color="#28a745",
+            hover_color="#218838",
+            state="disabled"
+        )
+        self.mark_face_btn.pack(side="left", padx=5)
+        
+        # Clear selection button
+        self.clear_btn = ctk.CTkButton(
+            action_frame,
+            text="Clear Selection",
+            command=self._clear_selection,
+            width=140,
+            height=40,
+            font=ctk.CTkFont(size=13),
+            state="disabled"
+        )
+        self.clear_btn.pack(side="left", padx=5)
+        
+        # Save annotations button
+        self.save_btn = ctk.CTkButton(
+            action_frame,
+            text="Save Annotations",
+            command=self._save_annotations,
+            width=160,
+            height=40,
+            font=ctk.CTkFont(size=13, weight="bold"),
+            fg_color="#007bff",
+            hover_color="#0056b3",
+            state="disabled"
+        )
+        self.save_btn.pack(side="left", padx=5)
+    
+    def _browse_session(self):
+        """Browse for session directory."""
+        folder = filedialog.askdirectory(title="Select Session Directory")
+        if not folder:
+            return
+        
+        self.session_dir = Path(folder)
+        self.path_entry.configure(state="normal")
+        self.path_entry.delete(0, "end")
+        self.path_entry.insert(0, str(self.session_dir))
+        self.path_entry.configure(state="readonly")
+        
+        # Enable load button if reviewer name is set
+        if self.reviewer_entry.get().strip():
+            self.load_btn.configure(state="normal")
+        
+        # Save to settings
+        self.settings.set("last_session_dir_review", str(self.session_dir))
+        self.settings.save_settings()
+    
+    def _load_session(self):
+        """Load face detections from session."""
+        if not self.session_dir:
+            messagebox.showerror("Error", "Please select a session directory first.")
+            return
+        
+        reviewer_name = self.reviewer_entry.get().strip()
+        if not reviewer_name:
+            messagebox.showerror("Error", "Please enter your reviewer name.")
+            return
+        
+        # Sanitize reviewer name for filesystem
+        reviewer_name = self._sanitize_reviewer_name(reviewer_name)
+        self.reviewer_name = reviewer_name
+        
+        # Save reviewer name to settings
+        self.settings.set("reviewer_name", reviewer_name)
+        self.settings.save_settings()
+        
+        # Load data in background thread
+        thread = threading.Thread(target=self._load_data_thread, daemon=True)
+        thread.start()
+    
+    def _sanitize_reviewer_name(self, name: str) -> str:
+        """Sanitize reviewer name for use in filenames."""
+        import re
+        # Replace spaces and special chars with underscores
+        sanitized = re.sub(r'[^\w\-]', '_', name)
+        return sanitized.lower()
+    
+    def _load_data_thread(self):
+        """Load face detections in background thread."""
+        try:
+            csv_path = self.session_dir / "face_detections.csv"
+            
+            if not csv_path.exists():
+                self.after(0, lambda: messagebox.showerror(
+                    "Error",
+                    f"Could not find face_detections.csv in:\n{self.session_dir}"
+                ))
+                return
+            
+            # Load CSV
+            self.df = pd.read_csv(csv_path)
+            
+            # Load existing annotations if they exist
+            self._load_existing_annotations()
+            
+            # Sort by confidence (lowest first)
+            if 'confidence' in self.df.columns:
+                self.df = self.df.sort_values('confidence', ascending=True).reset_index(drop=True)
+            
+            # Initialize annotations for all instances (default: is_face=True)
+            for idx in self.df.index:
+                if idx not in self.annotations:
+                    self.annotations[idx] = {'is_face': True, 'reviewed_at': None}
+            
+            # Update UI
+            self.after(0, self._update_stats)
+            self.after(0, self._display_gallery)
+            self.after(0, lambda: self.save_btn.configure(state="normal"))
+            
+        except Exception as e:
+            import traceback
+            error_details = traceback.format_exc()
+            print(f"\n[ERROR] Error loading session data:")
+            print(error_details)
+            
+            self.after(0, lambda: messagebox.showerror(
+                "Error",
+                f"Failed to load session data:\n{str(e)}\n\nCheck terminal for details."
+            ))
+    
+    def _load_existing_annotations(self):
+        """Load existing annotation file if it exists."""
+        annotation_dir = self.session_dir / "annotations"
+        annotation_file = annotation_dir / f"{self.reviewer_name}.csv"
+        
+        if annotation_file.exists():
+            try:
+                ann_df = pd.read_csv(annotation_file)
+                for _, row in ann_df.iterrows():
+                    idx = int(row['instance_index'])
+                    self.annotations[idx] = {
+                        'is_face': bool(row['is_face']),
+                        'reviewed_at': str(row['reviewed_at'])
+                    }
+                print(f"Loaded existing annotations from {annotation_file}")
+            except Exception as e:
+                print(f"Warning: Could not load annotations: {e}")
+    
+    def _load_settings(self):
+        """Load settings into UI."""
+        last_session = self.settings.get("last_session_dir_review", "")
+        if last_session and Path(last_session).exists():
+            self.session_dir = Path(last_session)
+            self.path_entry.configure(state="normal")
+            self.path_entry.delete(0, "end")
+            self.path_entry.insert(0, last_session)
+            self.path_entry.configure(state="readonly")
+        
+        reviewer_name = self.settings.get("reviewer_name", "")
+        if reviewer_name:
+            self.reviewer_entry.delete(0, "end")
+            self.reviewer_entry.insert(0, reviewer_name)
+        
+        if self.session_dir and reviewer_name:
+            self.load_btn.configure(state="normal")
+    
+    def _update_stats(self):
+        """Update statistics display."""
+        if self.df is None:
+            return
+        
+        total = len(self.df)
+        marked_nonface = sum(1 for ann in self.annotations.values() if not ann['is_face'])
+        valid_faces = total - marked_nonface
+        
+        stats_text = (
+            f"Total Instances: {total} | "
+            f"Valid Faces: {valid_faces} | "
+            f"Non-Face: {marked_nonface}"
+        )
+        
+        self.stats_label.configure(text=stats_text)
+    
+    def _on_items_per_page_changed(self):
+        """Handle items per page change."""
+        try:
+            new_value = int(self.items_per_page_var.get())
+            if new_value < 1:
+                new_value = 100
+                self.items_per_page_var.set(100)
+            
+            batch_changed = (new_value != self.items_per_page)
+            self.items_per_page = new_value
+            
+            # Reset to page 0 if batch size changed
+            if batch_changed:
+                self.current_page = 0
+            
+            self._display_gallery()
+        except ValueError:
+            self.items_per_page_var.set(self.items_per_page)
+            messagebox.showerror("Invalid Input", "Please enter a valid number for items per page.")
+    
+    def _apply_filter(self):
+        """Apply confidence filter and reload gallery."""
+        if self.df is None:
+            return
+        
+        self.current_page = 0
+        self._display_gallery()
+    
+    def _display_gallery(self):
+        """Display current page of face instances."""
+        if self.df is None:
+            return
+        
+        # Apply confidence filter
+        min_conf = float(self.min_confidence_var.get())
+        if 'confidence' in self.df.columns and min_conf > 0.0:
+            df_filtered = self.df[self.df['confidence'] >= min_conf].copy()
+        else:
+            df_filtered = self.df.copy()
+        
+        # Calculate pagination
+        total_items = len(df_filtered)
+        total_pages = max(1, (total_items + self.items_per_page - 1) // self.items_per_page)
+        
+        # Ensure current page is valid
+        if self.current_page >= total_pages:
+            self.current_page = max(0, total_pages - 1)
+        
+        # Get page slice
+        start_idx = self.current_page * self.items_per_page
+        end_idx = min(start_idx + self.items_per_page, total_items)
+        page_df = df_filtered.iloc[start_idx:end_idx]
+        
+        # Store for page navigation
+        self.current_df_filtered = df_filtered
+        self.current_total_pages = total_pages
+        
+        # Update page info label
+        self.page_info_label.configure(
+            text=f"Showing {start_idx + 1}-{end_idx} of {total_items} instances | Page {self.current_page + 1} of {total_pages}"
+        )
+        
+        # Update page numbers
+        self._update_page_numbers(total_pages)
+        
+        # Load images in background thread
+        thread = threading.Thread(
+            target=self._load_gallery_images_thread,
+            args=(page_df,),
+            daemon=True
+        )
+        thread.start()
+    
+    def _load_gallery_images_thread(self, page_df: pd.DataFrame):
+        """Load and display gallery images in background thread."""
+        # Show loading message in stats label (not in gallery frame)
+        self.after(0, lambda: self.stats_label.configure(text="Loading images..."))
+        
+        try:
+            # Load all images first
+            images_data = []
+            for idx, row in page_df.iterrows():
+                crop = self._extract_face_crop(row.to_dict())
+                if crop:
+                    self.image_cache[idx] = crop
+                    images_data.append((idx, row, crop))
+            
+            # Create gallery UI in main thread (will clear first)
+            self.after(0, lambda: self._create_gallery_grid(images_data))
+            
+            # Restore stats
+            self.after(0, lambda: self._update_stats())
+            
+        except Exception as e:
+            print(f"Error loading gallery images: {e}")
+            import traceback
+            traceback.print_exc()
+            self.after(0, lambda: messagebox.showerror(
+                "Error",
+                f"Failed to load gallery images:\n{str(e)}"
+            ))
+    
+    def _clear_gallery(self):
+        """Clear all gallery items."""
+        for widget in self.gallery_frame.winfo_children():
+            widget.destroy()
+    
+    def _calculate_images_per_row(self):
+        """Calculate number of images per row based on gallery frame width."""
+        try:
+            # Get gallery frame width
+            self.gallery_frame.update_idletasks()
+            frame_width = self.gallery_frame.winfo_width()
+            
+            # If width is 1 (not yet rendered), use default
+            if frame_width <= 1:
+                frame_width = 850  # Default width
+            
+            # Image frame width: 130px + padding (5px each side) = 140px per image
+            image_width = 140
+            images_per_row = max(1, frame_width // image_width)
+            
+            return images_per_row
+        except:
+            return 6  # Default fallback
+    
+    def _create_gallery_grid(self, images_data: List):
+        """Create gallery grid layout matching popup gallery style."""
+        # Ensure gallery is completely clear (no pack widgets left)
+        self._clear_gallery()
+        
+        images_per_row = self._calculate_images_per_row()
+        
+        # Store images for resize handling
+        self.gallery_frame.images_data = images_data
+        self.gallery_frame.images_per_row = images_per_row
+        
+        for i, (instance_idx, row_data, image) in enumerate(images_data):
+            row_idx = i // images_per_row
+            col_idx = i % images_per_row
+            
+            # Create container frame (same size as image)
+            img_container = ctk.CTkFrame(self.gallery_frame, width=130, height=155)
+            img_container.grid(row=row_idx, column=col_idx, padx=5, pady=5)
+            img_container.grid_propagate(False)
+            
+            # Resize image
+            img_resized = image.resize((120, 120), Image.LANCZOS)
+            img_tk = ImageTk.PhotoImage(img_resized)
+            
+            # Image label as background
+            img_label = ctk.CTkLabel(img_container, image=img_tk, text="")
+            img_label.image = img_tk  # Keep reference
+            img_label.place(x=5, y=5, relwidth=0.92, relheight=0.77)
+            
+            # Checkbox overlay (top-left corner)
+            checkbox_var = ctk.BooleanVar(value=instance_idx in self.selected_instances)
+            checkbox = ctk.CTkCheckBox(
+                img_container,
+                text="",
+                variable=checkbox_var,
+                width=20,
+                command=lambda idx=instance_idx, var=checkbox_var: self._on_checkbox_toggle(idx, var),
+                checkbox_width=18,
+                checkbox_height=18,
+                fg_color="#3b8ed0",
+                hover_color="#2a6fa5"
+            )
+            checkbox.place(x=10, y=10)
+            
+            # Make entire image clickable to toggle selection
+            def toggle_on_click(event, idx=instance_idx, var=checkbox_var):
+                var.set(not var.get())
+                self._on_checkbox_toggle(idx, var)
+            
+            img_label.bind("<Button-1>", toggle_on_click)
+            img_container.configure(cursor="hand2")
+            img_label.configure(cursor="hand2")
+            
+            # Info frame at bottom (confidence + index) - use pack instead of place for labels
+            info_frame = ctk.CTkFrame(img_container, fg_color="transparent")
+            info_frame.place(x=5, y=128, relwidth=0.92)
+            
+            # Confidence label
+            confidence = row_data.get('confidence', 0.0)
+            conf_text = f"{confidence:.3f}"
+            conf_label = ctk.CTkLabel(
+                info_frame,
+                text=conf_text,
+                font=ctk.CTkFont(size=10),
+                text_color="#ffa500" if confidence < 0.9 else "#90ee90"
+            )
+            conf_label.pack(side="left")
+            
+            # Instance index label
+            idx_label = ctk.CTkLabel(
+                info_frame,
+                text=f"#{instance_idx}",
+                font=ctk.CTkFont(size=9),
+                text_color="gray"
+            )
+            idx_label.pack(side="right")
+            
+            # Show non-face marker if marked (overlay in center)
+            if not self.annotations.get(instance_idx, {}).get('is_face', True):
+                nonface_label = ctk.CTkLabel(
+                    img_container,
+                    text="NON-FACE",
+                    font=ctk.CTkFont(size=10, weight="bold"),
+                    text_color="red",
+                    fg_color="black"
+                )
+                nonface_label.place(relx=0.5, rely=0.4, anchor="center")
+        
+        # Configure grid to enable proper scrolling
+        for col in range(images_per_row):
+            self.gallery_frame.grid_columnconfigure(col, weight=1, minsize=140)
+        
+        # Calculate total rows needed
+        total_rows = (len(images_data) + images_per_row - 1) // images_per_row
+        for row in range(total_rows):
+            self.gallery_frame.grid_rowconfigure(row, weight=0, minsize=160)
+        
+        # Force update of the scrollable frame's internal canvas
+        self.gallery_frame.update_idletasks()
+        
+        # Bind resize event to regenerate layout (only once)
+        if not hasattr(self, '_resize_bound'):
+            self.gallery_frame.bind('<Configure>', self._on_gallery_resize)
+            self._resize_bound = True
+    
+    def _on_gallery_resize(self, event=None):
+        """Handle gallery frame resize to adjust layout."""
+        if not hasattr(self.gallery_frame, 'images_data') or not self.gallery_frame.images_data:
+            return
+        
+        new_images_per_row = self._calculate_images_per_row()
+        
+        # Only regenerate if images per row changed
+        if new_images_per_row != self.gallery_frame.images_per_row:
+            self.gallery_frame.images_per_row = new_images_per_row
+            
+            # Regenerate grid layout with new column count
+            self._clear_gallery()
+            
+            for i, (instance_idx, row_data, image) in enumerate(self.gallery_frame.images_data):
+                row_idx = i // new_images_per_row
+                col_idx = i % new_images_per_row
+                
+                # Create container frame
+                img_container = ctk.CTkFrame(self.gallery_frame, width=130, height=155)
+                img_container.grid(row=row_idx, column=col_idx, padx=5, pady=5)
+                img_container.grid_propagate(False)
+                
+                # Resize image
+                img_resized = image.resize((120, 120), Image.LANCZOS)
+                img_tk = ImageTk.PhotoImage(img_resized)
+                
+                # Image label
+                img_label = ctk.CTkLabel(img_container, image=img_tk, text="")
+                img_label.image = img_tk
+                img_label.place(x=5, y=5, relwidth=0.92, relheight=0.77)
+                
+                # Checkbox
+                checkbox_var = ctk.BooleanVar(value=instance_idx in self.selected_instances)
+                checkbox = ctk.CTkCheckBox(
+                    img_container,
+                    text="",
+                    variable=checkbox_var,
+                    width=20,
+                    command=lambda idx=instance_idx, var=checkbox_var: self._on_checkbox_toggle(idx, var),
+                    checkbox_width=18,
+                    checkbox_height=18,
+                    fg_color="#3b8ed0",
+                    hover_color="#2a6fa5"
+                )
+                checkbox.place(x=10, y=10)
+                
+                # Make clickable
+                def toggle_on_click(event, idx=instance_idx, var=checkbox_var):
+                    var.set(not var.get())
+                    self._on_checkbox_toggle(idx, var)
+                
+                img_label.bind("<Button-1>", toggle_on_click)
+                img_container.configure(cursor="hand2")
+                img_label.configure(cursor="hand2")
+                
+                # Info at bottom
+                info_frame = ctk.CTkFrame(img_container, fg_color="transparent")
+                info_frame.place(x=5, y=128, relwidth=0.92)
+                
+                confidence = row_data.get('confidence', 0.0)
+                ctk.CTkLabel(
+                    info_frame,
+                    text=f"{confidence:.3f}",
+                    font=ctk.CTkFont(size=10),
+                    text_color="#ffa500" if confidence < 0.9 else "#90ee90"
+                ).pack(side="left")
+                
+                ctk.CTkLabel(
+                    info_frame,
+                    text=f"#{instance_idx}",
+                    font=ctk.CTkFont(size=9),
+                    text_color="gray"
+                ).pack(side="right")
+                
+                # Non-face marker
+                if not self.annotations.get(instance_idx, {}).get('is_face', True):
+                    ctk.CTkLabel(
+                        img_container,
+                        text="NON-FACE",
+                        font=ctk.CTkFont(size=10, weight="bold"),
+                        text_color="red",
+                        fg_color="black"
+                    ).place(relx=0.5, rely=0.4, anchor="center")
+            
+            # Configure grid columns and rows
+            for col in range(new_images_per_row):
+                self.gallery_frame.grid_columnconfigure(col, weight=1, minsize=140)
+            
+            total_rows = (len(self.gallery_frame.images_data) + new_images_per_row - 1) // new_images_per_row
+            for row in range(total_rows):
+                self.gallery_frame.grid_rowconfigure(row, weight=0, minsize=160)
+            
+            # Force update scrollable region
+            self.gallery_frame.update_idletasks()
+    
+    def _extract_face_crop(self, face_info: dict) -> Optional[Image.Image]:
+        """Extract face crop from video frame."""
+        try:
+            frame_number = int(face_info['frame_number'])
+            x, y, w, h = int(face_info['x']), int(face_info['y']), int(face_info['w']), int(face_info['h'])
+            
+            # Find video file
+            video_files = list(self.session_dir.glob("scenevideo.*"))
+            if not video_files:
+                return self._create_placeholder_image()
+            
+            video_path = video_files[0]
+            
+            # Open video and extract frame
+            cap = cv2.VideoCapture(str(video_path))
+            if not cap.isOpened():
+                return self._create_placeholder_image()
+            
+            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_number)
+            ret, frame = cap.read()
+            cap.release()
+            
+            if not ret:
+                return self._create_placeholder_image()
+            
+            # Get frame dimensions
+            h_img, w_img = frame.shape[:2]
+            
+            # Add padding
+            pad = int(max(w, h) * 0.1)
+            x1 = max(0, x - pad)
+            y1 = max(0, y - pad)
+            x2 = min(w_img, x + w + pad)
+            y2 = min(h_img, y + h + pad)
+            
+            if x2 <= x1 or y2 <= y1:
+                return self._create_placeholder_image()
+            
+            face_crop = frame[y1:y2, x1:x2]
+            
+            if face_crop.size == 0:
+                return self._create_placeholder_image()
+            
+            # Convert to RGB
+            face_crop_rgb = cv2.cvtColor(face_crop, cv2.COLOR_BGR2RGB)
+            
+            return Image.fromarray(face_crop_rgb)
+            
+        except Exception as e:
+            print(f"Error extracting face crop: {e}")
+            return self._create_placeholder_image()
+    
+    def _create_placeholder_image(self) -> Image.Image:
+        """Create a placeholder image."""
+        img = Image.new('RGB', (120, 120), color=(100, 100, 100))
+        return img
+    
+    def _on_checkbox_toggle(self, instance_idx: int, checkbox_var: ctk.BooleanVar):
+        """Handle checkbox toggle."""
+        if checkbox_var.get():
+            self.selected_instances.add(instance_idx)
+        else:
+            self.selected_instances.discard(instance_idx)
+        
+        self._update_selection_label()
+    
+    def _update_selection_label(self):
+        """Update selection count label."""
+        count = len(self.selected_instances)
+        if count == 0:
+            text = "0 instances selected"
+        elif count == 1:
+            text = "1 instance selected"
+        else:
+            text = f"{count} instances selected"
+        
+        self.selection_label.configure(text=text)
+        
+        # Enable/disable buttons based on selection
+        if count > 0:
+            self.mark_nonface_btn.configure(state="normal")
+            self.mark_face_btn.configure(state="normal")
+            self.clear_btn.configure(state="normal")
+        else:
+            self.mark_nonface_btn.configure(state="disabled")
+            self.mark_face_btn.configure(state="disabled")
+            self.clear_btn.configure(state="disabled")
+    
+    def _mark_as_nonface(self):
+        """Mark selected instances as non-face."""
+        if not self.selected_instances:
+            return
+        
+        # Confirm action
+        count = len(self.selected_instances)
+        response = messagebox.askyesno(
+            "Confirm",
+            f"Mark {count} instance(s) as non-face?\n\n"
+            "These instances will be excluded from clustering."
+        )
+        
+        if not response:
+            return
+        
+        # Mark as non-face
+        from datetime import datetime
+        timestamp = datetime.now().isoformat()
+        
+        for idx in self.selected_instances:
+            self.annotations[idx] = {
+                'is_face': False,
+                'reviewed_at': timestamp
+            }
+        
+        # Clear selection
+        self.selected_instances.clear()
+        
+        # Refresh display
+        self._update_stats()
+        self._display_gallery()
+        
+        messagebox.showinfo("Success", f"Marked {count} instance(s) as non-face.")
+    
+    def _mark_as_face(self):
+        """Restore selected instances as valid faces."""
+        if not self.selected_instances:
+            return
+        
+        # Confirm action
+        count = len(self.selected_instances)
+        response = messagebox.askyesno(
+            "Confirm",
+            f"Mark {count} instance(s) as valid face(s)?\n\n"
+            "These instances will be included in clustering."
+        )
+        
+        if not response:
+            return
+        
+        # Mark as face
+        from datetime import datetime
+        timestamp = datetime.now().isoformat()
+        
+        for idx in self.selected_instances:
+            self.annotations[idx] = {
+                'is_face': True,
+                'reviewed_at': timestamp
+            }
+        
+        # Clear selection
+        self.selected_instances.clear()
+        
+        # Refresh display
+        self._update_stats()
+        self._display_gallery()
+        
+        messagebox.showinfo("Success", f"Marked {count} instance(s) as valid face(s).")
+    
+    def _clear_selection(self):
+        """Clear all selections."""
+        self.selected_instances.clear()
+        self._update_selection_label()
+        self._display_gallery()
+    
+    def _save_annotations(self):
+        """Save annotations to CSV file."""
+        if self.df is None:
+            return
+        
+        try:
+            # Create annotations directory
+            annotation_dir = self.session_dir / "annotations"
+            annotation_dir.mkdir(exist_ok=True)
+            
+            # Build annotation dataframe
+            annotation_records = []
+            for idx in self.df.index:
+                row = self.df.loc[idx]
+                ann = self.annotations.get(idx, {'is_face': True, 'reviewed_at': None})
+                
+                annotation_records.append({
+                    'instance_index': idx,
+                    'frame_number': row['frame_number'],
+                    'is_face': ann['is_face'],
+                    'reviewed_at': ann['reviewed_at'] if ann['reviewed_at'] else '',
+                    'reviewer': self.reviewer_name
+                })
+            
+            # Save to CSV
+            ann_df = pd.DataFrame(annotation_records)
+            annotation_file = annotation_dir / f"{self.reviewer_name}.csv"
+            ann_df.to_csv(annotation_file, index=False)
+            
+            # Count statistics
+            total = len(ann_df)
+            marked_nonface = sum(1 for r in annotation_records if not r['is_face'])
+            valid_faces = total - marked_nonface
+            
+            messagebox.showinfo(
+                "Saved",
+                f"Annotations saved successfully!\n\n"
+                f"File: {annotation_file}\n"
+                f"Total instances: {total}\n"
+                f"Valid faces: {valid_faces}\n"
+                f"Non-face: {marked_nonface}"
+            )
+            
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            messagebox.showerror(
+                "Error",
+                f"Failed to save annotations:\n{str(e)}"
+            )
+    
+    def _update_page_numbers(self, total_pages: int = None):
+        """Update the clickable page number labels (matching popup gallery style)."""
+        # Clear existing page elements
+        for widget in self.page_numbers_frame.winfo_children():
+            widget.destroy()
+        
+        if total_pages is None:
+            total_pages = self.current_total_pages if hasattr(self, 'current_total_pages') else 1
+        
+        current_page = self.current_page
+        
+        if total_pages == 0:
+            return
+        
+        # First page button (<<)
+        first_label = ctk.CTkLabel(
+            self.page_numbers_frame,
+            text="<<",
+            font=ctk.CTkFont(size=12),
+            cursor="hand2"
+        )
+        first_label.pack(side="left", padx=3)
+        if current_page > 0:
+            first_label.bind("<Button-1>", lambda e: self._go_to_page(0))
+            first_label.configure(text_color="#3b8ed0")
+        else:
+            first_label.configure(text_color="gray")
+        
+        # Previous page label (<)
+        prev_label = ctk.CTkLabel(
+            self.page_numbers_frame,
+            text="<",
+            font=ctk.CTkFont(size=12),
+            cursor="hand2"
+        )
+        prev_label.pack(side="left", padx=3)
+        if current_page > 0:
+            prev_label.bind("<Button-1>", lambda e: self._go_to_page(current_page - 1))
+            prev_label.configure(text_color="#3b8ed0")
+        else:
+            prev_label.configure(text_color="gray")
+        
+        # Show page numbers (limit to reasonable number to avoid UI overflow)
+        max_visible_pages = 15
+        if total_pages <= max_visible_pages:
+            pages_to_show = list(range(total_pages))
+        else:
+            pages_to_show = []
+            pages_to_show.append(0)
+            
+            start = max(1, current_page - 2)
+            end = min(total_pages - 1, current_page + 2)
+            for p in range(start, end + 1):
+                if p not in pages_to_show:
+                    pages_to_show.append(p)
+            
+            if total_pages - 1 not in pages_to_show:
+                pages_to_show.append(total_pages - 1)
+            
+            if pages_to_show[1] > 1:
+                pages_to_show.insert(1, None)
+            if pages_to_show[-2] < total_pages - 2:
+                pages_to_show.insert(-1, None)
+        
+        # Create page number labels
+        for page_num in pages_to_show:
+            if page_num is None:
+                ctk.CTkLabel(
+                    self.page_numbers_frame,
+                    text="...",
+                    font=ctk.CTkFont(size=12)
+                ).pack(side="left", padx=2)
+            else:
+                is_current = (page_num == current_page)
+                page_label = ctk.CTkLabel(
+                    self.page_numbers_frame,
+                    text=str(page_num + 1),
+                    font=ctk.CTkFont(size=12, weight="bold" if is_current else "normal"),
+                    cursor="hand2"
+                )
+                page_label.pack(side="left", padx=3)
+                
+                if is_current:
+                    page_label.configure(text_color="#3b8ed0")
+                else:
+                    page_label.configure(text_color="#3b8ed0")
+                    page_label.bind("<Button-1>", lambda e, p=page_num: self._go_to_page(p))
+        
+        # Next page label (>)
+        next_label = ctk.CTkLabel(
+            self.page_numbers_frame,
+            text=">",
+            font=ctk.CTkFont(size=12),
+            cursor="hand2"
+        )
+        next_label.pack(side="left", padx=3)
+        if current_page < total_pages - 1:
+            next_label.bind("<Button-1>", lambda e: self._go_to_page(current_page + 1))
+            next_label.configure(text_color="#3b8ed0")
+        else:
+            next_label.configure(text_color="gray")
+        
+        # Last page button (>>)
+        last_label = ctk.CTkLabel(
+            self.page_numbers_frame,
+            text=">>",
+            font=ctk.CTkFont(size=12),
+            cursor="hand2"
+        )
+        last_label.pack(side="left", padx=3)
+        if current_page < total_pages - 1:
+            last_label.bind("<Button-1>", lambda e: self._go_to_page(total_pages - 1))
+            last_label.configure(text_color="#3b8ed0")
+        else:
+            last_label.configure(text_color="gray")
+    
+    def _go_to_page(self, page_num: int):
+        """Go to specific page."""
+        if hasattr(self, 'current_total_pages'):
+            if 0 <= page_num < self.current_total_pages:
+                self.current_page = page_num
+                self._display_gallery()
+        else:
+            self.current_page = page_num
+            self._display_gallery()
+
+
 class FaceIDAssignmentTab(ctk.CTkFrame):
-    """Tab 2: Face ID Assignment (Stage 3)."""
+    """Tab 3: Face ID Assignment (Stage 3)."""
     
     def __init__(self, master, settings_manager: SettingsManager):
         super().__init__(master)
@@ -1212,6 +2277,28 @@ class FaceIDAssignmentTab(ctk.CTkFrame):
         ctk.CTkLabel(mv_frame, text="Min Votes:", width=130, anchor="w").pack(side="left")
         self.min_votes_var = ctk.IntVar(value=5)
         ctk.CTkEntry(mv_frame, textvariable=self.min_votes_var, width=70).pack(side="left", padx=5)
+        
+        # Reviewer name (for loading face instance annotations)
+        reviewer_frame = ctk.CTkFrame(settings_frame)
+        reviewer_frame.pack(fill="x", padx=5, pady=10)
+        ctk.CTkLabel(
+            reviewer_frame, 
+            text="Reviewer (optional):", 
+            width=150, 
+            anchor="w"
+        ).pack(side="left")
+        self.reviewer_entry_tab3 = ctk.CTkEntry(
+            reviewer_frame,
+            placeholder_text="Leave blank to include all faces",
+            width=200
+        )
+        self.reviewer_entry_tab3.pack(side="left", padx=5)
+        ctk.CTkLabel(
+            reviewer_frame,
+            text="(applies face instance filters)",
+            font=ctk.CTkFont(size=9),
+            text_color="gray"
+        ).pack(side="left", padx=5)
     
     def _create_progress_panel(self, parent):
         """Create progress panel."""
@@ -1447,6 +2534,12 @@ class FaceIDAssignmentTab(ctk.CTkFrame):
         self.min_cluster_size_var.set(self.settings.get("stage3.min_cluster_size", 5))
         self.k_voting_var.set(self.settings.get("stage3.k_voting", 10))
         self.min_votes_var.set(self.settings.get("stage3.min_votes", 5))
+        
+        # Load reviewer name
+        reviewer_name = self.settings.get("reviewer_name", "")
+        if reviewer_name:
+            self.reviewer_entry_tab3.delete(0, "end")
+            self.reviewer_entry_tab3.insert(0, reviewer_name)
     
     def _save_settings(self):
         """Save current settings."""
@@ -1536,6 +2629,14 @@ class FaceIDAssignmentTab(ctk.CTkFrame):
                 self.after(0, lambda: reporter.update_time_estimate("0s", None))  # Reset time
                 
                 try:
+                    # Get reviewer name (sanitize if provided)
+                    reviewer_name = self.reviewer_entry_tab3.get().strip()
+                    if reviewer_name:
+                        import re
+                        reviewer_name = re.sub(r'[^\w\-]', '_', reviewer_name).lower()
+                    else:
+                        reviewer_name = None
+                    
                     _run_stage3_via_subprocess(
                         participant_dir=str(participant_path),
                         similarity_threshold=self.sim_threshold_var.get(),
@@ -1546,7 +2647,8 @@ class FaceIDAssignmentTab(ctk.CTkFrame):
                         min_cluster_size=self.min_cluster_size_var.get(),
                         k_voting=self.k_voting_var.get(),
                         min_votes=self.min_votes_var.get(),
-                        reporter=reporter
+                        reporter=reporter,
+                        reviewer=reviewer_name
                     )
                     self.after(0, lambda sid=step_id: reporter.update_step_status(sid, "completed"))
                 
@@ -1587,7 +2689,7 @@ class FaceIDAssignmentTab(ctk.CTkFrame):
 
 
 class ManualReviewTab(ctk.CTkFrame):
-    """Tab 3: Manual Review & Merging (refactored from original GUI)."""
+    """Tab 4: Manual Review & Merging (refactored from original GUI)."""
     
     def __init__(self, master, settings_manager: SettingsManager):
         super().__init__(master)
@@ -1648,6 +2750,30 @@ class ManualReviewTab(ctk.CTkFrame):
             command=self._browse_folder,
             width=100,
             height=35
+        ).pack(side="left", padx=5)
+        
+        # Reviewer name
+        reviewer_frame = ctk.CTkFrame(self)
+        reviewer_frame.pack(fill="x", padx=20, pady=(0, 10))
+        
+        ctk.CTkLabel(
+            reviewer_frame,
+            text="Reviewer Name:",
+            font=ctk.CTkFont(size=13)
+        ).pack(side="left", padx=10)
+        
+        self.reviewer_entry = ctk.CTkEntry(
+            reviewer_frame,
+            placeholder_text="Enter your name...",
+            width=200
+        )
+        self.reviewer_entry.pack(side="left", padx=10)
+        
+        ctk.CTkLabel(
+            reviewer_frame,
+            text="(Used for annotation file naming)",
+            font=ctk.CTkFont(size=10),
+            text_color="gray"
         ).pack(side="left", padx=5)
         
         # Session filter panel
@@ -1802,22 +2928,39 @@ class ManualReviewTab(ctk.CTkFrame):
         self.face_list_frame.pack(fill="both", expand=True, padx=5, pady=(0, 5))
     
     def _create_save_button(self):
-        """Create the save button."""
+        """Create the save and export buttons."""
         save_frame = ctk.CTkFrame(self, fg_color="transparent")
         save_frame.pack(fill="x", padx=20)
         
+        # Button container for horizontal layout
+        button_container = ctk.CTkFrame(save_frame, fg_color="transparent")
+        button_container.pack(pady=10)
+        
         self.save_btn = ctk.CTkButton(
-            save_frame,
-            text="Save Merged Results",
+            button_container,
+            text="Save Annotations",
             command=self._save_results,
-            width=200,
+            width=180,
             height=45,
-            font=ctk.CTkFont(size=16, weight="bold"),
+            font=ctk.CTkFont(size=14, weight="bold"),
             fg_color="#007ACC",
             hover_color="#0066AA",
             state="disabled"
         )
-        self.save_btn.pack(pady=10)
+        self.save_btn.pack(side="left", padx=5)
+        
+        self.export_btn = ctk.CTkButton(
+            button_container,
+            text="Export Final CSV",
+            command=self._export_final_csv,
+            width=180,
+            height=45,
+            font=ctk.CTkFont(size=14, weight="bold"),
+            fg_color="#28a745",
+            hover_color="#218838",
+            state="disabled"
+        )
+        self.export_btn.pack(side="left", padx=5)
     
     def _browse_folder(self):
         """Open folder browser and load data."""
@@ -2002,6 +3145,7 @@ class ManualReviewTab(ctk.CTkFrame):
             # Display results
             self.after(0, self._display_face_list)
             self.after(0, lambda: self.save_btn.configure(state="normal"))
+            self.after(0, lambda: self.export_btn.configure(state="normal"))
             self.after(0, lambda: self.review_btn.configure(state="normal"))
             
         except Exception as e:
@@ -2417,6 +3561,9 @@ class ManualReviewTab(ctk.CTkFrame):
         popup.face_id = face_id
         popup.num_instances = num_instances
         
+        # Store selected instances (by their dataframe index)
+        popup.selected_instances = set()
+        
         # Pagination controls frame
         pagination_controls_frame = ctk.CTkFrame(popup)
         pagination_controls_frame.pack(pady=5)
@@ -2469,18 +3616,61 @@ class ManualReviewTab(ctk.CTkFrame):
         loading_label.pack(pady=20)
         
         # Scrollable gallery (responsive width)
-        gallery_frame = ctk.CTkScrollableFrame(popup, height=550)
+        gallery_frame = ctk.CTkScrollableFrame(popup, height=450)
         gallery_frame.pack(fill="both", expand=True, padx=10, pady=10)
+        
+        # Action buttons frame
+        action_frame = ctk.CTkFrame(popup)
+        action_frame.pack(pady=10)
+        
+        # Selection label
+        selection_label = ctk.CTkLabel(
+            action_frame,
+            text="0 instances selected",
+            font=ctk.CTkFont(size=12)
+        )
+        selection_label.pack(side="left", padx=10)
+        popup.selection_label = selection_label
+        
+        # Create New ID button
+        ctk.CTkButton(
+            action_frame,
+            text="Create New ID",
+            command=lambda: self._gallery_create_new_id(popup),
+            width=150,
+            height=35,
+            font=ctk.CTkFont(size=12)
+        ).pack(side="left", padx=5)
+        
+        # Assign to Existing ID button
+        ctk.CTkButton(
+            action_frame,
+            text="Assign to Existing ID",
+            command=lambda: self._gallery_assign_to_existing(popup),
+            width=180,
+            height=35,
+            font=ctk.CTkFont(size=12)
+        ).pack(side="left", padx=5)
+        
+        # Clear Selection button
+        ctk.CTkButton(
+            action_frame,
+            text="Clear Selection",
+            command=lambda: self._gallery_clear_selection(popup, gallery_frame, loading_label),
+            width=150,
+            height=35,
+            font=ctk.CTkFont(size=12)
+        ).pack(side="left", padx=5)
         
         # Close button
         ctk.CTkButton(
-            popup,
+            action_frame,
             text="Close",
             command=popup.destroy,
-            width=150,
-            height=40,
-            font=ctk.CTkFont(size=14)
-        ).pack(pady=10)
+            width=100,
+            height=35,
+            font=ctk.CTkFont(size=12)
+        ).pack(side="left", padx=5)
         
         # Initialize page numbers and load first page
         self._update_gallery_page_numbers(popup, page_numbers_frame, gallery_frame, loading_label, load_btn)
@@ -2542,19 +3732,48 @@ class ManualReviewTab(ctk.CTkFrame):
                 self.after(0, lambda: load_btn.configure(text="Load", state="normal"))
             
             # Create grid with responsive layout
+            popup_window = gallery_frame.winfo_toplevel()
             for idx, img in enumerate(images):
                 row_idx = idx // images_per_row
                 col_idx = idx % images_per_row
                 
-                # Create frame for image
-                img_frame = ctk.CTkFrame(gallery_frame, width=130, height=130)
-                img_frame.grid(row=row_idx, column=col_idx, padx=5, pady=5)
+                # Get the actual dataframe index for this image
+                df_idx = page_instances.iloc[idx].name
                 
-                # Add image
+                # Create container frame (same size as image)
+                img_container = ctk.CTkFrame(gallery_frame, width=130, height=130)
+                img_container.grid(row=row_idx, column=col_idx, padx=5, pady=5)
+                img_container.grid_propagate(False)
+                
+                # Add image as background
                 img_tk = ImageTk.PhotoImage(img)
-                img_label = ctk.CTkLabel(img_frame, image=img_tk, text="")
+                img_label = ctk.CTkLabel(img_container, image=img_tk, text="")
                 img_label.image = img_tk  # Keep reference
-                img_label.pack(padx=5, pady=5)
+                img_label.place(x=0, y=0, relwidth=1, relheight=1)
+                
+                # Checkbox overlay (top-right corner)
+                checkbox_var = ctk.BooleanVar(value=df_idx in popup_window.selected_instances)
+                checkbox = ctk.CTkCheckBox(
+                    img_container,
+                    text="",
+                    variable=checkbox_var,
+                    width=20,
+                    command=lambda idx=df_idx, var=checkbox_var: self._gallery_toggle_selection(popup_window, idx, var),
+                    checkbox_width=18,
+                    checkbox_height=18,
+                    fg_color="#3b8ed0",
+                    hover_color="#2a6fa5"
+                )
+                checkbox.place(x=5, y=5)
+                
+                # Make entire image clickable to toggle selection
+                def toggle_on_click(event, idx=df_idx, var=checkbox_var, cb=checkbox):
+                    var.set(not var.get())
+                    self._gallery_toggle_selection(popup_window, idx, var)
+                
+                img_label.bind("<Button-1>", toggle_on_click)
+                img_container.configure(cursor="hand2")
+                img_label.configure(cursor="hand2")
             
             # Store images_per_row and images in gallery_frame for resize handling
             gallery_frame.images_per_row = images_per_row
@@ -2793,52 +4012,287 @@ class ManualReviewTab(ctk.CTkFrame):
         else:
             last_label.configure(text_color="gray")
     
+    def _gallery_toggle_selection(self, popup, df_idx, checkbox_var):
+        """Toggle selection of an instance in gallery."""
+        if checkbox_var.get():
+            popup.selected_instances.add(df_idx)
+        else:
+            popup.selected_instances.discard(df_idx)
+        
+        # Update selection label
+        count = len(popup.selected_instances)
+        popup.selection_label.configure(text=f"{count} instance{'s' if count != 1 else ''} selected")
+    
+    def _gallery_clear_selection(self, popup, gallery_frame, loading_label):
+        """Clear all selections and reload current page."""
+        popup.selected_instances.clear()
+        popup.selection_label.configure(text="0 instances selected")
+        
+        # Reload current page to uncheck all checkboxes
+        self._gallery_load_page(popup, gallery_frame, loading_label, 
+                              popup.batch_size_entry, popup.load_btn, popup.page_numbers_frame)
+    
+    def _gallery_create_new_id(self, popup):
+        """Create a new face ID from selected instances."""
+        if not popup.selected_instances:
+            messagebox.showwarning("No Selection", "Please select at least one instance.")
+            return
+        
+        # Confirm action
+        count = len(popup.selected_instances)
+        response = messagebox.askyesno(
+            "Create New ID",
+            f"Create a new face ID from {count} selected instance{'s' if count != 1 else ''}?\n\n"
+            f"These instances will be removed from their current ID(s)."
+        )
+        
+        if not response:
+            return
+        
+        # Generate new face ID
+        existing_ids = list(self.face_groups.keys())
+        max_id_num = 0
+        for fid in existing_ids:
+            if fid.startswith("FACE_"):
+                try:
+                    num = int(fid.split("_")[1])
+                    max_id_num = max(max_id_num, num)
+                except:
+                    pass
+        new_face_id = f"FACE_{max_id_num + 1:05d}"
+        
+        # Update dataframe: set new face_id for selected instances
+        for df_idx in popup.selected_instances:
+            self.df.at[df_idx, 'face_id'] = new_face_id
+            if self.df_full is not None:
+                self.df_full.at[df_idx, 'face_id'] = new_face_id
+        
+        # Find representative for new ID
+        selected_rows = self.df.loc[list(popup.selected_instances)]
+        representative = self._find_representative_face(selected_rows)
+        thumbnail = self._extract_face_crop(representative) if representative else None
+        
+        # Create new face group
+        self.face_groups[new_face_id] = {
+            'count': count,
+            'representative': representative,
+            'thumbnail': thumbnail,
+            'original_ids': [new_face_id]
+        }
+        
+        # Update existing face groups (decrease counts)
+        for df_idx in popup.selected_instances:
+            old_face_id = popup.face_instances.loc[df_idx, 'face_id']
+            if old_face_id in self.face_groups:
+                self.face_groups[old_face_id]['count'] -= 1
+                if self.face_groups[old_face_id]['count'] <= 0:
+                    del self.face_groups[old_face_id]
+        
+        # Re-sort face groups
+        self.face_groups = dict(
+            sorted(self.face_groups.items(), key=lambda x: x[1]['count'], reverse=True)
+        )
+        
+        # Refresh main face list
+        self.after(0, self._display_face_list)
+        
+        # Clear selection and update gallery
+        popup.selected_instances.clear()
+        popup.selection_label.configure(text="0 instances selected")
+        
+        # Show success message (popup stays open)
+        messagebox.showinfo(
+            "Success",
+            f"Created new face ID: {new_face_id}\n"
+            f"Assigned {count} instance{'s' if count != 1 else ''} to it."
+        )
+    
+    def _gallery_assign_to_existing(self, popup):
+        """Assign selected instances to an existing face ID."""
+        if not popup.selected_instances:
+            messagebox.showwarning("No Selection", "Please select at least one instance.")
+            return
+        
+        # Create selection dialog
+        self._show_id_selection_dialog(popup)
+    
+    def _show_id_selection_dialog(self, gallery_popup):
+        """Show dialog to select an existing face ID."""
+        dialog = ctk.CTkToplevel(self)
+        dialog.title("Select Face ID")
+        dialog.geometry("600x700")
+        dialog.grab_set()  # Modal
+        
+        # Title
+        count = len(gallery_popup.selected_instances)
+        ctk.CTkLabel(
+            dialog,
+            text=f"Assign {count} instance{'s' if count != 1 else ''} to which Face ID?",
+            font=ctk.CTkFont(size=16, weight="bold")
+        ).pack(pady=10)
+        
+        # Scrollable list of face IDs
+        list_frame = ctk.CTkScrollableFrame(dialog, width=550, height=550)
+        list_frame.pack(fill="both", expand=True, padx=10, pady=10)
+        
+        # Create clickable rows for each face ID
+        for face_id, info in self.face_groups.items():
+            # Skip the current face ID
+            if face_id == gallery_popup.face_id:
+                continue
+            
+            row_frame = ctk.CTkFrame(list_frame)
+            row_frame.pack(fill="x", padx=5, pady=3)
+            
+            # Make row clickable
+            def select_id(fid=face_id):
+                dialog.destroy()
+                self._gallery_assign_to_id(gallery_popup, fid)
+            
+            row_frame.bind("<Button-1>", lambda e, fid=face_id: select_id(fid))
+            row_frame.configure(cursor="hand2")
+            
+            # Thumbnail
+            thumb = info.get('thumbnail')
+            if thumb:
+                thumb_tk = ImageTk.PhotoImage(thumb)
+                thumb_label = ctk.CTkLabel(row_frame, image=thumb_tk, text="", cursor="hand2")
+                thumb_label.image = thumb_tk
+                thumb_label.pack(side="left", padx=5)
+                thumb_label.bind("<Button-1>", lambda e, fid=face_id: select_id(fid))
+            
+            # Face ID and count
+            id_label = ctk.CTkLabel(
+                row_frame,
+                text=f"{face_id} ({info['count']} instances)",
+                font=ctk.CTkFont(size=12),
+                anchor="w",
+                cursor="hand2"
+            )
+            id_label.pack(side="left", fill="x", expand=True, padx=5)
+            id_label.bind("<Button-1>", lambda e, fid=face_id: select_id(fid))
+        
+        # Cancel button
+        ctk.CTkButton(
+            dialog,
+            text="Cancel",
+            command=dialog.destroy,
+            width=150,
+            height=35,
+            font=ctk.CTkFont(size=12)
+        ).pack(pady=10)
+    
+    def _gallery_assign_to_id(self, gallery_popup, target_face_id):
+        """Assign selected instances to a specific face ID."""
+        count = len(gallery_popup.selected_instances)
+        
+        # Confirm action
+        response = messagebox.askyesno(
+            "Confirm Assignment",
+            f"Assign {count} selected instance{'s' if count != 1 else ''} to {target_face_id}?"
+        )
+        
+        if not response:
+            return
+        
+        # Update dataframe: set target face_id for selected instances
+        for df_idx in gallery_popup.selected_instances:
+            old_face_id = self.df.at[df_idx, 'face_id']
+            self.df.at[df_idx, 'face_id'] = target_face_id
+            if self.df_full is not None:
+                self.df_full.at[df_idx, 'face_id'] = target_face_id
+            
+            # Update face group counts
+            if old_face_id in self.face_groups:
+                self.face_groups[old_face_id]['count'] -= 1
+                if self.face_groups[old_face_id]['count'] <= 0:
+                    del self.face_groups[old_face_id]
+        
+        # Increase count for target face ID
+        if target_face_id in self.face_groups:
+            self.face_groups[target_face_id]['count'] += count
+        
+        # Re-sort face groups
+        self.face_groups = dict(
+            sorted(self.face_groups.items(), key=lambda x: x[1]['count'], reverse=True)
+        )
+        
+        # Refresh main face list
+        self.after(0, self._display_face_list)
+        
+        # Clear selection and update gallery
+        gallery_popup.selected_instances.clear()
+        gallery_popup.selection_label.configure(text="0 instances selected")
+        
+        # Show success message (popup stays open)
+        messagebox.showinfo(
+            "Success",
+            f"Assigned {count} instance{'s' if count != 1 else ''} to {target_face_id}"
+        )
+    
     def _save_results(self):
-        """Save merged results to CSV with merged_face_id column."""
+        """Save merged results to annotation file (not modifying faces_combined.csv)."""
         if self.df_full is None:
             return
+        
+        # Get reviewer name
+        reviewer_name = self.reviewer_entry.get().strip()
+        if not reviewer_name:
+            messagebox.showerror("Error", "Please enter your reviewer name.")
+            return
+        
+        # Sanitize reviewer name
+        import re
+        from datetime import datetime
+        reviewer_name = re.sub(r'[^\w\-]', '_', reviewer_name).lower()
         
         # Confirm save
         response = messagebox.askyesno(
             "Confirm Save",
-            "This will add a 'merged_face_id' column to faces_combined.csv.\n"
-            "The original file will be backed up. Continue?"
+            f"This will save your face ID merge annotations to:\n"
+            f"annotations/{reviewer_name}_review.csv\n\n"
+            f"The original faces_combined.csv will NOT be modified.\n"
+            f"Continue?"
         )
         
         if not response:
             return
         
         try:
-            # Create backup
-            csv_path = self.participant_dir / "faces_combined.csv"
-            backup_path = self.participant_dir / "faces_combined.backup.csv"
+            # Create annotations directory
+            annotation_dir = self.participant_dir / "annotations"
+            annotation_dir.mkdir(exist_ok=True)
             
-            import shutil
-            shutil.copy2(csv_path, backup_path)
+            # Build annotation records
+            annotation_records = []
+            timestamp = datetime.now().isoformat()
             
-            # Add merged_face_id column
-            df_out = self.df_full.copy()
-            df_out['merged_face_id'] = df_out['face_id'].map(self.face_id_to_merged)
+            for face_id, merged_id in self.face_id_to_merged.items():
+                annotation_records.append({
+                    'face_id': face_id,
+                    'merged_face_id': merged_id,
+                    'reviewed_at': timestamp,
+                    'reviewer': reviewer_name
+                })
             
-            # Fill any missing values (use original face_id)
-            df_out['merged_face_id'].fillna(df_out['face_id'], inplace=True)
+            # Save to annotation file
+            ann_df = pd.DataFrame(annotation_records)
+            annotation_file = annotation_dir / f"{reviewer_name}_review.csv"
+            ann_df.to_csv(annotation_file, index=False)
             
             # Count merges
             num_merged = len([k for k, v in self.face_id_to_merged.items() if k != v])
-            unique_merged_ids = df_out['merged_face_id'].nunique()
-            original_unique_ids = df_out['face_id'].nunique()
-            
-            # Save
-            df_out.to_csv(csv_path, index=False)
+            unique_original_ids = len(set(self.face_id_to_merged.keys()))
+            unique_merged_ids = len(set(self.face_id_to_merged.values()))
             
             messagebox.showinfo(
                 "Saved",
-                f"Successfully saved merged results!\n\n"
-                f"Output: {csv_path}\n"
-                f"Backup: {backup_path}\n\n"
-                f"Original unique IDs: {original_unique_ids}\n"
+                f"Successfully saved merge annotations!\n\n"
+                f"File: {annotation_file}\n"
+                f"Reviewer: {reviewer_name}\n\n"
+                f"Original unique IDs: {unique_original_ids}\n"
                 f"Merged unique IDs: {unique_merged_ids}\n"
-                f"Reduction: {original_unique_ids - unique_merged_ids} IDs"
+                f"Reduction: {unique_original_ids - unique_merged_ids} IDs"
             )
             
         except Exception as e:
@@ -2846,13 +4300,70 @@ class ManualReviewTab(ctk.CTkFrame):
             traceback.print_exc()
             messagebox.showerror(
                 "Error",
-                f"Failed to save results:\n{str(e)}"
+                f"Failed to save annotations:\n{str(e)}"
+            )
+    
+    def _export_final_csv(self):
+        """Export final CSV with merged_face_id column applied."""
+        if self.df_full is None:
+            return
+        
+        # Get reviewer name
+        reviewer_name = self.reviewer_entry.get().strip()
+        if not reviewer_name:
+            messagebox.showerror("Error", "Please enter your reviewer name.")
+            return
+        
+        # Sanitize reviewer name
+        import re
+        reviewer_name = re.sub(r'[^\w\-]', '_', reviewer_name).lower()
+        
+        try:
+            # Create output dataframe with merged_face_id column
+            df_out = self.df_full.copy()
+            df_out['merged_face_id'] = df_out['face_id'].map(self.face_id_to_merged)
+            
+            # Fill any missing values (use original face_id)
+            df_out['merged_face_id'].fillna(df_out['face_id'], inplace=True)
+            
+            # Save to reviewer-specific file
+            output_path = self.participant_dir / f"faces_combined_{reviewer_name}.csv"
+            df_out.to_csv(output_path, index=False)
+            
+            # Count statistics
+            num_merged = len([k for k, v in self.face_id_to_merged.items() if k != v])
+            unique_original_ids = len(set(self.face_id_to_merged.keys()))
+            unique_merged_ids = len(set(self.face_id_to_merged.values()))
+            
+            messagebox.showinfo(
+                "Exported",
+                f"Successfully exported final CSV with merged IDs!\n\n"
+                f"File: {output_path}\n"
+                f"Reviewer: {reviewer_name}\n\n"
+                f"Total faces: {len(df_out)}\n"
+                f"Original unique IDs: {unique_original_ids}\n"
+                f"Merged unique IDs: {unique_merged_ids}\n"
+                f"Reduction: {unique_original_ids - unique_merged_ids} IDs"
+            )
+            
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            messagebox.showerror(
+                "Error",
+                f"Failed to export CSV:\n{str(e)}"
             )
     
     def _load_settings(self):
         """Load settings into UI."""
         self.min_instances_var.set(self.settings.get("tab3.min_instances", 1))
         self.min_confidence_var.set(self.settings.get("tab3.min_confidence", 0.0))
+        
+        # Load reviewer name
+        reviewer_name = self.settings.get("reviewer_name", "")
+        if reviewer_name:
+            self.reviewer_entry.delete(0, "end")
+            self.reviewer_entry.insert(0, reviewer_name)
 
 
 class FaceDietApp(ctk.CTk):
@@ -2872,19 +4383,23 @@ class FaceDietApp(ctk.CTk):
         self.tabview.pack(fill="both", expand=True, padx=10, pady=10)
         
         # Add tabs
-        self.tabview.add("Video Processing")
-        self.tabview.add("Face ID Assignment")
-        self.tabview.add("Manual Review")
+        self.tabview.add("Face Detection")
+        self.tabview.add("Face Instance Review")
+        self.tabview.add("Face ID Clustering")
+        self.tabview.add("Face ID Review")
         
         # Create tab content
-        self.tab1 = VideoProcessingTab(self.tabview.tab("Video Processing"), self.settings)
+        self.tab1 = VideoProcessingTab(self.tabview.tab("Face Detection"), self.settings)
         self.tab1.pack(fill="both", expand=True)
         
-        self.tab2 = FaceIDAssignmentTab(self.tabview.tab("Face ID Assignment"), self.settings)
+        self.tab2 = FaceInstanceReviewTab(self.tabview.tab("Face Instance Review"), self.settings)
         self.tab2.pack(fill="both", expand=True)
         
-        self.tab3 = ManualReviewTab(self.tabview.tab("Manual Review"), self.settings)
+        self.tab3 = FaceIDAssignmentTab(self.tabview.tab("Face ID Clustering"), self.settings)
         self.tab3.pack(fill="both", expand=True)
+        
+        self.tab4 = ManualReviewTab(self.tabview.tab("Face ID Review"), self.settings)
+        self.tab4.pack(fill="both", expand=True)
 
 
 def main():
@@ -2895,8 +4410,8 @@ def main():
         msgbox.showerror(
             "Missing venv_tf210",
             f"venv_tf210 Python interpreter not found at:\n{VENV_TF210_PYTHON}\n\n"
-            f"Processing features (Tabs 1 & 2) will not work.\n"
-            f"Tab 3 (Manual Review) should still work."
+            f"Processing features (Tabs 1 & 3) will not work.\n"
+            f"Tabs 2 & 4 (Review features) should still work."
         )
     
     # Set appearance

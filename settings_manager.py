@@ -32,6 +32,8 @@ class SettingsManager:
         """Return default settings."""
         return {
             "last_project_dir": "",
+            "last_session_dir_review": "",
+            "reviewer_name": "",
             "stage1": {
                 "sampling_rate": 30,
                 "use_gpu": False,
