@@ -30,8 +30,34 @@ import tkinter
 from settings_manager import SettingsManager, ReviewerRegistry
 from directory_tree_widget import DirectoryTreeWidget
 
-# Path to venv_tf210 Python interpreter for processing
-VENV_TF210_PYTHON = Path(__file__).parent / "venv_tf210" / "Scripts" / "python.exe"
+# Default search locations for the processing venv (Stage 1 & 2 only).
+# Checked in order; the first existing interpreter is used as the default.
+_PROCESSING_VENV_CANDIDATES = [
+    Path(__file__).parent / "venv_processing" / "Scripts" / "python.exe",
+    Path(__file__).parent / "venv_tf210" / "Scripts" / "python.exe",
+]
+
+
+def _get_processing_python(settings: SettingsManager) -> Optional[Path]:
+    """
+    Return the Path to the processing Python interpreter.
+
+    Precedence:
+      1. Value saved in settings (``processing_python`` key)
+      2. First candidate venv found next to the project
+      3. None (caller must handle missing case)
+    """
+    saved = settings.get("processing_python", "")
+    if saved:
+        p = Path(saved)
+        if p.exists():
+            return p
+
+    for candidate in _PROCESSING_VENV_CANDIDATES:
+        if candidate.exists():
+            return candidate
+
+    return None
 
 
 def _format_time(seconds: float) -> str:
@@ -48,17 +74,23 @@ def _format_time(seconds: float) -> str:
         return f"{hours}h {minutes}m"
 
 
-def _run_stage1_via_subprocess(session_dir: str, sampling_rate: int, use_gpu: bool, min_confidence: float, reporter, debug_mode: bool = False):
-    """Run stage1_detect_faces via subprocess using venv_tf210, streaming output in real-time."""
+def _run_stage1_via_subprocess(session_dir: str, sampling_rate: int, use_gpu: bool,
+                               min_confidence: float, reporter, debug_mode: bool = False,
+                               settings: SettingsManager = None):
+    """Run stage1_detect_faces via subprocess using the processing venv."""
     import time
     import threading
     import re
     import cv2
-    
-    if not VENV_TF210_PYTHON.exists():
+
+    processing_python = _get_processing_python(settings) if settings else None
+    if processing_python is None:
         raise FileNotFoundError(
-            f"venv_tf210 Python interpreter not found at: {VENV_TF210_PYTHON}\n"
-            f"Please ensure venv_tf210 is set up correctly."
+            "Processing Python interpreter not found.\n\n"
+            "Stage 1 requires insightface + deepface which must be installed in a "
+            "separate Python 3.10 environment.\n\n"
+            "Run setup_processing.bat to create it, or configure the path in the "
+            "startup dialog."
         )
     
     # Calculate 5% duration if debug mode is enabled
@@ -81,8 +113,8 @@ def _run_stage1_via_subprocess(session_dir: str, sampling_rate: int, use_gpu: bo
     
     script_path = Path(__file__).parent / "stage1_detect_faces.py"
     cmd = [
-        str(VENV_TF210_PYTHON),
-        "-u",  # Unbuffered output
+        str(processing_python),
+        "-u",
         str(script_path),
         session_dir,
         "--sampling-rate", str(sampling_rate),
@@ -168,17 +200,22 @@ def _run_stage1_via_subprocess(session_dir: str, sampling_rate: int, use_gpu: bo
     return True
 
 
-def _run_stage2_via_subprocess(session_dir: str, batch_size: int, reporter, debug_mode: bool = False):
-    """Run stage2_extract_attributes via subprocess using venv_tf210, streaming output in real-time."""
+def _run_stage2_via_subprocess(session_dir: str, batch_size: int, reporter,
+                               debug_mode: bool = False, settings: SettingsManager = None):
+    """Run stage2_extract_attributes via subprocess using the processing venv."""
     import time
     import threading
     import re
     import pandas as pd
-    
-    if not VENV_TF210_PYTHON.exists():
+
+    processing_python = _get_processing_python(settings) if settings else None
+    if processing_python is None:
         raise FileNotFoundError(
-            f"venv_tf210 Python interpreter not found at: {VENV_TF210_PYTHON}\n"
-            f"Please ensure venv_tf210 is set up correctly."
+            "Processing Python interpreter not found.\n\n"
+            "Stage 2 requires deepface + tensorflow which must be installed in a "
+            "separate Python 3.10 environment.\n\n"
+            "Run setup_processing.bat to create it, or configure the path in the "
+            "startup dialog."
         )
     
     # Calculate 5% limit if debug mode is enabled
@@ -197,8 +234,8 @@ def _run_stage2_via_subprocess(session_dir: str, batch_size: int, reporter, debu
     
     script_path = Path(__file__).parent / "stage2_extract_attributes.py"
     cmd = [
-        str(VENV_TF210_PYTHON),
-        "-u",  # Unbuffered output
+        str(processing_python),
+        "-u",
         str(script_path),
         session_dir,
         "--batch-size", str(batch_size),
@@ -288,19 +325,19 @@ def _run_stage3_via_subprocess(
     min_votes: int,
     reporter,
 ):
-    """Run stage3_graph_clustering via subprocess using venv_tf210, streaming output in real-time."""
+    """
+    Run stage3_graph_clustering via subprocess.
+
+    Stage 3 uses faiss, igraph/leidenalg, networkx — no TensorFlow or insightface.
+    It runs with the same Python interpreter that runs the GUI (sys.executable),
+    so no separate processing venv is needed for clustering.
+    """
     import time
     import threading
 
-    if not VENV_TF210_PYTHON.exists():
-        raise FileNotFoundError(
-            f"venv_tf210 Python interpreter not found at: {VENV_TF210_PYTHON}\n"
-            f"Please ensure venv_tf210 is set up correctly."
-        )
-
     script_path = Path(__file__).parent / "stage3_graph_clustering.py"
     cmd = [
-        str(VENV_TF210_PYTHON),
+        sys.executable,  # same venv as the GUI
         "-u",
         str(script_path),
         participant_dir,
@@ -967,28 +1004,30 @@ class VideoProcessingTab(ctk.CTkFrame):
                         use_gpu=self.use_gpu_var.get(),
                         min_confidence=self._get_min_confidence(),
                         reporter=reporter,
-                        debug_mode=self.debug_mode_var.get()
+                        debug_mode=self.debug_mode_var.get(),
+                        settings=self.settings,
                     )
                     self.after(0, lambda sid=step_id_s1: reporter.update_step_status(sid, "completed"))
                 except Exception as e:
                     self.after(0, lambda sid=step_id_s1: reporter.update_step_status(sid, "error"))
                     raise
-                
+
                 # Stage 2: Attribute Extraction
                 step_id_s2 = f"session_{idx}_stage2"
-                self.after(0, lambda p=participant_name, s=session_name: 
+                self.after(0, lambda p=participant_name, s=session_name:
                     reporter.set_current_step("Attribute Extraction", p, s))
                 self.after(0, lambda sid=step_id_s2: reporter.update_step_status(sid, "in_progress"))
-                self.after(0, lambda: reporter.update_progress(0, "0%"))  # Reset progress bar
-                self.after(0, lambda: reporter.update_time_estimate("0s", None))  # Reset time
+                self.after(0, lambda: reporter.update_progress(0, "0%"))
+                self.after(0, lambda: reporter.update_time_estimate("0s", None))
                 self.after(0, lambda: reporter.log(f"Running Stage 2 for {session_name}..."))
-                
+
                 try:
                     _run_stage2_via_subprocess(
                         session_dir=str(session_path),
                         batch_size=self._get_batch_size(),
                         reporter=reporter,
-                        debug_mode=self.debug_mode_var.get()
+                        debug_mode=self.debug_mode_var.get(),
+                        settings=self.settings,
                     )
                     self.after(0, lambda sid=step_id_s2: reporter.update_step_status(sid, "completed"))
                 except Exception as e:
@@ -4431,7 +4470,7 @@ class StartupDialog(ctk.CTkToplevel):
         self.result_reviewer_id: Optional[str] = None
 
         self.title("Face-Diet — Setup")
-        self.geometry("600x420")
+        self.geometry("640x480")
         self.resizable(False, False)
         self.grab_set()   # make modal
         self.focus_force()
@@ -4521,6 +4560,50 @@ class StartupDialog(ctk.CTkToplevel):
             self.new_rev_frame, text="Create", width=70, command=self._create_reviewer
         ).pack(side="left", padx=6)
 
+        # Processing environment (collapsible)
+        proc_toggle_frame = ctk.CTkFrame(self, fg_color="transparent")
+        proc_toggle_frame.pack(fill="x", padx=30, pady=(4, 0))
+
+        self.show_proc_var = ctk.BooleanVar(value=False)
+        ctk.CTkCheckBox(
+            proc_toggle_frame,
+            text="Configure processing environment (Tab 1 — face detection & attributes)",
+            variable=self.show_proc_var,
+            command=self._toggle_proc_panel,
+            font=ctk.CTkFont(size=11),
+            checkbox_width=14, checkbox_height=14,
+        ).pack(anchor="w")
+
+        self.proc_frame = ctk.CTkFrame(self)
+        proc_row = ctk.CTkFrame(self.proc_frame, fg_color="transparent")
+        proc_row.pack(fill="x", padx=6, pady=6)
+
+        ctk.CTkLabel(
+            proc_row,
+            text="Python 3.10 venv  \n(insightface + deepface):",
+            font=ctk.CTkFont(size=11),
+            justify="right"
+        ).pack(side="left", padx=(0, 6))
+
+        self.proc_entry = ctk.CTkEntry(
+            proc_row,
+            placeholder_text="e.g. C:\\path\\to\\venv_processing\\Scripts\\python.exe",
+            width=300
+        )
+        self.proc_entry.pack(side="left", fill="x", expand=True)
+
+        ctk.CTkButton(
+            proc_row, text="Browse", width=70,
+            command=self._browse_processing_python
+        ).pack(side="left", padx=(6, 0))
+
+        ctk.CTkLabel(
+            self.proc_frame,
+            text="Leave blank to auto-detect venv_processing or venv_tf210 next to the project.",
+            font=ctk.CTkFont(size=10),
+            text_color="gray"
+        ).pack(anchor="w", padx=10, pady=(0, 4))
+
         # Status label
         self.status_label = ctk.CTkLabel(self, text="", font=ctk.CTkFont(size=11),
                                           text_color="orange")
@@ -4600,6 +4683,21 @@ class StartupDialog(ctk.CTkToplevel):
         self.reviewer_var.set(reviewer_id)
         self.new_rev_frame.pack_forget()
 
+    def _toggle_proc_panel(self):
+        if self.show_proc_var.get():
+            self.proc_frame.pack(fill="x", padx=30, pady=(2, 0))
+        else:
+            self.proc_frame.pack_forget()
+
+    def _browse_processing_python(self):
+        path = filedialog.askopenfilename(
+            title="Select Python interpreter for processing venv",
+            filetypes=[("Python executable", "python.exe python"), ("All files", "*")]
+        )
+        if path:
+            self.proc_entry.delete(0, "end")
+            self.proc_entry.insert(0, path)
+
     def _load_last_values(self):
         """Pre-fill fields from last session."""
         last_dir = self.settings.get("last_project_dir", "")
@@ -4613,6 +4711,11 @@ class StartupDialog(ctk.CTkToplevel):
                    for i in range(len(self.reviewer_option.cget("values")))]
             if last_reviewer in ids:
                 self.reviewer_var.set(last_reviewer)
+
+        # Pre-fill processing python if saved
+        saved_proc = self.settings.get("processing_python", "")
+        if saved_proc:
+            self.proc_entry.insert(0, saved_proc)
 
     def _confirm(self):
         project_dir_str = self.dir_entry.get().strip()
@@ -4635,6 +4738,12 @@ class StartupDialog(ctk.CTkToplevel):
         # Persist
         self.settings.set("last_project_dir", str(self.result_project_dir))
         self.settings.set("reviewer_id", self.result_reviewer_id)
+
+        # Save processing python if explicitly set
+        proc_python = self.proc_entry.get().strip()
+        if proc_python:
+            self.settings.set("processing_python", proc_python)
+
         self.settings.save_settings()
 
         self.grab_release()
@@ -4706,21 +4815,8 @@ class FaceDietApp(ctk.CTk):
 
 def main():
     """Main entry point."""
-    # Verify venv_tf210 exists for processing
-    if not VENV_TF210_PYTHON.exists():
-        import tkinter.messagebox as msgbox
-        msgbox.showerror(
-            "Missing venv_tf210",
-            f"venv_tf210 Python interpreter not found at:\n{VENV_TF210_PYTHON}\n\n"
-            f"Processing features (Tabs 1 & 3) will not work.\n"
-            f"Tabs 2 & 4 (Review features) should still work."
-        )
-    
-    # Set appearance
     ctk.set_appearance_mode("dark")
     ctk.set_default_color_theme("blue")
-    
-    # Create and run app
     app = FaceDietApp()
     app.mainloop()
 

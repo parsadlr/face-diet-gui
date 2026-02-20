@@ -143,6 +143,10 @@ class SettingsManager:
         return {
             "last_project_dir": "",
             "reviewer_id": "",
+            # Path to the Python interpreter used for Stage 1 & 2 (insightface + deepface).
+            # Stage 3 runs in the same environment as the GUI and does not use this.
+            # Defaults to venv_processing next to the project; can be any Python 3.10 venv.
+            "processing_python": "",
             "stage1": {
                 "sampling_rate": 30,
                 "use_gpu": False,

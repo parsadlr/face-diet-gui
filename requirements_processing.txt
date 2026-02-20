@@ -1,0 +1,34 @@
+# ============================================================
+# Processing environment  (requirements_processing.txt)
+# Requires Python 3.10 EXACTLY  (TensorFlow 2.10 constraint)
+# ============================================================
+# This environment is only needed for Tab 1 (face detection +
+# attribute extraction). Tabs 2, 3, and 4 run in the GUI venv.
+#
+# Run once to install (inside the processing venv):
+#   pip install -r requirements_processing.txt
+#
+# Then install insightface from the provided wheel:
+#   pip install whls/insightface-0.7.3-cp310-cp310-win_amd64.whl
+
+# --- Shared data handling (must match GUI venv) ---
+numpy<2                 # insightface requires NumPy 1.x
+pandas>=2.0.0
+opencv-python>=4.8.0
+
+# --- ONNX runtime for insightface (CPU or GPU) ---
+# For GPU (CUDA 11.8 + cuDNN 8.x):
+onnxruntime-gpu==1.18.1
+# For CPU-only (comment out the line above and uncomment this):
+# onnxruntime>=1.16.0
+
+onnx==1.16.1
+protobuf>=3.20.0
+
+# --- insightface ---
+# Install manually from the wheel file (see above).
+# Do NOT install via pip install insightface — it may not build on Windows.
+
+# --- DeepFace (attribute extraction: age, gender, race, emotion) ---
+deepface>=0.0.79
+tensorflow==2.10.*      # Must be 2.10.x for Python 3.10 + CUDA 11.x compatibility
