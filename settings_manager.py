@@ -1,12 +1,122 @@
 """
 Settings Manager for Face-Diet GUI
 
-Handles persistence of GUI settings to/from JSON config file.
+Handles persistence of GUI settings to/from JSON config file,
+and manages the per-project reviewer registry stored in
+{project_dir}/_annotations/reviewers.json.
 """
 
 import json
+import re
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
+
+
+class ReviewerRegistry:
+    """
+    Manage the list of reviewers for a project.
+
+    The registry is stored as a small JSON file at:
+        {project_dir}/_annotations/reviewers.json
+
+    It is completely independent of the GUI settings file so that
+    multiple users sharing the same project directory all see the
+    same reviewer list regardless of their local machine config.
+    """
+
+    ANNOTATIONS_DIR = "_annotations"
+    REGISTRY_FILE = "reviewers.json"
+
+    # ------------------------------------------------------------------ #
+    # Construction / loading                                               #
+    # ------------------------------------------------------------------ #
+
+    def __init__(self, project_dir: Path):
+        self.project_dir = Path(project_dir)
+        self._registry_path = self.project_dir / self.ANNOTATIONS_DIR / self.REGISTRY_FILE
+        self._data: Dict = {"reviewers": []}
+        self._load()
+
+    def _load(self):
+        if self._registry_path.exists():
+            try:
+                with open(self._registry_path, "r", encoding="utf-8") as fh:
+                    self._data = json.load(fh)
+            except Exception as e:
+                print(f"Warning: could not load reviewer registry: {e}")
+
+    def _save(self):
+        self._registry_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(self._registry_path, "w", encoding="utf-8") as fh:
+            json.dump(self._data, fh, indent=2)
+
+    # ------------------------------------------------------------------ #
+    # Public API                                                           #
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def sanitize_id(raw: str) -> str:
+        """
+        Convert a free-text name into a filesystem-safe reviewer ID.
+        E.g. "Alice Smith" → "alice_smith"
+        """
+        return re.sub(r"[^\w\-]", "_", raw).lower().strip("_")
+
+    def get_reviewers(self) -> List[Dict]:
+        """Return the list of reviewer dicts (id, display_name, created_at)."""
+        return list(self._data.get("reviewers", []))
+
+    def get_reviewer_ids(self) -> List[str]:
+        return [r["id"] for r in self.get_reviewers()]
+
+    def reviewer_exists(self, reviewer_id: str) -> bool:
+        return reviewer_id in self.get_reviewer_ids()
+
+    def add_reviewer(self, reviewer_id: str, display_name: str) -> bool:
+        """
+        Add a new reviewer to the registry.
+
+        Returns True on success, False if the ID already exists.
+        """
+        if self.reviewer_exists(reviewer_id):
+            return False
+        self._data.setdefault("reviewers", []).append({
+            "id": reviewer_id,
+            "display_name": display_name,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        })
+        self._save()
+        return True
+
+    def get_reviewer_dir(self, reviewer_id: str) -> Path:
+        """
+        Return the root annotation directory for this reviewer:
+            {project_dir}/_annotations/{reviewer_id}/
+        """
+        return self.project_dir / self.ANNOTATIONS_DIR / reviewer_id
+
+    def get_tab2_annotation_path(self, reviewer_id: str, participant: str, session: str) -> Path:
+        """
+        {project_dir}/_annotations/{reviewer_id}/{participant}/{session}/tab2_is_face.csv
+        """
+        return self.get_reviewer_dir(reviewer_id) / participant / session / "tab2_is_face.csv"
+
+    def get_tab3_face_ids_path(self, reviewer_id: str, participant: str) -> Path:
+        """
+        {project_dir}/_annotations/{reviewer_id}/{participant}/tab3_face_ids.csv
+        """
+        return self.get_reviewer_dir(reviewer_id) / participant / "tab3_face_ids.csv"
+
+    def get_tab4_merges_path(self, reviewer_id: str, participant: str) -> Path:
+        """
+        {project_dir}/_annotations/{reviewer_id}/{participant}/tab4_merges.csv
+        """
+        return self.get_reviewer_dir(reviewer_id) / participant / "tab4_merges.csv"
+
+    def get_annotations_base_dir(self) -> Path:
+        """Return {project_dir}/_annotations/"""
+        return self.project_dir / self.ANNOTATIONS_DIR
 
 
 class SettingsManager:
@@ -32,8 +142,7 @@ class SettingsManager:
         """Return default settings."""
         return {
             "last_project_dir": "",
-            "last_session_dir_review": "",
-            "reviewer_name": "",
+            "reviewer_id": "",
             "stage1": {
                 "sampling_rate": 30,
                 "use_gpu": False,

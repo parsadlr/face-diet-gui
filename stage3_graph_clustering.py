@@ -49,31 +49,41 @@ if not LEIDEN_AVAILABLE and not NETWORKX_AVAILABLE:
     sys.exit(1)
 
 
-def load_all_sessions(participant_dir: str, min_confidence: float = 0.0, reviewer: str = None) -> Tuple[pd.DataFrame, np.ndarray, Dict]:
+def load_all_sessions(
+    participant_dir: str,
+    min_confidence: float = 0.0,
+    annotations_dir: str = None,
+) -> Tuple[pd.DataFrame, np.ndarray, Dict]:
     """
     Load all session data into one combined dataset.
-    
+
     Parameters
     ----------
     participant_dir : str
-        Path to participant directory
+        Path to participant directory containing per-session sub-directories.
     min_confidence : float
-        Minimum confidence threshold
-    reviewer : str, optional
-        Reviewer name to load face instance annotations from.
-        If provided, filters out instances marked as non-face by this reviewer.
-    
+        Minimum detection confidence threshold.
+    annotations_dir : str, optional
+        Path to the reviewer's per-participant annotation directory, i.e.
+        ``{project}/_annotations/{reviewer_id}/{participant}/``.
+        When provided, each session's ``tab2_is_face.csv`` is loaded from
+        ``{annotations_dir}/{session_name}/tab2_is_face.csv`` and instances
+        marked as non-face are excluded before clustering.
+
     Returns
     -------
     Tuple[pd.DataFrame, np.ndarray, Dict]
         (combined_df, embeddings_array, metadata)
     """
     participant_path = Path(participant_dir).resolve()
-    
-    # Find all session CSVs
+    ann_base = Path(annotations_dir) if annotations_dir else None
+
+    # Find all session CSVs (skip hidden / reserved dirs)
     session_csvs = []
     for session_dir in sorted(participant_path.iterdir()):
         if not session_dir.is_dir():
+            continue
+        if session_dir.name.startswith('.') or session_dir.name.startswith('_'):
             continue
         face_csv = session_dir / "face_detections.csv"
         if face_csv.exists():
@@ -82,46 +92,41 @@ def load_all_sessions(participant_dir: str, min_confidence: float = 0.0, reviewe
                 'session_dir': session_dir,
                 'csv_path': face_csv,
             })
-    
+
     if not session_csvs:
         raise FileNotFoundError("No face_detections.csv files found")
-    
+
     print(f"Found {len(session_csvs)} sessions")
-    if reviewer:
-        print(f"Applying face instance annotations from reviewer: {reviewer}")
-    
+    if ann_base:
+        print(f"Applying face instance annotations from: {ann_base}")
+
     # Load all sessions
     all_dfs = []
     all_embeddings = []
     total_filtered_by_annotations = 0
-    
+
     for session_idx, session in enumerate(session_csvs):
         print(f"  Loading {session['session_name']}...")
-        
+
         df = pd.read_csv(session['csv_path'])
+        # Keep original row index so we can write it back to the overlay file
+        df['instance_index'] = df.index
         original_count = len(df)
-        
-        # Load face instance annotations if reviewer is specified
-        if reviewer:
-            annotation_dir = session['session_dir'] / "annotations"
-            annotation_file = annotation_dir / f"{reviewer}.csv"
-            
+
+        # Apply reviewer Tab 2 annotations if available
+        if ann_base is not None:
+            annotation_file = ann_base / session['session_name'] / "tab2_is_face.csv"
             if annotation_file.exists():
                 try:
                     ann_df = pd.read_csv(annotation_file)
-                    # Create mapping: instance_index -> is_face
                     is_face_map = dict(zip(ann_df['instance_index'], ann_df['is_face']))
-                    
-                    # Filter out instances marked as non-face
-                    # Keep instances that are either:
-                    # 1. Not in annotation file (not reviewed = assumed valid)
-                    # 2. Marked as is_face=True
-                    valid_mask = df.index.map(lambda idx: is_face_map.get(idx, True))
+                    valid_mask = df['instance_index'].map(
+                        lambda idx: is_face_map.get(idx, True)
+                    )
                     df = df[valid_mask].reset_index(drop=True)
-                    
                     filtered_count = original_count - len(df)
                     if filtered_count > 0:
-                        print(f"    Filtered {filtered_count} non-face instances based on {reviewer}'s annotations")
+                        print(f"    Filtered {filtered_count} non-face instances")
                         total_filtered_by_annotations += filtered_count
                 except Exception as e:
                     print(f"    Warning: Could not load annotations from {annotation_file}: {e}")
@@ -154,7 +159,6 @@ def load_all_sessions(participant_dir: str, min_confidence: float = 0.0, reviewe
         
         df['session_name'] = session['session_name']
         df['session_index'] = session_idx
-        df['original_row_index'] = df.index
         
         all_dfs.append(df)
         all_embeddings.extend(embeddings)
@@ -453,9 +457,10 @@ def refine_small_clusters(
 
 def stage3_graph_clustering(
     participant_dir: str,
+    annotations_dir: str = None,
+    output_dir: str = None,
     similarity_threshold: float = 0.6,
     k_neighbors: int = 50,
-    output_name: str = 'faces_combined.csv',
     min_confidence: float = 0.0,
     algorithm: str = 'leiden',
     enable_refinement: bool = True,
@@ -463,41 +468,51 @@ def stage3_graph_clustering(
     k_voting: int = 10,
     min_votes: int = 5,
     reassign_threshold: float = None,
-    reviewer: str = None,
 ):
     """
     Stage 3: Graph-based community detection for global face IDs.
-    
+
     Parameters
     ----------
     participant_dir : str
-        Path to participant directory
+        Path to participant directory.
+    annotations_dir : str, optional
+        Reviewer's per-participant annotation directory
+        (``{project}/_annotations/{reviewer_id}/{participant}/``).
+        Per-session ``tab2_is_face.csv`` files are read from here.
+    output_dir : str, optional
+        Directory where ``tab3_face_ids.csv`` and ``tab3_stats.txt`` are
+        written.  Defaults to *annotations_dir* when provided, otherwise to
+        *participant_dir*.
     similarity_threshold : float
-        Cosine similarity threshold for edges
+        Cosine similarity threshold for edges.
     k_neighbors : int
-        Number of nearest neighbors to consider
-    output_name : str
-        Output filename
+        Number of nearest neighbors to consider.
     min_confidence : float
-        Minimum detection confidence
+        Minimum detection confidence.
     algorithm : str
-        'leiden' or 'louvain'
+        ``'leiden'`` or ``'louvain'``.
     enable_refinement : bool
-        Whether to refine small clusters using k-NN voting (default: True)
+        Whether to refine small clusters using k-NN voting.
     min_cluster_size : int
-        Clusters with ≤ this many faces are candidates for reassignment (default: 5)
+        Clusters with ≤ this many faces are candidates for reassignment.
     k_voting : int
-        Number of neighbors to check for voting in refinement (default: 10)
+        Number of neighbours to check for voting in refinement.
     min_votes : int
-        Minimum votes needed to reassign a face (default: 5)
+        Minimum votes needed to reassign a face.
     reassign_threshold : float
-        Similarity threshold for reassignment (default: similarity_threshold + 0.05)
-    reviewer : str, optional
-        Reviewer name to load face instance annotations from.
-        If provided, filters out instances marked as non-face.
+        Similarity threshold for reassignment.
     """
     participant_path = Path(participant_dir).resolve()
-    output_csv = participant_path / output_name
+
+    # Resolve output directory
+    if output_dir:
+        out_path = Path(output_dir)
+    elif annotations_dir:
+        out_path = Path(annotations_dir)
+    else:
+        out_path = participant_path
+    out_path.mkdir(parents=True, exist_ok=True)
     
     print("=" * 80)
     print("STAGE 3: GRAPH-BASED COMMUNITY DETECTION")
@@ -514,7 +529,9 @@ def stage3_graph_clustering(
     print("STEP 1: LOADING DATA")
     print("=" * 80)
     
-    combined_df, embeddings, metadata = load_all_sessions(participant_dir, min_confidence, reviewer)
+    combined_df, embeddings, metadata = load_all_sessions(
+        participant_dir, min_confidence, annotations_dir
+    )
     
     print(f"\n[OK] Loaded {len(combined_df):,} faces from {metadata['num_sessions']} sessions")
     
@@ -588,53 +605,36 @@ def stage3_graph_clustering(
         final_num_ids = combined_df['face_id'].nunique()
         print(f"  IDs: {initial_num_ids} → {final_num_ids} (reduced by {initial_num_ids - final_num_ids})")
     
-    # Reorder columns
-    cols = list(combined_df.columns)
-    cols.remove('face_id')
-    cols.remove('session_name')
-    if 'embedding' in cols:
-        cols.remove('embedding')
-        cols = ['face_id', 'session_name'] + cols + ['embedding']
-    else:
-        cols = ['face_id', 'session_name'] + cols
-    
-    combined_df = combined_df[cols]
-    
-    # Save combined CSV
-    combined_df.to_csv(output_csv, index=False)
-    print(f"  [OK] Saved: {output_csv}")
-    
-    # Save per-session CSVs
-    for session_name in combined_df['session_name'].unique():
-        session_df = combined_df[combined_df['session_name'] == session_name]
-        session_dirs = [d for d in participant_path.iterdir() if d.name == session_name]
-        if session_dirs:
-            session_output = session_dirs[0] / "stage3_global_ids.csv"
-            session_df.to_csv(session_output, index=False)
-            print(f"  [OK] {session_name}: {len(session_df):,} faces")
-    
-    # Get final unique ID count after refinement
     final_num_unique_ids = combined_df['face_id'].nunique()
-    
-    # STEP 6: Generate stats
+
+    # STEP 6: Write thin overlay file (session_name, instance_index, face_id)
     print("\n" + "=" * 80)
-    print("STEP 6: GENERATING STATISTICS")
+    print("STEP 6: SAVING RESULTS")
     print("=" * 80)
-    
-    stats_file = participant_path / "faces_combined.stats.txt"
+
+    face_ids_file = out_path / "tab3_face_ids.csv"
+    overlay_df = combined_df[['session_name', 'instance_index', 'face_id']].copy()
+    overlay_df.to_csv(face_ids_file, index=False)
+    print(f"  [OK] Face ID overlay saved: {face_ids_file}")
+    print(f"       {len(overlay_df):,} rows, {final_num_unique_ids} unique IDs")
+
+    # Write stats
+    stats_file = out_path / "tab3_stats.txt"
     with open(stats_file, 'w') as f:
-        f.write("Global Face ID Assignment Statistics\n")
+        f.write("Stage 3 — Global Face ID Assignment Statistics\n")
         f.write("=" * 80 + "\n\n")
         f.write(f"Algorithm: {algorithm.upper()}\n")
         f.write(f"Similarity threshold: {similarity_threshold}\n")
         f.write(f"k-neighbors: {k_neighbors}\n")
         if min_confidence > 0:
             f.write(f"Min confidence: {min_confidence}\n")
-        f.write(f"\nTotal faces: {len(combined_df):,}\n")
+        f.write(f"\nTotal faces clustered: {len(combined_df):,}\n")
         f.write(f"Unique global IDs: {final_num_unique_ids}\n")
         f.write(f"Sessions: {metadata['num_sessions']}\n")
         f.write(f"Graph edges: {len(edge_sources):,}\n\n")
-        
+        f.write(f"Filtered by Tab 2 annotations: "
+                f"{metadata['total_filtered_by_annotations']:,}\n\n")
+
         f.write("Per-session breakdown:\n\n")
         for session_name in metadata['session_names']:
             session_df = combined_df[combined_df['session_name'] == session_name]
@@ -643,42 +643,41 @@ def stage3_graph_clustering(
             unique_ids = session_df['face_id'].nunique()
             attended = int(session_df['attended'].sum()) if 'attended' in session_df.columns else 0
             attended_pct = 100 * attended / len(session_df) if len(session_df) > 0 else 0
-            
             f.write(f"{session_name}:\n")
             f.write(f"  Total faces: {len(session_df):,}\n")
             f.write(f"  Unique global IDs: {unique_ids}\n")
             f.write(f"  Attended faces: {attended:,} ({attended_pct:.1f}%)\n\n")
-        
+
         f.write("=" * 80 + "\n")
         f.write("Global ID Distribution (sorted by instance count):\n\n")
-        
         id_counts = combined_df['face_id'].value_counts()
-        
         for face_id in id_counts.index:
             count = id_counts[face_id]
             faces = combined_df[combined_df['face_id'] == face_id]
             sessions_present = faces['session_name'].unique()
             attended_count = int(faces['attended'].sum()) if 'attended' in faces.columns else 0
-            
-            f.write(f"{face_id}: {count} instances across {len(sessions_present)} session(s) ({attended_count} attended)\n")
-    
+            f.write(
+                f"{face_id}: {count} instances across "
+                f"{len(sessions_present)} session(s) "
+                f"({attended_count} attended)\n"
+            )
+
     print(f"  [OK] Stats saved: {stats_file}")
-    
-    # Final summary
+
     print("\n" + "=" * 80)
     print("[OK] STAGE 3 COMPLETE")
     print("=" * 80)
     print(f"Total faces: {len(combined_df):,}")
     print(f"Unique global IDs: {final_num_unique_ids}")
     print(f"Graph edges: {len(edge_sources):,}")
-    print(f"Output: {output_csv}")
+    print(f"Output: {face_ids_file}")
     print("=" * 80)
-    
+
     return {
         'total_faces': len(combined_df),
         'unique_global_ids': final_num_unique_ids,
         'num_edges': len(edge_sources),
-        'output_csv': str(output_csv),
+        'face_ids_file': str(face_ids_file),
         'stats_file': str(stats_file),
     }
 
@@ -687,9 +686,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Stage 3: Graph-based community detection for global face IDs"
     )
-    
+
     parser.add_argument('participant_dir', help='Path to participant directory')
-    parser.add_argument('-t', '--threshold', type=float, default=0.6, 
+    parser.add_argument('-t', '--threshold', type=float, default=0.6,
                         help='Similarity threshold (default: 0.6)')
     parser.add_argument('-k', '--k-neighbors', type=int, default=50,
                         help='Number of nearest neighbors (default: 50)')
@@ -697,29 +696,33 @@ if __name__ == "__main__":
                         help='Minimum confidence (default: 0.0)')
     parser.add_argument('-a', '--algorithm', choices=['leiden', 'louvain'], default='leiden',
                         help='Community detection algorithm (default: leiden)')
-    parser.add_argument('-o', '--output', default='faces_combined.csv',
-                        help='Output filename (default: faces_combined.csv)')
+    parser.add_argument('--annotations_dir', type=str, default=None,
+                        help='Reviewer annotation directory for this participant '
+                             '({project}/_annotations/{reviewer_id}/{participant}/). '
+                             'Per-session tab2_is_face.csv files are read from here.')
+    parser.add_argument('--output_dir', type=str, default=None,
+                        help='Directory where tab3_face_ids.csv is written '
+                             '(defaults to annotations_dir or participant_dir).')
     parser.add_argument('--no-refine', action='store_true',
                         help='Disable small cluster refinement')
     parser.add_argument('--min-cluster-size', type=int, default=5,
-                        help='Clusters with ≤ N faces are refined (default: 5)')
+                        help='Clusters with <= N faces are refined (default: 5)')
     parser.add_argument('--k-voting', type=int, default=10,
                         help='Neighbors to check for voting in refinement (default: 10)')
     parser.add_argument('--min-votes', type=int, default=5,
                         help='Minimum votes needed to reassign a face (default: 5)')
     parser.add_argument('--reassign-threshold', type=float, default=None,
                         help='Similarity threshold for reassignment (default: threshold + 0.05)')
-    parser.add_argument('--reviewer', type=str, default=None,
-                        help='Reviewer name to load face instance annotations from (optional)')
-    
+
     args = parser.parse_args()
-    
+
     try:
         stage3_graph_clustering(
             participant_dir=args.participant_dir,
+            annotations_dir=args.annotations_dir,
+            output_dir=args.output_dir,
             similarity_threshold=args.threshold,
             k_neighbors=args.k_neighbors,
-            output_name=args.output,
             min_confidence=args.min_confidence,
             algorithm=args.algorithm,
             enable_refinement=not args.no_refine,
@@ -727,7 +730,6 @@ if __name__ == "__main__":
             k_voting=args.k_voting,
             min_votes=args.min_votes,
             reassign_threshold=args.reassign_threshold,
-            reviewer=args.reviewer,
         )
     except Exception as e:
         print(f"\n[ERROR] Error: {e}", file=sys.stderr)

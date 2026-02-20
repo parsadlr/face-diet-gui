@@ -104,7 +104,7 @@ class DirectoryTreeWidget(ctk.CTkFrame):
         
         participants = sorted([
             d for d in self.project_dir.iterdir()
-            if d.is_dir() and not d.name.startswith('.')
+            if d.is_dir() and not d.name.startswith('.') and not d.name.startswith('_')
         ])
         
         if not participants:

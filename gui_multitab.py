@@ -27,7 +27,7 @@ from PIL import Image, ImageTk
 from tkinter import filedialog, messagebox
 import tkinter
 
-from settings_manager import SettingsManager
+from settings_manager import SettingsManager, ReviewerRegistry
 from directory_tree_widget import DirectoryTreeWidget
 
 # Path to venv_tf210 Python interpreter for processing
@@ -276,6 +276,8 @@ def _run_stage2_via_subprocess(session_dir: str, batch_size: int, reporter, debu
 
 def _run_stage3_via_subprocess(
     participant_dir: str,
+    annotations_dir: str,
+    output_dir: str,
     similarity_threshold: float,
     k_neighbors: int,
     min_confidence: float,
@@ -285,40 +287,37 @@ def _run_stage3_via_subprocess(
     k_voting: int,
     min_votes: int,
     reporter,
-    reviewer: str = None
 ):
     """Run stage3_graph_clustering via subprocess using venv_tf210, streaming output in real-time."""
     import time
     import threading
-    
+
     if not VENV_TF210_PYTHON.exists():
         raise FileNotFoundError(
             f"venv_tf210 Python interpreter not found at: {VENV_TF210_PYTHON}\n"
             f"Please ensure venv_tf210 is set up correctly."
         )
-    
+
     script_path = Path(__file__).parent / "stage3_graph_clustering.py"
     cmd = [
         str(VENV_TF210_PYTHON),
-        "-u",  # Unbuffered output
+        "-u",
         str(script_path),
         participant_dir,
         "--threshold", str(similarity_threshold),
         "--k-neighbors", str(k_neighbors),
         "--min-confidence", str(min_confidence),
         "--algorithm", algorithm,
-        "--output", "faces_combined.csv",
+        "--annotations_dir", annotations_dir,
+        "--output_dir", output_dir,
     ]
-    
+
     if not enable_refinement:
         cmd.append("--no-refine")
     else:
         cmd.extend(["--min-cluster-size", str(min_cluster_size)])
         cmd.extend(["--k-voting", str(k_voting)])
         cmd.extend(["--min-votes", str(min_votes)])
-    
-    if reviewer:
-        cmd.extend(["--reviewer", reviewer])
     
     # Use Popen to stream output in real-time
     # Set encoding to UTF-8 to handle Unicode characters properly on Windows
@@ -540,13 +539,15 @@ class ProgressReporter:
 class VideoProcessingTab(ctk.CTkFrame):
     """Tab 1: Video Processing (Stages 1 & 2)."""
     
-    def __init__(self, master, settings_manager: SettingsManager):
+    def __init__(self, master, settings_manager: SettingsManager,
+                 project_dir: Path, reviewer_id: str):
         super().__init__(master)
         self.settings = settings_manager
-        self.project_dir: Optional[Path] = None
+        self.project_dir: Path = project_dir
+        self.reviewer_id: str = reviewer_id
         self.processing_thread: Optional[threading.Thread] = None
         self.is_processing = False
-        
+
         self._setup_ui()
         self._load_settings()
     
@@ -558,32 +559,37 @@ class VideoProcessingTab(ctk.CTkFrame):
             text="Video Processing: Face Detection & Attributes",
             font=ctk.CTkFont(size=20, weight="bold")
         ).pack(pady=(10, 20))
-        
-        # Directory selection
-        dir_frame = ctk.CTkFrame(self)
-        dir_frame.pack(fill="x", padx=20, pady=(0, 10))
-        
+
+        # Read-only project + reviewer info bar
+        info_frame = ctk.CTkFrame(self)
+        info_frame.pack(fill="x", padx=20, pady=(0, 10))
+
         ctk.CTkLabel(
-            dir_frame,
-            text="Project Directory:",
-            font=ctk.CTkFont(size=14, weight="bold")
-        ).pack(side="left", padx=10)
-        
-        self.dir_entry = ctk.CTkEntry(
-            dir_frame,
-            placeholder_text="Select project root directory...",
-            width=500,
-            state="readonly"
+            info_frame,
+            text="Project:",
+            font=ctk.CTkFont(size=13, weight="bold")
+        ).pack(side="left", padx=(10, 4))
+
+        self.dir_label = ctk.CTkLabel(
+            info_frame,
+            text=str(self.project_dir) if self.project_dir else "—",
+            font=ctk.CTkFont(size=12),
+            text_color="gray"
         )
-        self.dir_entry.pack(side="left", padx=10)
-        
-        ctk.CTkButton(
-            dir_frame,
-            text="Browse",
-            command=self._browse_directory,
-            width=100,
-            height=35
-        ).pack(side="left", padx=5)
+        self.dir_label.pack(side="left", padx=(0, 20))
+
+        ctk.CTkLabel(
+            info_frame,
+            text="Reviewer:",
+            font=ctk.CTkFont(size=13, weight="bold")
+        ).pack(side="left", padx=(10, 4))
+
+        ctk.CTkLabel(
+            info_frame,
+            text=self.reviewer_id or "—",
+            font=ctk.CTkFont(size=12),
+            text_color="#3b8ed0"
+        ).pack(side="left", padx=(0, 10))
         
         # Main content area (side-by-side)
         content_frame = ctk.CTkFrame(self)
@@ -821,23 +827,23 @@ class VideoProcessingTab(ctk.CTkFrame):
     
     def _load_settings(self):
         """Load settings into UI."""
-        last_dir = self.settings.get("last_project_dir", "")
-        if last_dir and Path(last_dir).exists():
-            self.project_dir = Path(last_dir)
-            self.dir_entry.configure(state="normal")
-            self.dir_entry.delete(0, "end")
-            self.dir_entry.insert(0, last_dir)
-            self.dir_entry.configure(state="readonly")
-            self.tree_widget.build_tree(last_dir)
-        
+        # Build tree from the app-level project_dir
+        if self.project_dir and self.project_dir.exists():
+            self.tree_widget.build_tree(str(self.project_dir))
+
         self.use_original_fps_var.set(self.settings.get("stage1.use_original_fps", True))
         self.sampling_rate_var.set(self.settings.get("stage1.sampling_rate", 30))
         self.min_confidence_stage1_var.set(self.settings.get("stage1.min_confidence", 0.0))
         self.use_gpu_var.set(self.settings.get("stage1.use_gpu", False))
         self.batch_size_var.set(self.settings.get("stage2.batch_size", 32))
-        
-        # Update UI state based on checkbox
+
         self._on_original_fps_toggle()
+
+    def set_project_dir(self, project_dir: Path):
+        """Called by app when project directory changes."""
+        self.project_dir = project_dir
+        self.dir_label.configure(text=str(project_dir))
+        self.tree_widget.build_tree(str(project_dir))
     
     def _get_min_confidence(self):
         """Get min confidence value with validation."""
@@ -1023,22 +1029,29 @@ class VideoProcessingTab(ctk.CTkFrame):
 
 class FaceInstanceReviewTab(ctk.CTkFrame):
     """Tab 2: Face Instance Review - Manual review of detected faces before clustering."""
-    
-    def __init__(self, master, settings_manager: SettingsManager):
+
+    def __init__(self, master, settings_manager: SettingsManager,
+                 project_dir: Path, reviewer_id: str):
         super().__init__(master)
         self.settings = settings_manager
-        
-        # Data storage
+        self.project_dir: Path = project_dir
+        self.reviewer_id: str = reviewer_id
+
+        # Selected participant / session
+        self.selected_participant: Optional[str] = None
+        self.selected_session: Optional[str] = None
         self.session_dir: Optional[Path] = None
+
+        # Data storage
         self.df: Optional[pd.DataFrame] = None
         self.annotations: Dict = {}  # instance_index -> {'is_face': bool, 'reviewed_at': str}
         self.current_page = 0
         self.items_per_page = 100
         self.selected_instances = set()
-        
+
         # Image cache
         self.image_cache: Dict[int, Image.Image] = {}
-        
+
         self._setup_ui()
         self._load_settings()
     
@@ -1050,59 +1063,62 @@ class FaceInstanceReviewTab(ctk.CTkFrame):
             text="Face Instance Review - Manual Detection Verification",
             font=ctk.CTkFont(size=20, weight="bold")
         ).pack(pady=(10, 20))
-        
-        # Session selection
-        dir_frame = ctk.CTkFrame(self)
-        dir_frame.pack(fill="x", padx=20, pady=(0, 10))
-        
+
+        # Reviewer info bar
+        info_frame = ctk.CTkFrame(self)
+        info_frame.pack(fill="x", padx=20, pady=(0, 10))
+
         ctk.CTkLabel(
-            dir_frame,
-            text="Session Folder:",
-            font=ctk.CTkFont(size=14, weight="bold")
-        ).pack(side="left", padx=10)
-        
-        self.path_entry = ctk.CTkEntry(
-            dir_frame,
-            placeholder_text="Select session directory...",
-            width=500,
-            state="readonly"
-        )
-        self.path_entry.pack(side="left", padx=10)
-        
-        ctk.CTkButton(
-            dir_frame,
-            text="Browse",
-            command=self._browse_session,
-            width=100,
-            height=35
-        ).pack(side="left", padx=5)
-        
-        # Reviewer name
-        reviewer_frame = ctk.CTkFrame(self)
-        reviewer_frame.pack(fill="x", padx=20, pady=(0, 10))
-        
+            info_frame,
+            text="Reviewing as:",
+            font=ctk.CTkFont(size=13, weight="bold")
+        ).pack(side="left", padx=(10, 4))
         ctk.CTkLabel(
-            reviewer_frame,
-            text="Reviewer Name:",
-            font=ctk.CTkFont(size=13)
-        ).pack(side="left", padx=10)
-        
-        self.reviewer_entry = ctk.CTkEntry(
-            reviewer_frame,
-            placeholder_text="Enter your name...",
-            width=200
-        )
-        self.reviewer_entry.pack(side="left", padx=10)
-        
+            info_frame,
+            text=self.reviewer_id or "—",
+            font=ctk.CTkFont(size=13),
+            text_color="#3b8ed0"
+        ).pack(side="left", padx=(0, 20))
+
+        # Participant / session selector
+        sel_frame = ctk.CTkFrame(self)
+        sel_frame.pack(fill="x", padx=20, pady=(0, 10))
+
+        # --- Left: participants ---
+        p_col = ctk.CTkFrame(sel_frame)
+        p_col.pack(side="left", fill="both", expand=True, padx=(0, 5))
+
+        ctk.CTkLabel(
+            p_col, text="Participant", font=ctk.CTkFont(size=13, weight="bold")
+        ).pack(anchor="w", padx=5, pady=(4, 2))
+
+        self.participant_listbox = ctk.CTkScrollableFrame(p_col, height=90)
+        self.participant_listbox.pack(fill="both", expand=True, padx=5, pady=(0, 4))
+
+        # --- Right: sessions ---
+        s_col = ctk.CTkFrame(sel_frame)
+        s_col.pack(side="left", fill="both", expand=True, padx=(5, 0))
+
+        ctk.CTkLabel(
+            s_col, text="Session", font=ctk.CTkFont(size=13, weight="bold")
+        ).pack(anchor="w", padx=5, pady=(4, 2))
+
+        self.session_listbox = ctk.CTkScrollableFrame(s_col, height=90)
+        self.session_listbox.pack(fill="both", expand=True, padx=5, pady=(0, 4))
+
+        # Load button
         self.load_btn = ctk.CTkButton(
-            reviewer_frame,
+            sel_frame,
             text="Load Session",
             command=self._load_session,
             width=120,
             height=35,
             state="disabled"
         )
-        self.load_btn.pack(side="left", padx=10)
+        self.load_btn.pack(side="left", padx=10, pady=5, anchor="s")
+
+        # Populate participant list immediately
+        self._populate_participants()
         
         # Statistics panel
         self.stats_frame = ctk.CTkFrame(self)
@@ -1266,55 +1282,102 @@ class FaceInstanceReviewTab(ctk.CTkFrame):
         )
         self.save_btn.pack(side="left", padx=5)
     
-    def _browse_session(self):
-        """Browse for session directory."""
-        folder = filedialog.askdirectory(title="Select Session Directory")
-        if not folder:
+    def _populate_participants(self):
+        """Populate the participant list from the project directory."""
+        for w in self.participant_listbox.winfo_children():
+            w.destroy()
+        self._participant_btn_vars: Dict[str, ctk.StringVar] = {}
+
+        if not self.project_dir or not self.project_dir.exists():
+            ctk.CTkLabel(
+                self.participant_listbox, text="No project loaded", text_color="gray"
+            ).pack()
             return
-        
-        self.session_dir = Path(folder)
-        self.path_entry.configure(state="normal")
-        self.path_entry.delete(0, "end")
-        self.path_entry.insert(0, str(self.session_dir))
-        self.path_entry.configure(state="readonly")
-        
-        # Enable load button if reviewer name is set
-        if self.reviewer_entry.get().strip():
-            self.load_btn.configure(state="normal")
-        
-        # Save to settings
-        self.settings.set("last_session_dir_review", str(self.session_dir))
-        self.settings.save_settings()
-    
+
+        participants = sorted([
+            d.name for d in self.project_dir.iterdir()
+            if d.is_dir() and not d.name.startswith('_') and not d.name.startswith('.')
+        ])
+
+        for pname in participants:
+            btn = ctk.CTkButton(
+                self.participant_listbox,
+                text=pname,
+                height=28,
+                anchor="w",
+                fg_color="transparent",
+                hover_color=("gray85", "gray30"),
+                command=lambda p=pname: self._on_participant_selected(p)
+            )
+            btn.pack(fill="x", padx=2, pady=1)
+            self._participant_btn_vars[pname] = btn
+
+    def _on_participant_selected(self, participant: str):
+        """Called when a participant is clicked."""
+        self.selected_participant = participant
+        self.selected_session = None
+        self.load_btn.configure(state="disabled")
+
+        # Highlight selected participant
+        for pname, btn in self._participant_btn_vars.items():
+            btn.configure(
+                fg_color=("#3b8ed0" if pname == participant else "transparent")
+            )
+
+        # Populate sessions
+        for w in self.session_listbox.winfo_children():
+            w.destroy()
+
+        p_path = self.project_dir / participant
+        sessions = sorted([
+            d.name for d in p_path.iterdir()
+            if d.is_dir()
+            and not d.name.startswith('_')
+            and not d.name.startswith('.')
+            and (d / "face_detections.csv").exists()
+        ])
+
+        self._session_btn_vars: Dict[str, ctk.CTkButton] = {}
+        for sname in sessions:
+            # Check if reviewer already has annotations for this session
+            registry = ReviewerRegistry(self.project_dir)
+            ann_path = registry.get_tab2_annotation_path(
+                self.reviewer_id, participant, sname
+            )
+            done_marker = " ✓" if ann_path.exists() else ""
+            btn = ctk.CTkButton(
+                self.session_listbox,
+                text=sname + done_marker,
+                height=28,
+                anchor="w",
+                fg_color="transparent",
+                hover_color=("gray85", "gray30"),
+                command=lambda s=sname: self._on_session_selected(s)
+            )
+            btn.pack(fill="x", padx=2, pady=1)
+            self._session_btn_vars[sname] = btn
+
+    def _on_session_selected(self, session: str):
+        """Called when a session is clicked."""
+        self.selected_session = session
+        self.load_btn.configure(state="normal")
+
+        for sname, btn in self._session_btn_vars.items():
+            btn.configure(
+                fg_color=("#3b8ed0" if sname == session else "transparent")
+            )
+
     def _load_session(self):
-        """Load face detections from session."""
-        if not self.session_dir:
-            messagebox.showerror("Error", "Please select a session directory first.")
+        """Load face detections from the selected participant/session."""
+        if not self.selected_participant or not self.selected_session:
+            messagebox.showerror("Error", "Please select a participant and session.")
             return
-        
-        reviewer_name = self.reviewer_entry.get().strip()
-        if not reviewer_name:
-            messagebox.showerror("Error", "Please enter your reviewer name.")
-            return
-        
-        # Sanitize reviewer name for filesystem
-        reviewer_name = self._sanitize_reviewer_name(reviewer_name)
-        self.reviewer_name = reviewer_name
-        
-        # Save reviewer name to settings
-        self.settings.set("reviewer_name", reviewer_name)
-        self.settings.save_settings()
-        
+
+        self.session_dir = self.project_dir / self.selected_participant / self.selected_session
+
         # Load data in background thread
         thread = threading.Thread(target=self._load_data_thread, daemon=True)
         thread.start()
-    
-    def _sanitize_reviewer_name(self, name: str) -> str:
-        """Sanitize reviewer name for use in filenames."""
-        import re
-        # Replace spaces and special chars with underscores
-        sanitized = re.sub(r'[^\w\-]', '_', name)
-        return sanitized.lower()
     
     def _load_data_thread(self):
         """Load face detections in background thread."""
@@ -1361,9 +1424,11 @@ class FaceInstanceReviewTab(ctk.CTkFrame):
     
     def _load_existing_annotations(self):
         """Load existing annotation file if it exists."""
-        annotation_dir = self.session_dir / "annotations"
-        annotation_file = annotation_dir / f"{self.reviewer_name}.csv"
-        
+        registry = ReviewerRegistry(self.project_dir)
+        annotation_file = registry.get_tab2_annotation_path(
+            self.reviewer_id, self.selected_participant, self.selected_session
+        )
+
         if annotation_file.exists():
             try:
                 ann_df = pd.read_csv(annotation_file)
@@ -1376,24 +1441,10 @@ class FaceInstanceReviewTab(ctk.CTkFrame):
                 print(f"Loaded existing annotations from {annotation_file}")
             except Exception as e:
                 print(f"Warning: Could not load annotations: {e}")
-    
+
     def _load_settings(self):
-        """Load settings into UI."""
-        last_session = self.settings.get("last_session_dir_review", "")
-        if last_session and Path(last_session).exists():
-            self.session_dir = Path(last_session)
-            self.path_entry.configure(state="normal")
-            self.path_entry.delete(0, "end")
-            self.path_entry.insert(0, last_session)
-            self.path_entry.configure(state="readonly")
-        
-        reviewer_name = self.settings.get("reviewer_name", "")
-        if reviewer_name:
-            self.reviewer_entry.delete(0, "end")
-            self.reviewer_entry.insert(0, reviewer_name)
-        
-        if self.session_dir and reviewer_name:
-            self.load_btn.configure(state="normal")
+        """Load settings into UI (no per-tab reviewer or session dir to restore)."""
+        pass
     
     def _update_stats(self):
         """Update statistics display."""
@@ -1904,55 +1955,50 @@ class FaceInstanceReviewTab(ctk.CTkFrame):
         self._display_gallery()
     
     def _save_annotations(self):
-        """Save annotations to CSV file."""
+        """Save annotations to reviewer overlay CSV."""
         if self.df is None:
             return
-        
+
         try:
-            # Create annotations directory
-            annotation_dir = self.session_dir / "annotations"
-            annotation_dir.mkdir(exist_ok=True)
-            
-            # Build annotation dataframe
+            registry = ReviewerRegistry(self.project_dir)
+            annotation_file = registry.get_tab2_annotation_path(
+                self.reviewer_id, self.selected_participant, self.selected_session
+            )
+            annotation_file.parent.mkdir(parents=True, exist_ok=True)
+
             annotation_records = []
             for idx in self.df.index:
-                row = self.df.loc[idx]
                 ann = self.annotations.get(idx, {'is_face': True, 'reviewed_at': None})
-                
                 annotation_records.append({
                     'instance_index': idx,
-                    'frame_number': row['frame_number'],
                     'is_face': ann['is_face'],
                     'reviewed_at': ann['reviewed_at'] if ann['reviewed_at'] else '',
-                    'reviewer': self.reviewer_name
                 })
-            
-            # Save to CSV
+
             ann_df = pd.DataFrame(annotation_records)
-            annotation_file = annotation_dir / f"{self.reviewer_name}.csv"
             ann_df.to_csv(annotation_file, index=False)
-            
-            # Count statistics
+
             total = len(ann_df)
             marked_nonface = sum(1 for r in annotation_records if not r['is_face'])
             valid_faces = total - marked_nonface
-            
+
+            # Refresh session list to show ✓ marker
+            if self.selected_participant:
+                self._on_participant_selected(self.selected_participant)
+
             messagebox.showinfo(
                 "Saved",
-                f"Annotations saved successfully!\n\n"
+                f"Annotations saved!\n\n"
                 f"File: {annotation_file}\n"
                 f"Total instances: {total}\n"
                 f"Valid faces: {valid_faces}\n"
                 f"Non-face: {marked_nonface}"
             )
-            
+
         except Exception as e:
             import traceback
             traceback.print_exc()
-            messagebox.showerror(
-                "Error",
-                f"Failed to save annotations:\n{str(e)}"
-            )
+            messagebox.showerror("Error", f"Failed to save annotations:\n{str(e)}")
     
     def _update_page_numbers(self, total_pages: int = None):
         """Update the clickable page number labels (matching popup gallery style)."""
@@ -2083,21 +2129,20 @@ class FaceInstanceReviewTab(ctk.CTkFrame):
 
 class FaceIDAssignmentTab(ctk.CTkFrame):
     """Tab 3: Face ID Assignment (Stage 3)."""
-    
-    def __init__(self, master, settings_manager: SettingsManager):
+
+    def __init__(self, master, settings_manager: SettingsManager,
+                 project_dir: Path, reviewer_id: str):
         super().__init__(master)
         self.settings = settings_manager
-        self.project_dir: Optional[Path] = None
+        self.project_dir: Path = project_dir
+        self.reviewer_id: str = reviewer_id
         self.participant_widgets: Dict = {}
         self.processing_thread: Optional[threading.Thread] = None
         self.is_processing = False
-        
+
         self._setup_ui()
         self._load_settings()
-        
-        # Show initial message if no directory loaded
-        if not self.project_dir:
-            self._load_participant_list()
+        self._load_participant_list()
     
     def _setup_ui(self):
         """Setup UI components."""
@@ -2107,32 +2152,35 @@ class FaceIDAssignmentTab(ctk.CTkFrame):
             text="Face ID Assignment: Global Clustering",
             font=ctk.CTkFont(size=20, weight="bold")
         ).pack(pady=(10, 20))
-        
-        # Directory selection
-        dir_frame = ctk.CTkFrame(self)
-        dir_frame.pack(fill="x", padx=20, pady=(0, 10))
-        
+
+        # Read-only info bar
+        info_frame = ctk.CTkFrame(self)
+        info_frame.pack(fill="x", padx=20, pady=(0, 10))
+
         ctk.CTkLabel(
-            dir_frame,
-            text="Project Directory:",
-            font=ctk.CTkFont(size=14, weight="bold")
-        ).pack(side="left", padx=10)
-        
-        self.dir_entry = ctk.CTkEntry(
-            dir_frame,
-            placeholder_text="Select project root directory...",
-            width=500,
-            state="readonly"
+            info_frame,
+            text="Project:",
+            font=ctk.CTkFont(size=13, weight="bold")
+        ).pack(side="left", padx=(10, 4))
+        self.dir_label = ctk.CTkLabel(
+            info_frame,
+            text=str(self.project_dir) if self.project_dir else "—",
+            font=ctk.CTkFont(size=12),
+            text_color="gray"
         )
-        self.dir_entry.pack(side="left", padx=10)
-        
-        ctk.CTkButton(
-            dir_frame,
-            text="Browse",
-            command=self._browse_directory,
-            width=100,
-            height=35
-        ).pack(side="left", padx=5)
+        self.dir_label.pack(side="left", padx=(0, 20))
+
+        ctk.CTkLabel(
+            info_frame,
+            text="Reviewer:",
+            font=ctk.CTkFont(size=13, weight="bold")
+        ).pack(side="left", padx=(10, 4))
+        ctk.CTkLabel(
+            info_frame,
+            text=self.reviewer_id or "—",
+            font=ctk.CTkFont(size=13),
+            text_color="#3b8ed0"
+        ).pack(side="left", padx=(0, 10))
         
         # Main content area
         content_frame = ctk.CTkFrame(self)
@@ -2278,26 +2326,15 @@ class FaceIDAssignmentTab(ctk.CTkFrame):
         self.min_votes_var = ctk.IntVar(value=5)
         ctk.CTkEntry(mv_frame, textvariable=self.min_votes_var, width=70).pack(side="left", padx=5)
         
-        # Reviewer name (for loading face instance annotations)
-        reviewer_frame = ctk.CTkFrame(settings_frame)
-        reviewer_frame.pack(fill="x", padx=5, pady=10)
+        # Info: reviewer annotations will be applied automatically
+        rev_info_frame = ctk.CTkFrame(settings_frame)
+        rev_info_frame.pack(fill="x", padx=5, pady=10)
         ctk.CTkLabel(
-            reviewer_frame, 
-            text="Reviewer (optional):", 
-            width=150, 
-            anchor="w"
-        ).pack(side="left")
-        self.reviewer_entry_tab3 = ctk.CTkEntry(
-            reviewer_frame,
-            placeholder_text="Leave blank to include all faces",
-            width=200
-        )
-        self.reviewer_entry_tab3.pack(side="left", padx=5)
-        ctk.CTkLabel(
-            reviewer_frame,
-            text="(applies face instance filters)",
-            font=ctk.CTkFont(size=9),
-            text_color="gray"
+            rev_info_frame,
+            text="Face instance filters from Tab 2 will be applied\nautomatically using the current reviewer's annotations.",
+            font=ctk.CTkFont(size=10),
+            text_color="gray",
+            justify="left"
         ).pack(side="left", padx=5)
     
     def _create_progress_panel(self, parent):
@@ -2384,25 +2421,12 @@ class FaceIDAssignmentTab(ctk.CTkFrame):
         else:
             self.log_textbox.pack_forget()
     
-    def _browse_directory(self):
-        """Browse for project directory."""
-        folder = filedialog.askdirectory(title="Select Project Root Directory")
-        if not folder:
-            return
-        
-        self.project_dir = Path(folder)
-        self.dir_entry.configure(state="normal")
-        self.dir_entry.delete(0, "end")
-        self.dir_entry.insert(0, str(self.project_dir))
-        self.dir_entry.configure(state="readonly")
-        
-        # Load participants
+    def set_project_dir(self, project_dir: Path):
+        """Called by app when project directory changes."""
+        self.project_dir = project_dir
+        self.dir_label.configure(text=str(project_dir))
         self._load_participant_list()
-        
-        # Save to settings
-        self.settings.set("last_project_dir", str(self.project_dir))
-        self.settings.save_settings()
-    
+
     def _load_participant_list(self):
         """Load participants from project directory."""
         # Clear existing
@@ -2430,10 +2454,12 @@ class FaceIDAssignmentTab(ctk.CTkFrame):
             ).pack(pady=5)
             return
         
-        # Find participants
+        # Find participants (skip hidden and reserved dirs)
         participants = sorted([
             d for d in self.project_dir.iterdir()
-            if d.is_dir() and not d.name.startswith('.')
+            if d.is_dir()
+            and not d.name.startswith('.')
+            and not d.name.startswith('_')
         ])
         
         if not participants:
@@ -2517,15 +2543,6 @@ class FaceIDAssignmentTab(ctk.CTkFrame):
     
     def _load_settings(self):
         """Load settings into UI."""
-        last_dir = self.settings.get("last_project_dir", "")
-        if last_dir and Path(last_dir).exists():
-            self.project_dir = Path(last_dir)
-            self.dir_entry.configure(state="normal")
-            self.dir_entry.delete(0, "end")
-            self.dir_entry.insert(0, last_dir)
-            self.dir_entry.configure(state="readonly")
-            self._load_participant_list()
-        
         self.algorithm_var.set(self.settings.get("stage3.algorithm", "leiden"))
         self.sim_threshold_var.set(self.settings.get("stage3.similarity_threshold", 0.6))
         self.k_neighbors_var.set(self.settings.get("stage3.k_neighbors", 50))
@@ -2534,12 +2551,6 @@ class FaceIDAssignmentTab(ctk.CTkFrame):
         self.min_cluster_size_var.set(self.settings.get("stage3.min_cluster_size", 5))
         self.k_voting_var.set(self.settings.get("stage3.k_voting", 10))
         self.min_votes_var.set(self.settings.get("stage3.min_votes", 5))
-        
-        # Load reviewer name
-        reviewer_name = self.settings.get("reviewer_name", "")
-        if reviewer_name:
-            self.reviewer_entry_tab3.delete(0, "end")
-            self.reviewer_entry_tab3.insert(0, reviewer_name)
     
     def _save_settings(self):
         """Save current settings."""
@@ -2629,16 +2640,16 @@ class FaceIDAssignmentTab(ctk.CTkFrame):
                 self.after(0, lambda: reporter.update_time_estimate("0s", None))  # Reset time
                 
                 try:
-                    # Get reviewer name (sanitize if provided)
-                    reviewer_name = self.reviewer_entry_tab3.get().strip()
-                    if reviewer_name:
-                        import re
-                        reviewer_name = re.sub(r'[^\w\-]', '_', reviewer_name).lower()
-                    else:
-                        reviewer_name = None
-                    
+                    registry = ReviewerRegistry(self.project_dir)
+                    annotations_dir = str(
+                        registry.get_reviewer_dir(self.reviewer_id) / participant_name
+                    )
+                    output_dir = annotations_dir  # thin face_ids file goes into same dir
+
                     _run_stage3_via_subprocess(
                         participant_dir=str(participant_path),
+                        annotations_dir=annotations_dir,
+                        output_dir=output_dir,
                         similarity_threshold=self.sim_threshold_var.get(),
                         k_neighbors=self.k_neighbors_var.get(),
                         min_confidence=self.min_confidence_var.get(),
@@ -2648,7 +2659,6 @@ class FaceIDAssignmentTab(ctk.CTkFrame):
                         k_voting=self.k_voting_var.get(),
                         min_votes=self.min_votes_var.get(),
                         reporter=reporter,
-                        reviewer=reviewer_name
                     )
                     self.after(0, lambda sid=step_id: reporter.update_step_status(sid, "completed"))
                 
@@ -2690,13 +2700,19 @@ class FaceIDAssignmentTab(ctk.CTkFrame):
 
 class ManualReviewTab(ctk.CTkFrame):
     """Tab 4: Manual Review & Merging (refactored from original GUI)."""
-    
-    def __init__(self, master, settings_manager: SettingsManager):
+
+    def __init__(self, master, settings_manager: SettingsManager,
+                 project_dir: Path, reviewer_id: str):
         super().__init__(master)
         self.settings = settings_manager
-        
-        # Data storage
+        self.project_dir: Path = project_dir
+        self.reviewer_id: str = reviewer_id
+
+        # Selected participant
+        self.selected_participant: Optional[str] = None
         self.participant_dir: Optional[Path] = None
+
+        # Data storage
         self.df: Optional[pd.DataFrame] = None
         self.df_full: Optional[pd.DataFrame] = None
         self.face_groups: Dict = {}
@@ -2705,15 +2721,15 @@ class ManualReviewTab(ctk.CTkFrame):
         self.face_id_to_merged: Dict[str, str] = {}
         self.session_bbox_stats: Dict[str, Dict[str, float]] = {}
         self.representative_sample_size = 30
-        
+
         # Session filtering
         self.available_sessions: List[str] = []
         self.session_checkboxes: Dict[str, ctk.BooleanVar] = {}
-        
+
         # UI components
         self.row_widgets: Dict[str, Dict] = {}
         self.selected_ids: set = set()
-        
+
         self._setup_ui()
         self._load_settings()
     
@@ -2725,56 +2741,51 @@ class ManualReviewTab(ctk.CTkFrame):
             text="Manual Review & Face ID Merging",
             font=ctk.CTkFont(size=20, weight="bold")
         ).pack(pady=(10, 20))
-        
-        # Participant selection
-        dir_frame = ctk.CTkFrame(self)
-        dir_frame.pack(fill="x", padx=20, pady=(0, 10))
-        
+
+        # Reviewer info bar
+        info_frame = ctk.CTkFrame(self)
+        info_frame.pack(fill="x", padx=20, pady=(0, 10))
+
         ctk.CTkLabel(
-            dir_frame,
-            text="Participant Folder:",
-            font=ctk.CTkFont(size=14, weight="bold")
-        ).pack(side="left", padx=10)
-        
-        self.path_entry = ctk.CTkEntry(
-            dir_frame,
-            placeholder_text="Select participant directory...",
-            width=500,
-            state="readonly"
+            info_frame,
+            text="Reviewing as:",
+            font=ctk.CTkFont(size=13, weight="bold")
+        ).pack(side="left", padx=(10, 4))
+        ctk.CTkLabel(
+            info_frame,
+            text=self.reviewer_id or "—",
+            font=ctk.CTkFont(size=13),
+            text_color="#3b8ed0"
+        ).pack(side="left", padx=(0, 20))
+
+        # Participant selector
+        sel_frame = ctk.CTkFrame(self)
+        sel_frame.pack(fill="x", padx=20, pady=(0, 10))
+
+        ctk.CTkLabel(
+            sel_frame,
+            text="Participant:",
+            font=ctk.CTkFont(size=13, weight="bold")
+        ).pack(side="left", padx=(10, 4))
+
+        self.participant_listbox_tab4 = ctk.CTkScrollableFrame(
+            sel_frame, height=80, width=300
         )
-        self.path_entry.pack(side="left", padx=10)
-        
-        ctk.CTkButton(
-            dir_frame,
-            text="Browse",
-            command=self._browse_folder,
-            width=100,
-            height=35
-        ).pack(side="left", padx=5)
-        
-        # Reviewer name
-        reviewer_frame = ctk.CTkFrame(self)
-        reviewer_frame.pack(fill="x", padx=20, pady=(0, 10))
-        
-        ctk.CTkLabel(
-            reviewer_frame,
-            text="Reviewer Name:",
-            font=ctk.CTkFont(size=13)
-        ).pack(side="left", padx=10)
-        
-        self.reviewer_entry = ctk.CTkEntry(
-            reviewer_frame,
-            placeholder_text="Enter your name...",
-            width=200
+        self.participant_listbox_tab4.pack(side="left", fill="x", padx=5, pady=4)
+
+        self.review_btn = ctk.CTkButton(
+            sel_frame,
+            text="Load Participant",
+            command=self._review_with_filters,
+            width=140,
+            height=35,
+            state="disabled",
+            fg_color="#007ACC",
+            hover_color="#0066AA"
         )
-        self.reviewer_entry.pack(side="left", padx=10)
-        
-        ctk.CTkLabel(
-            reviewer_frame,
-            text="(Used for annotation file naming)",
-            font=ctk.CTkFont(size=10),
-            text_color="gray"
-        ).pack(side="left", padx=5)
+        self.review_btn.pack(side="left", padx=10)
+
+        self._populate_participants_tab4()
         
         # Session filter panel
         self._create_session_filter_panel()
@@ -2962,18 +2973,53 @@ class ManualReviewTab(ctk.CTkFrame):
         )
         self.export_btn.pack(side="left", padx=5)
     
-    def _browse_folder(self):
-        """Open folder browser and load data."""
-        folder = filedialog.askdirectory(title="Select Participant Directory")
-        if not folder:
+    def _populate_participants_tab4(self):
+        """Populate the participant list from the project directory."""
+        for w in self.participant_listbox_tab4.winfo_children():
+            w.destroy()
+        self._participant_btn_tab4: Dict[str, ctk.CTkButton] = {}
+
+        if not self.project_dir or not self.project_dir.exists():
+            ctk.CTkLabel(
+                self.participant_listbox_tab4, text="No project loaded", text_color="gray"
+            ).pack()
             return
-        
-        self.participant_dir = Path(folder)
-        self.path_entry.configure(state="normal")
-        self.path_entry.delete(0, "end")
-        self.path_entry.insert(0, str(self.participant_dir))
-        self.path_entry.configure(state="readonly")
+
+        participants = sorted([
+            d.name for d in self.project_dir.iterdir()
+            if d.is_dir()
+            and not d.name.startswith('_')
+            and not d.name.startswith('.')
+        ])
+
+        for pname in participants:
+            # Only show participants that have tab3_face_ids.csv
+            registry = ReviewerRegistry(self.project_dir)
+            face_ids_path = registry.get_tab3_face_ids_path(self.reviewer_id, pname)
+            if not face_ids_path.exists():
+                continue
+            btn = ctk.CTkButton(
+                self.participant_listbox_tab4,
+                text=pname,
+                height=28,
+                anchor="w",
+                fg_color="transparent",
+                hover_color=("gray85", "gray30"),
+                command=lambda p=pname: self._on_participant_selected_tab4(p)
+            )
+            btn.pack(fill="x", padx=2, pady=1)
+            self._participant_btn_tab4[pname] = btn
+
+    def _on_participant_selected_tab4(self, participant: str):
+        """Called when a participant is clicked in Tab 4."""
+        self.selected_participant = participant
+        self.participant_dir = self.project_dir / participant
         self.review_btn.configure(state="normal")
+
+        for pname, btn in self._participant_btn_tab4.items():
+            btn.configure(
+                fg_color=("#3b8ed0" if pname == participant else "transparent")
+            )
     
     def _select_all_sessions(self):
         """Select all session checkboxes."""
@@ -3051,34 +3097,72 @@ class ManualReviewTab(ctk.CTkFrame):
     
     def _review_with_filters(self):
         """Load and filter data using current settings."""
-        if not self.participant_dir:
-            messagebox.showerror("Error", "Please select a participant folder first.")
+        if not self.selected_participant:
+            messagebox.showerror("Error", "Please select a participant first.")
             return
         self._validate_and_load()
-    
+
     def _validate_and_load(self):
-        """Validate folder structure and load data."""
-        csv_path = self.participant_dir / "faces_combined.csv"
-        
-        if not csv_path.exists():
+        """Validate that clustering has been run for this reviewer/participant, then load."""
+        registry = ReviewerRegistry(self.project_dir)
+        face_ids_path = registry.get_tab3_face_ids_path(
+            self.reviewer_id, self.selected_participant
+        )
+
+        if not face_ids_path.exists():
             messagebox.showerror(
                 "Error",
-                f"Could not find faces_combined.csv in:\n{self.participant_dir}"
+                f"No face ID assignments found for reviewer '{self.reviewer_id}' "
+                f"and participant '{self.selected_participant}'.\n\n"
+                f"Please run Tab 3 (Face ID Clustering) first."
             )
             return
-        
-        # Load data in background thread
-        thread = threading.Thread(target=self._load_data_thread, args=(csv_path,))
-        thread.daemon = True
+
+        thread = threading.Thread(target=self._load_data_thread, daemon=True)
         thread.start()
-    
-    def _load_data_thread(self, csv_path: Path):
-        """Load and process data in background thread (simplified version from original)."""
+
+    def _load_data_thread(self):
+        """Load and process data in background thread."""
         try:
-            # Load CSV
-            self.df_full = pd.read_csv(csv_path)
+            registry = ReviewerRegistry(self.project_dir)
+            participant = self.selected_participant
+            participant_path = self.project_dir / participant
+
+            # Load face_ids overlay
+            face_ids_path = registry.get_tab3_face_ids_path(self.reviewer_id, participant)
+            face_ids_df = pd.read_csv(face_ids_path)
+
+            # Load all per-session face_detections.csv and merge with face_ids
+            session_dfs = []
+            for session_dir in sorted(participant_path.iterdir()):
+                if not session_dir.is_dir() or session_dir.name.startswith('_'):
+                    continue
+                csv_path = session_dir / "face_detections.csv"
+                if not csv_path.exists():
+                    continue
+                sdf = pd.read_csv(csv_path)
+                sdf['session_name'] = session_dir.name
+                sdf['instance_index'] = sdf.index
+                session_dfs.append(sdf)
+
+            if not session_dfs:
+                self.after(0, lambda: messagebox.showerror(
+                    "Error", "No face_detections.csv files found for this participant."
+                ))
+                return
+
+            base_df = pd.concat(session_dfs, ignore_index=True)
+
+            # Merge face_ids onto base data
+            base_df = base_df.merge(
+                face_ids_df[['session_name', 'instance_index', 'face_id']],
+                on=['session_name', 'instance_index'],
+                how='inner'
+            )
+
+            self.df_full = base_df
             self.df = self.df_full.copy()
-            
+
             # Get available sessions
             self.available_sessions = sorted(self.df['session_name'].unique())
             
@@ -4231,174 +4315,392 @@ class ManualReviewTab(ctk.CTkFrame):
         )
     
     def _save_results(self):
-        """Save merged results to annotation file (not modifying faces_combined.csv)."""
+        """Save merged results to reviewer overlay annotation file."""
         if self.df_full is None:
             return
-        
-        # Get reviewer name
-        reviewer_name = self.reviewer_entry.get().strip()
-        if not reviewer_name:
-            messagebox.showerror("Error", "Please enter your reviewer name.")
-            return
-        
-        # Sanitize reviewer name
-        import re
+
         from datetime import datetime
-        reviewer_name = re.sub(r'[^\w\-]', '_', reviewer_name).lower()
-        
-        # Confirm save
+
         response = messagebox.askyesno(
             "Confirm Save",
-            f"This will save your face ID merge annotations to:\n"
-            f"annotations/{reviewer_name}_review.csv\n\n"
-            f"The original faces_combined.csv will NOT be modified.\n"
+            f"Save face ID merge annotations for reviewer '{self.reviewer_id}'?\n\n"
+            f"The base data files will NOT be modified.\n"
             f"Continue?"
         )
-        
         if not response:
             return
-        
+
         try:
-            # Create annotations directory
-            annotation_dir = self.participant_dir / "annotations"
-            annotation_dir.mkdir(exist_ok=True)
-            
-            # Build annotation records
-            annotation_records = []
+            registry = ReviewerRegistry(self.project_dir)
+            annotation_file = registry.get_tab4_merges_path(
+                self.reviewer_id, self.selected_participant
+            )
+            annotation_file.parent.mkdir(parents=True, exist_ok=True)
+
             timestamp = datetime.now().isoformat()
-            
-            for face_id, merged_id in self.face_id_to_merged.items():
-                annotation_records.append({
+            annotation_records = [
+                {
                     'face_id': face_id,
                     'merged_face_id': merged_id,
                     'reviewed_at': timestamp,
-                    'reviewer': reviewer_name
-                })
-            
-            # Save to annotation file
+                }
+                for face_id, merged_id in self.face_id_to_merged.items()
+            ]
+
             ann_df = pd.DataFrame(annotation_records)
-            annotation_file = annotation_dir / f"{reviewer_name}_review.csv"
             ann_df.to_csv(annotation_file, index=False)
-            
-            # Count merges
-            num_merged = len([k for k, v in self.face_id_to_merged.items() if k != v])
+
             unique_original_ids = len(set(self.face_id_to_merged.keys()))
             unique_merged_ids = len(set(self.face_id_to_merged.values()))
-            
+
             messagebox.showinfo(
                 "Saved",
-                f"Successfully saved merge annotations!\n\n"
+                f"Merge annotations saved!\n\n"
                 f"File: {annotation_file}\n"
-                f"Reviewer: {reviewer_name}\n\n"
                 f"Original unique IDs: {unique_original_ids}\n"
                 f"Merged unique IDs: {unique_merged_ids}\n"
                 f"Reduction: {unique_original_ids - unique_merged_ids} IDs"
             )
-            
+
         except Exception as e:
             import traceback
             traceback.print_exc()
-            messagebox.showerror(
-                "Error",
-                f"Failed to save annotations:\n{str(e)}"
-            )
+            messagebox.showerror("Error", f"Failed to save annotations:\n{str(e)}")
     
     def _export_final_csv(self):
-        """Export final CSV with merged_face_id column applied."""
+        """
+        Export on-demand: join base data + tab3_face_ids + tab4_merges into a
+        single wide CSV.  The large shared files are never duplicated on disk;
+        this export is produced once per reviewer when explicitly requested.
+        """
         if self.df_full is None:
             return
-        
-        # Get reviewer name
-        reviewer_name = self.reviewer_entry.get().strip()
-        if not reviewer_name:
-            messagebox.showerror("Error", "Please enter your reviewer name.")
-            return
-        
-        # Sanitize reviewer name
-        import re
-        reviewer_name = re.sub(r'[^\w\-]', '_', reviewer_name).lower()
-        
+
         try:
-            # Create output dataframe with merged_face_id column
+            registry = ReviewerRegistry(self.project_dir)
+            participant = self.selected_participant
+
+            # Reload the full base + reviewer face_ids (df_full already has face_id)
             df_out = self.df_full.copy()
-            df_out['merged_face_id'] = df_out['face_id'].map(self.face_id_to_merged)
-            
-            # Fill any missing values (use original face_id)
-            df_out['merged_face_id'].fillna(df_out['face_id'], inplace=True)
-            
-            # Save to reviewer-specific file
-            output_path = self.participant_dir / f"faces_combined_{reviewer_name}.csv"
+
+            # Apply merge mapping → final_face_id
+            df_out['final_face_id'] = df_out['face_id'].map(self.face_id_to_merged)
+            df_out['final_face_id'].fillna(df_out['face_id'], inplace=True)
+
+            # Save to reviewer-specific export
+            export_dir = registry.get_reviewer_dir(self.reviewer_id) / participant
+            export_dir.mkdir(parents=True, exist_ok=True)
+            output_path = export_dir / f"final_faces_{self.reviewer_id}.csv"
             df_out.to_csv(output_path, index=False)
-            
-            # Count statistics
-            num_merged = len([k for k, v in self.face_id_to_merged.items() if k != v])
+
             unique_original_ids = len(set(self.face_id_to_merged.keys()))
             unique_merged_ids = len(set(self.face_id_to_merged.values()))
-            
+
             messagebox.showinfo(
                 "Exported",
-                f"Successfully exported final CSV with merged IDs!\n\n"
+                f"Final CSV exported!\n\n"
                 f"File: {output_path}\n"
-                f"Reviewer: {reviewer_name}\n\n"
+                f"Reviewer: {self.reviewer_id}\n\n"
                 f"Total faces: {len(df_out)}\n"
                 f"Original unique IDs: {unique_original_ids}\n"
-                f"Merged unique IDs: {unique_merged_ids}\n"
+                f"Final unique IDs: {unique_merged_ids}\n"
                 f"Reduction: {unique_original_ids - unique_merged_ids} IDs"
             )
-            
+
         except Exception as e:
             import traceback
             traceback.print_exc()
-            messagebox.showerror(
-                "Error",
-                f"Failed to export CSV:\n{str(e)}"
-            )
+            messagebox.showerror("Error", f"Failed to export CSV:\n{str(e)}")
     
     def _load_settings(self):
         """Load settings into UI."""
         self.min_instances_var.set(self.settings.get("tab3.min_instances", 1))
         self.min_confidence_var.set(self.settings.get("tab3.min_confidence", 0.0))
-        
-        # Load reviewer name
-        reviewer_name = self.settings.get("reviewer_name", "")
-        if reviewer_name:
-            self.reviewer_entry.delete(0, "end")
-            self.reviewer_entry.insert(0, reviewer_name)
+
+
+class StartupDialog(ctk.CTkToplevel):
+    """
+    Modal dialog shown at startup to select / create a reviewer and project directory.
+    Blocks the main window until confirmed.
+    """
+
+    def __init__(self, master, settings: SettingsManager):
+        super().__init__(master)
+        self.settings = settings
+        self.result_project_dir: Optional[Path] = None
+        self.result_reviewer_id: Optional[str] = None
+
+        self.title("Face-Diet — Setup")
+        self.geometry("600x420")
+        self.resizable(False, False)
+        self.grab_set()   # make modal
+        self.focus_force()
+
+        self._setup_ui()
+        self._load_last_values()
+
+    # ------------------------------------------------------------------ #
+    # UI                                                                   #
+    # ------------------------------------------------------------------ #
+
+    def _setup_ui(self):
+        ctk.CTkLabel(
+            self,
+            text="Face-Diet Setup",
+            font=ctk.CTkFont(size=22, weight="bold")
+        ).pack(pady=(20, 4))
+
+        ctk.CTkLabel(
+            self,
+            text="Select your project directory and reviewer identity to begin.",
+            font=ctk.CTkFont(size=12),
+            text_color="gray"
+        ).pack(pady=(0, 20))
+
+        # Project directory
+        proj_frame = ctk.CTkFrame(self)
+        proj_frame.pack(fill="x", padx=30, pady=6)
+
+        ctk.CTkLabel(
+            proj_frame, text="Project directory:", font=ctk.CTkFont(size=13, weight="bold")
+        ).pack(anchor="w", padx=6, pady=(6, 2))
+
+        dir_row = ctk.CTkFrame(proj_frame, fg_color="transparent")
+        dir_row.pack(fill="x", padx=6, pady=(0, 6))
+
+        self.dir_entry = ctk.CTkEntry(dir_row, placeholder_text="Path to project root…", width=380)
+        self.dir_entry.pack(side="left", fill="x", expand=True)
+
+        ctk.CTkButton(
+            dir_row, text="Browse", width=80, command=self._browse_dir
+        ).pack(side="left", padx=(6, 0))
+
+        # Reviewer selection
+        rev_frame = ctk.CTkFrame(self)
+        rev_frame.pack(fill="x", padx=30, pady=6)
+
+        ctk.CTkLabel(
+            rev_frame, text="Reviewer:", font=ctk.CTkFont(size=13, weight="bold")
+        ).pack(anchor="w", padx=6, pady=(6, 2))
+
+        self.reviewer_var = ctk.StringVar(value="")
+        self.reviewer_option = ctk.CTkOptionMenu(
+            rev_frame,
+            variable=self.reviewer_var,
+            values=["— select —"],
+            width=280,
+            command=self._on_reviewer_selected
+        )
+        self.reviewer_option.pack(side="left", padx=6, pady=(0, 6))
+
+        ctk.CTkButton(
+            rev_frame, text="+ New", width=80, command=self._show_new_reviewer_panel
+        ).pack(side="left", padx=(6, 0))
+
+        # New reviewer panel (hidden initially)
+        self.new_rev_frame = ctk.CTkFrame(self)
+
+        ctk.CTkLabel(
+            self.new_rev_frame, text="New reviewer ID (no spaces):",
+            font=ctk.CTkFont(size=12)
+        ).pack(side="left", padx=6)
+
+        self.new_id_entry = ctk.CTkEntry(self.new_rev_frame, width=120,
+                                          placeholder_text="e.g. alice")
+        self.new_id_entry.pack(side="left", padx=4)
+
+        ctk.CTkLabel(
+            self.new_rev_frame, text="Display name:", font=ctk.CTkFont(size=12)
+        ).pack(side="left", padx=6)
+
+        self.new_name_entry = ctk.CTkEntry(self.new_rev_frame, width=140,
+                                            placeholder_text="e.g. Alice Smith")
+        self.new_name_entry.pack(side="left", padx=4)
+
+        ctk.CTkButton(
+            self.new_rev_frame, text="Create", width=70, command=self._create_reviewer
+        ).pack(side="left", padx=6)
+
+        # Status label
+        self.status_label = ctk.CTkLabel(self, text="", font=ctk.CTkFont(size=11),
+                                          text_color="orange")
+        self.status_label.pack(pady=4)
+
+        # Confirm button
+        ctk.CTkButton(
+            self,
+            text="Continue →",
+            width=180,
+            height=42,
+            font=ctk.CTkFont(size=15, weight="bold"),
+            command=self._confirm
+        ).pack(pady=16)
+
+    # ------------------------------------------------------------------ #
+    # Helpers                                                              #
+    # ------------------------------------------------------------------ #
+
+    def _browse_dir(self):
+        folder = filedialog.askdirectory(title="Select Project Root Directory")
+        if not folder:
+            return
+        self.dir_entry.delete(0, "end")
+        self.dir_entry.insert(0, folder)
+        self._refresh_reviewer_list(Path(folder))
+
+    def _refresh_reviewer_list(self, project_dir: Path):
+        """Reload the reviewer dropdown from the project's registry."""
+        try:
+            registry = ReviewerRegistry(project_dir)
+            ids = registry.get_reviewer_ids()
+        except Exception:
+            ids = []
+
+        options = ids if ids else ["— select —"]
+        self.reviewer_option.configure(values=options)
+        if ids:
+            self.reviewer_var.set(ids[0])
+        else:
+            self.reviewer_var.set("— select —")
+
+    def _on_reviewer_selected(self, value: str):
+        if value == "— select —":
+            self.new_rev_frame.pack_forget()
+
+    def _show_new_reviewer_panel(self):
+        self.new_rev_frame.pack(fill="x", padx=30, pady=4)
+        self.new_id_entry.focus()
+
+    def _create_reviewer(self):
+        project_dir_str = self.dir_entry.get().strip()
+        if not project_dir_str or not Path(project_dir_str).exists():
+            self.status_label.configure(text="Please select a valid project directory first.")
+            return
+
+        raw_id = self.new_id_entry.get().strip()
+        display_name = self.new_name_entry.get().strip()
+        if not raw_id:
+            self.status_label.configure(text="Reviewer ID cannot be empty.")
+            return
+
+        reviewer_id = ReviewerRegistry.sanitize_id(raw_id)
+        if not display_name:
+            display_name = reviewer_id
+
+        registry = ReviewerRegistry(Path(project_dir_str))
+        if registry.reviewer_exists(reviewer_id):
+            self.status_label.configure(text=f"Reviewer '{reviewer_id}' already exists.")
+            return
+
+        registry.add_reviewer(reviewer_id, display_name)
+        self.status_label.configure(
+            text=f"Reviewer '{reviewer_id}' created.", text_color="#28a745"
+        )
+        self._refresh_reviewer_list(Path(project_dir_str))
+        self.reviewer_var.set(reviewer_id)
+        self.new_rev_frame.pack_forget()
+
+    def _load_last_values(self):
+        """Pre-fill fields from last session."""
+        last_dir = self.settings.get("last_project_dir", "")
+        if last_dir and Path(last_dir).exists():
+            self.dir_entry.insert(0, last_dir)
+            self._refresh_reviewer_list(Path(last_dir))
+
+        last_reviewer = self.settings.get("reviewer_id", "")
+        if last_reviewer:
+            ids = [self.reviewer_option.cget("values")[i]
+                   for i in range(len(self.reviewer_option.cget("values")))]
+            if last_reviewer in ids:
+                self.reviewer_var.set(last_reviewer)
+
+    def _confirm(self):
+        project_dir_str = self.dir_entry.get().strip()
+        if not project_dir_str or not Path(project_dir_str).exists():
+            self.status_label.configure(
+                text="Please select a valid project directory.", text_color="orange"
+            )
+            return
+
+        reviewer_id = self.reviewer_var.get()
+        if not reviewer_id or reviewer_id == "— select —":
+            self.status_label.configure(
+                text="Please select or create a reviewer.", text_color="orange"
+            )
+            return
+
+        self.result_project_dir = Path(project_dir_str)
+        self.result_reviewer_id = reviewer_id
+
+        # Persist
+        self.settings.set("last_project_dir", str(self.result_project_dir))
+        self.settings.set("reviewer_id", self.result_reviewer_id)
+        self.settings.save_settings()
+
+        self.grab_release()
+        self.destroy()
 
 
 class FaceDietApp(ctk.CTk):
     """Main application with tabbed interface."""
-    
+
     def __init__(self):
         super().__init__()
-        
+
         self.title("Face-Diet: Comprehensive Face Processing Pipeline")
         self.geometry("1600x1000")
-        
-        # Initialize settings manager
+
+        # Initialize settings
         self.settings = SettingsManager()
-        
+
+        # Show startup dialog (modal — blocks until dismissed)
+        self.withdraw()  # hide main window until setup is complete
+        dialog = StartupDialog(self, self.settings)
+        self.wait_window(dialog)
+
+        if dialog.result_project_dir is None:
+            # User closed the dialog without confirming
+            self.destroy()
+            return
+
+        self.project_dir: Path = dialog.result_project_dir
+        self.reviewer_id: str = dialog.result_reviewer_id
+
+        self.deiconify()  # show main window now
+
         # Create tabview
         self.tabview = ctk.CTkTabview(self, width=1580, height=980)
         self.tabview.pack(fill="both", expand=True, padx=10, pady=10)
-        
+
         # Add tabs
         self.tabview.add("Face Detection")
         self.tabview.add("Face Instance Review")
         self.tabview.add("Face ID Clustering")
         self.tabview.add("Face ID Review")
-        
-        # Create tab content
-        self.tab1 = VideoProcessingTab(self.tabview.tab("Face Detection"), self.settings)
+
+        # Create tab content — pass project_dir and reviewer_id to each tab
+        self.tab1 = VideoProcessingTab(
+            self.tabview.tab("Face Detection"),
+            self.settings, self.project_dir, self.reviewer_id
+        )
         self.tab1.pack(fill="both", expand=True)
-        
-        self.tab2 = FaceInstanceReviewTab(self.tabview.tab("Face Instance Review"), self.settings)
+
+        self.tab2 = FaceInstanceReviewTab(
+            self.tabview.tab("Face Instance Review"),
+            self.settings, self.project_dir, self.reviewer_id
+        )
         self.tab2.pack(fill="both", expand=True)
-        
-        self.tab3 = FaceIDAssignmentTab(self.tabview.tab("Face ID Clustering"), self.settings)
+
+        self.tab3 = FaceIDAssignmentTab(
+            self.tabview.tab("Face ID Clustering"),
+            self.settings, self.project_dir, self.reviewer_id
+        )
         self.tab3.pack(fill="both", expand=True)
-        
-        self.tab4 = ManualReviewTab(self.tabview.tab("Face ID Review"), self.settings)
+
+        self.tab4 = ManualReviewTab(
+            self.tabview.tab("Face ID Review"),
+            self.settings, self.project_dir, self.reviewer_id
+        )
         self.tab4.pack(fill="both", expand=True)
 
 
