@@ -118,6 +118,25 @@ class ReviewerRegistry:
         """Return {project_dir}/_annotations/"""
         return self.project_dir / self.ANNOTATIONS_DIR
 
+    def get_consensus_dir(self, participant: str, session: str) -> Path:
+        """
+        Return the consensus annotation directory for a session:
+            {project_dir}/_annotations/consensus/{participant}/{session}/
+        """
+        return self.project_dir / self.ANNOTATIONS_DIR / "consensus" / participant / session
+
+    def get_consensus_annotation_path(self, participant: str, session: str) -> Path:
+        """
+        {project_dir}/_annotations/consensus/{participant}/{session}/consensus_is_face.csv
+        """
+        return self.get_consensus_dir(participant, session) / "consensus_is_face.csv"
+
+    def get_mismatches_resolved_path(self, participant: str, session: str) -> Path:
+        """
+        {project_dir}/_annotations/consensus/{participant}/{session}/mismatches_resolved.json
+        """
+        return self.get_consensus_dir(participant, session) / "mismatches_resolved.json"
+
 
 class SettingsManager:
     """Manage GUI settings with JSON persistence."""
@@ -143,10 +162,6 @@ class SettingsManager:
         return {
             "last_project_dir": "",
             "reviewer_id": "",
-            # Path to the Python interpreter used for Stage 1 & 2 (insightface + deepface).
-            # Stage 3 runs in the same environment as the GUI and does not use this.
-            # Defaults to venv_processing next to the project; can be any Python 3.10 venv.
-            "processing_python": "",
             "stage1": {
                 "sampling_rate": 30,
                 "use_gpu": False,

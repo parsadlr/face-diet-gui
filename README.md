@@ -19,82 +19,49 @@ Multiple reviewers can work on the same project completely independently. Their 
 
 ## Environment Setup
 
-Two virtual environments are required because TensorFlow 2.10 (needed for face attribute extraction) only supports Python 3.10, while the GUI itself runs on any modern Python.
+**Python 3.10** and a single virtual environment are required. TensorFlow 2.10 (for face attribute extraction in Tab 1) only supports Python 3.10, so the whole app runs on one venv with Python 3.10.
 
-### Why two environments?
-
-| Env | Python | Used for |
-|-----|--------|---------|
-| `venv_gui` | 3.10 – 3.13 | Running the GUI, Tab 2 review, Tab 3 clustering, Tab 4 review |
-| `venv_processing` | **3.10 exactly** | Tab 1 only — InsightFace detection + DeepFace attribute extraction |
-
-Tab 3 (clustering) uses `faiss`, `igraph`, and `leidenalg` — no TensorFlow — so it runs inside `venv_gui` directly.
-
----
-
-### 1. Create `venv_gui`
+### 1. Create the virtual environment
 
 ```bash
-# From the project root — any Python 3.10+ works
-python -m venv venv_gui
+# From the project root — use Python 3.10 (required for TensorFlow 2.10)
+python -m venv venv
 
 # Activate (Windows)
-venv_gui\Scripts\activate
+venv\Scripts\activate
 
-# Install
-pip install -r requirements_gui.txt
+# Install dependencies
+pip install -r requirements.txt
 ```
 
-`requirements_gui.txt` installs: `customtkinter`, `pandas`, `numpy`, `opencv-python`, `Pillow`, `faiss-cpu`, `python-igraph`, `leidenalg`, `networkx`, `scipy`.
+### 2. Install InsightFace (Windows)
 
----
+InsightFace has no official Windows pip package. Install from a pre-built wheel:
 
-### 2. Create `venv_processing`
-
-**Python 3.10 is required.** TensorFlow 2.10 does not support 3.11 or later.
-
-```bash
-# Specify Python 3.10 explicitly (adjust path to your installation)
-"C:\Python310\python.exe" -m venv venv_processing
-
-# Activate (Windows)
-venv_processing\Scripts\activate
-
-# Install base dependencies
-pip install -r requirements_processing.txt
-```
-
-`requirements_processing.txt` installs: `numpy<2`, `opencv-python`, `onnx`, `onnxruntime-gpu` (or `onnxruntime` for CPU), `deepface`, `tensorflow==2.10.*`.
-
-#### Install InsightFace
-
-InsightFace must be installed from a pre-built wheel because it does not have an official Windows pip release. Place the wheel in a `whls/` folder next to the project, then:
+1. Place the wheel in a `whls/` folder next to the project (e.g. `insightface-0.7.3-cp310-cp310-win_amd64.whl`).
+2. In the activated venv:
 
 ```bash
-# Inside the activated venv_processing
 pip install whls/insightface-0.7.3-cp310-cp310-win_amd64.whl
 ```
 
-#### GPU support (optional)
+### 3. GPU support (optional)
 
-For GPU inference, ensure CUDA 11.8 and cuDNN 8.x are installed, then use `onnxruntime-gpu` (already in `requirements_processing.txt`). For CPU-only, swap it for plain `onnxruntime`.
+For GPU inference (Tab 1), install CUDA 11.8 and cuDNN 8.x; `requirements.txt` includes `onnxruntime-gpu`. For CPU-only, edit `requirements.txt` and use `onnxruntime>=1.16.0` instead of `onnxruntime-gpu==1.18.1`.
 
----
+### 4. Optional: use a different Python for Tab 1
 
-### 3. Configure the processing environment in the GUI
+By default the GUI uses the same Python that runs the app (single venv). To point Tab 1 (face detection + attributes) at another interpreter:
 
-The GUI automatically searches for `venv_processing\Scripts\python.exe` and `venv_tf210\Scripts\python.exe` next to the project root. If your processing venv is in a different location:
-
-1. Launch the GUI (see below).
-2. In the startup dialog, expand **"Configure processing environment"**.
-3. Browse to or paste the full path to the Python interpreter, e.g. `C:\path\to\venv_processing\Scripts\python.exe`.
-4. Click **Continue** — the path is saved and remembered for future sessions.
+1. Launch the GUI and in the startup dialog expand **"Configure processing environment"**.
+2. Enter or browse to that interpreter’s path (e.g. another venv’s `Scripts\python.exe`).
+3. Click **Continue** — the path is saved for future sessions.
 
 ---
 
 ## Running the GUI
 
-Activate `venv_gui` first, then:
+Activate the venv, then:
 
 ```bash
 python run_gui.py
@@ -141,7 +108,7 @@ ProjectRoot/
 - Select sessions using the participant/session tree (supports multi-select).
 - Configure sampling rate, GPU usage, and minimum detection confidence.
 - Click **Start Processing**. Progress is streamed in real time.
-- Requires `venv_processing` — see setup above.
+- Uses the same Python as the GUI (single venv) unless you configured a different interpreter.
 - Output: `face_detections.csv` per session with columns:
   `frame_number, time_seconds, x, y, w, h, confidence, sharpness, distance, pitch, yaw, roll, attended, age, gender, race, emotion, embedding`
 
@@ -161,7 +128,7 @@ ProjectRoot/
 - Configure clustering settings (algorithm, similarity threshold, k-neighbors, refinement).
 - Click **Assign Face IDs**. The script reads all sessions' `face_detections.csv`
   and automatically applies the current reviewer's `tab2_is_face.csv` filters.
-- Runs in `venv_gui` — no separate processing environment needed.
+- Runs in the same venv as the GUI.
 - Output: `tab3_face_ids.csv` — a thin overlay file (`session_name, instance_index, face_id`). Stats written to `tab3_stats.txt`.
 
 ### Tab 4 — Face ID Review
@@ -194,13 +161,12 @@ ProjectRoot/
 | `gui_multitab.py` | Main GUI application (all four tabs + startup dialog) |
 | `settings_manager.py` | GUI settings persistence + `ReviewerRegistry` class |
 | `directory_tree_widget.py` | Reusable participant/session tree widget (Tab 1) |
-| `stage1_detect_faces.py` | CLI script for face detection (called via subprocess, uses `venv_processing`) |
-| `stage2_extract_attributes.py` | CLI script for attribute extraction (called via subprocess, uses `venv_processing`) |
-| `stage3_graph_clustering.py` | CLI script for global face ID clustering (called via subprocess, uses `venv_gui`) |
+| `stage1_detect_faces.py` | CLI script for face detection (called via subprocess) |
+| `stage2_extract_attributes.py` | CLI script for attribute extraction (called via subprocess) |
+| `stage3_graph_clustering.py` | CLI script for global face ID clustering (called via subprocess) |
 | `video_processor.py` | Video-level processing utilities used by Stage 1 & 2 |
 | `face_detection.py` | InsightFace detection helpers |
 | `face_attributes.py` | DeepFace attribute extraction helpers |
 | `utils.py` | Shared utility functions |
 | `profiler.py` | Optional performance profiler |
-| `requirements_gui.txt` | Dependencies for `venv_gui` |
-| `requirements_processing.txt` | Dependencies for `venv_processing` |
+| `requirements.txt` | Dependencies for the single venv (Python 3.10) |

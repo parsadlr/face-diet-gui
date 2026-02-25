@@ -223,7 +223,7 @@ class DirectoryTreeWidget(ctk.CTkFrame):
         status_label = ctk.CTkLabel(
             session_frame,
             text=" | ".join(status_text),
-            font=ctk.CTkFont(size=10),
+            font=ctk.CTkFont(size=12),
             text_color="gray"
         )
         status_label.pack(side="left", padx=10)

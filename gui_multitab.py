@@ -4,8 +4,9 @@ Face-Diet Multi-Tab GUI
 A comprehensive GUI for the entire face processing pipeline:
 - Tab 1: Face Detection (Stages 1 & 2)
 - Tab 2: Face Instance Review - Manual detection verification
-- Tab 3: Face ID Clustering (Stage 3)
-- Tab 4: Face ID Review - Manual ID merging
+- Tab 3: Resolve Mismatches - Consensus face/non-face across reviewers
+- Tab 4: Face ID Clustering (Stage 3)
+- Tab 5: Face ID Review - Manual ID merging
 """
 
 import os
@@ -16,7 +17,7 @@ import threading
 import queue
 import subprocess
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 from collections import defaultdict
 
 import customtkinter as ctk
@@ -30,34 +31,122 @@ import tkinter
 from settings_manager import SettingsManager, ReviewerRegistry
 from directory_tree_widget import DirectoryTreeWidget
 
-# Default search locations for the processing venv (Stage 1 & 2 only).
-# Checked in order; the first existing interpreter is used as the default.
-_PROCESSING_VENV_CANDIDATES = [
-    Path(__file__).parent / "venv_processing" / "Scripts" / "python.exe",
-    Path(__file__).parent / "venv_tf210" / "Scripts" / "python.exe",
-]
+# Inactive (disabled) main action buttons: white text, desaturated background (towards gray)
+BTN_DISABLED_FG = "#5a6268"
+
+class ProcessingStopped(Exception):
+    """Raised when the user stops processing via the Stop button."""
 
 
-def _get_processing_python(settings: SettingsManager) -> Optional[Path]:
+def _discard_annotations_for_session(project_dir: Path, participant_name: str, session_name: str) -> None:
     """
-    Return the Path to the processing Python interpreter.
-
-    Precedence:
-      1. Value saved in settings (``processing_python`` key)
-      2. First candidate venv found next to the project
-      3. None (caller must handle missing case)
+    Remove all reviewer annotations that depend on face detection for this session.
+    After re-running Stage 1, Tab 2/3/4 data for this session (and participant for Tab 3/4)
+    are no longer valid. Deletes for all reviewers:
+    - Tab 2: that session's is_face annotations
+    - Tab 3: that participant's face_ids (clustering depends on all sessions)
+    - Tab 4: that participant's merges
     """
-    saved = settings.get("processing_python", "")
-    if saved:
-        p = Path(saved)
-        if p.exists():
-            return p
+    try:
+        registry = ReviewerRegistry(project_dir)
+        for reviewer_id in registry.get_reviewer_ids():
+            tab2_path = registry.get_tab2_annotation_path(reviewer_id, participant_name, session_name)
+            if tab2_path.exists():
+                tab2_path.unlink()
+            tab3_path = registry.get_tab3_face_ids_path(reviewer_id, participant_name)
+            if tab3_path.exists():
+                tab3_path.unlink()
+            tab4_path = registry.get_tab4_merges_path(reviewer_id, participant_name)
+            if tab4_path.exists():
+                tab4_path.unlink()
+    except Exception as e:
+        print(f"Warning: could not discard some annotations: {e}")
 
-    for candidate in _PROCESSING_VENV_CANDIDATES:
-        if candidate.exists():
-            return candidate
 
-    return None
+def _load_review_status_for_session(registry: "ReviewerRegistry", reviewer_id: str, participant: str, session: str) -> Dict:
+    """Load {reviewed: bool} for a session from reviewer's review_status.json. Used for session list."""
+    ann_path = registry.get_tab2_annotation_path(reviewer_id, participant, session)
+    path = ann_path.parent / "review_status.json"
+    if path.exists():
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return {"reviewed": bool(data.get("reviewed", False))}
+        except Exception:
+            pass
+    return {"reviewed": False}
+
+
+def _load_mismatches_resolved_flag(registry: "ReviewerRegistry", participant: str, session: str) -> bool:
+    """Load global 'mismatches resolved' flag for a session (Tab 3), from _annotations/consensus/."""
+    path = registry.get_mismatches_resolved_path(participant, session)
+    if path.exists():
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return bool(data.get("resolved", False))
+        except Exception:
+            pass
+    return False
+
+
+def _get_sessions_with_review_status(project_dir: Path) -> List[Dict]:
+    """
+    For each session (participant/session with face_detections.csv), return count of reviewers
+    who have marked the session as fully reviewed, and mismatch_count.
+    reviewer_ids in result = only reviewers who have set "entirely reviewed" (not just saved).
+    If global mismatches_resolved.json is True for session, treat as resolved (green).
+    """
+    registry = ReviewerRegistry(project_dir)
+    reviewer_ids = registry.get_reviewer_ids()
+    result = []
+    for participant_dir in sorted(project_dir.iterdir()):
+        if not participant_dir.is_dir() or participant_dir.name.startswith(("_", ".")):
+            continue
+        participant = participant_dir.name
+        for session_dir in sorted(participant_dir.iterdir()):
+            if not session_dir.is_dir() or (session_dir / "face_detections.csv").exists() is False:
+                continue
+            session = session_dir.name
+            if session.startswith(("_", ".")):
+                continue
+            # Reviewers who have tab2 annotations AND have marked session as fully reviewed
+            reviewers_reviewed = []
+            for rid in reviewer_ids:
+                p = registry.get_tab2_annotation_path(rid, participant, session)
+                if p.exists() and _load_review_status_for_session(registry, rid, participant, session).get("reviewed", False):
+                    reviewers_reviewed.append(rid)
+            # For mismatch count we still need 2+ reviewers with tab2 data (any)
+            reviewers_with_tab2 = [rid for rid in reviewer_ids if registry.get_tab2_annotation_path(rid, participant, session).exists()]
+            mismatch_count = 0
+            if len(reviewers_with_tab2) >= 2:
+                try:
+                    df = pd.read_csv(session_dir / "face_detections.csv")
+                    if "confidence" in df.columns:
+                        df = df.sort_values("confidence", ascending=True).reset_index(drop=True)
+                    indices = list(df.index)
+                    per_reviewer = {}
+                    for rid in reviewers_with_tab2:
+                        ann_path = registry.get_tab2_annotation_path(rid, participant, session)
+                        ann_df = pd.read_csv(ann_path)
+                        per_reviewer[rid] = dict(zip(ann_df["instance_index"].astype(int), ann_df["is_face"].astype(bool)))
+                    for idx in indices:
+                        vals = [per_reviewer[rid].get(idx, True) for rid in reviewers_with_tab2]
+                        if len(set(vals)) > 1:
+                            mismatch_count += 1
+                except Exception:
+                    pass
+            resolved = _load_mismatches_resolved_flag(registry, participant, session)
+            result.append({
+                "participant": participant,
+                "session": session,
+                "session_dir": session_dir,
+                "reviewer_ids": reviewers_reviewed,
+                "reviewers_with_tab2_count": len(reviewers_with_tab2),
+                "mismatch_count": mismatch_count,
+                "resolved": resolved,
+            })
+    return result
 
 
 def _format_time(seconds: float) -> str:
@@ -76,23 +165,18 @@ def _format_time(seconds: float) -> str:
 
 def _run_stage1_via_subprocess(session_dir: str, sampling_rate: int, use_gpu: bool,
                                min_confidence: float, reporter, debug_mode: bool = False,
-                               settings: SettingsManager = None):
+                               settings: SettingsManager = None,
+                               process_holder: Optional[List] = None,
+                               stop_check: Optional[Callable[[], bool]] = None):
     """Run stage1_detect_faces via subprocess using the processing venv."""
     import time
     import threading
     import re
     import cv2
 
-    processing_python = _get_processing_python(settings) if settings else None
-    if processing_python is None:
-        raise FileNotFoundError(
-            "Processing Python interpreter not found.\n\n"
-            "Stage 1 requires insightface + deepface which must be installed in a "
-            "separate Python 3.10 environment.\n\n"
-            "Run setup_processing.bat to create it, or configure the path in the "
-            "startup dialog."
-        )
-    
+    # Always use current interpreter (project venv)
+    processing_python = Path(sys.executable)
+
     # Calculate 5% duration if debug mode is enabled
     end_time = None
     if debug_mode:
@@ -137,6 +221,8 @@ def _run_stage1_via_subprocess(session_dir: str, sampling_rate: int, use_gpu: bo
         bufsize=1,
         cwd=str(Path(__file__).parent)
     )
+    if process_holder is not None:
+        process_holder[0] = process
     
     # Pattern to match progress lines: [  X%] Frame Y ... Z/W frames
     progress_pattern = re.compile(r'\[\s*(\d+)%\].*?(\d+)/(\d+)\s+frames')
@@ -190,7 +276,11 @@ def _run_stage1_via_subprocess(session_dir: str, sampling_rate: int, use_gpu: bo
     # Wait for process to complete
     return_code = process.wait()
     stderr_thread.join(timeout=1.0)  # Wait for stderr to finish reading
+    if process_holder is not None:
+        process_holder[0] = None
     
+    if stop_check and stop_check():
+        raise ProcessingStopped()
     if return_code != 0:
         error_msg = f"Stage 1 failed with return code {return_code}"
         if error_lines:
@@ -201,23 +291,18 @@ def _run_stage1_via_subprocess(session_dir: str, sampling_rate: int, use_gpu: bo
 
 
 def _run_stage2_via_subprocess(session_dir: str, batch_size: int, reporter,
-                               debug_mode: bool = False, settings: SettingsManager = None):
+                               debug_mode: bool = False, settings: SettingsManager = None,
+                               process_holder: Optional[List] = None,
+                               stop_check: Optional[Callable[[], bool]] = None):
     """Run stage2_extract_attributes via subprocess using the processing venv."""
     import time
     import threading
     import re
     import pandas as pd
 
-    processing_python = _get_processing_python(settings) if settings else None
-    if processing_python is None:
-        raise FileNotFoundError(
-            "Processing Python interpreter not found.\n\n"
-            "Stage 2 requires deepface + tensorflow which must be installed in a "
-            "separate Python 3.10 environment.\n\n"
-            "Run setup_processing.bat to create it, or configure the path in the "
-            "startup dialog."
-        )
-    
+    # Always use current interpreter (project venv)
+    processing_python = Path(sys.executable)
+
     # Calculate 5% limit if debug mode is enabled
     limit = None
     if debug_mode:
@@ -255,6 +340,8 @@ def _run_stage2_via_subprocess(session_dir: str, batch_size: int, reporter,
         bufsize=1,
         cwd=str(Path(__file__).parent)
     )
+    if process_holder is not None:
+        process_holder[0] = process
     
     # Pattern to match progress lines: [  X%] ... Y/Z faces
     progress_pattern = re.compile(r'\[\s*(\d+)%\].*?(\d+)/(\d+)\s+faces')
@@ -301,7 +388,11 @@ def _run_stage2_via_subprocess(session_dir: str, batch_size: int, reporter,
     # Wait for process to complete
     return_code = process.wait()
     stderr_thread.join(timeout=1.0)  # Wait for stderr to finish reading
+    if process_holder is not None:
+        process_holder[0] = None
     
+    if stop_check and stop_check():
+        raise ProcessingStopped()
     if return_code != 0:
         error_msg = f"Stage 2 failed with return code {return_code}"
         if error_lines:
@@ -324,6 +415,8 @@ def _run_stage3_via_subprocess(
     k_voting: int,
     min_votes: int,
     reporter,
+    process_holder: Optional[List] = None,
+    stop_check: Optional[Callable[[], bool]] = None,
 ):
     """
     Run stage3_graph_clustering via subprocess.
@@ -368,6 +461,8 @@ def _run_stage3_via_subprocess(
         bufsize=1,
         cwd=str(Path(__file__).parent)
     )
+    if process_holder is not None:
+        process_holder[0] = process
     
     # Pattern to match progress lines: [  X%] Processed Y/Z faces
     progress_pattern = re.compile(r'\[\s*(\d+)%\].*?Processed\s+[\d,]+/?([\d,]+)\s+.*?faces')
@@ -399,7 +494,11 @@ def _run_stage3_via_subprocess(
     
     # Wait for process to complete
     return_code = process.wait()
+    if process_holder is not None:
+        process_holder[0] = None
     
+    if stop_check and stop_check():
+        raise ProcessingStopped()
     if return_code != 0:
         raise RuntimeError(f"Stage 3 failed with return code {return_code}")
     
@@ -584,6 +683,8 @@ class VideoProcessingTab(ctk.CTkFrame):
         self.reviewer_id: str = reviewer_id
         self.processing_thread: Optional[threading.Thread] = None
         self.is_processing = False
+        self._current_process_holder: List = [None]
+        self._stop_requested = False
 
         self._setup_ui()
         self._load_settings()
@@ -595,87 +696,69 @@ class VideoProcessingTab(ctk.CTkFrame):
             self,
             text="Video Processing: Face Detection & Attributes",
             font=ctk.CTkFont(size=20, weight="bold")
-        ).pack(pady=(10, 20))
+        ).pack(pady=(10, 15))
 
-        # Read-only project + reviewer info bar
-        info_frame = ctk.CTkFrame(self)
-        info_frame.pack(fill="x", padx=20, pady=(0, 10))
-
-        ctk.CTkLabel(
-            info_frame,
-            text="Project:",
-            font=ctk.CTkFont(size=13, weight="bold")
-        ).pack(side="left", padx=(10, 4))
-
-        self.dir_label = ctk.CTkLabel(
-            info_frame,
-            text=str(self.project_dir) if self.project_dir else "—",
-            font=ctk.CTkFont(size=12),
-            text_color="gray"
-        )
-        self.dir_label.pack(side="left", padx=(0, 20))
-
-        ctk.CTkLabel(
-            info_frame,
-            text="Reviewer:",
-            font=ctk.CTkFont(size=13, weight="bold")
-        ).pack(side="left", padx=(10, 4))
-
-        ctk.CTkLabel(
-            info_frame,
-            text=self.reviewer_id or "—",
-            font=ctk.CTkFont(size=12),
-            text_color="#3b8ed0"
-        ).pack(side="left", padx=(0, 10))
-        
-        # Main content area (side-by-side)
+        # Main content area: three equal columns — Participants & Sessions | Settings | Progress
         content_frame = ctk.CTkFrame(self)
         content_frame.pack(fill="both", expand=True, padx=20, pady=10)
         
-        # Left panel: Directory tree
-        left_panel = ctk.CTkFrame(content_frame, width=600)
-        left_panel.pack(side="left", fill="both", expand=True, padx=(0, 10))
-        left_panel.pack_propagate(False)
-        
+        # Column 1: Participants & sessions (directory tree)
+        col_tree = ctk.CTkFrame(content_frame)
+        col_tree.pack(side="left", fill="both", expand=True, padx=(0, 6))
         ctk.CTkLabel(
-            left_panel,
-            text="Select Participants & Sessions",
+            col_tree,
+            text="Participants & Sessions",
             font=ctk.CTkFont(size=14, weight="bold")
         ).pack(pady=5)
-        
-        self.tree_widget = DirectoryTreeWidget(left_panel)
+        self.tree_widget = DirectoryTreeWidget(col_tree)
         self.tree_widget.pack(fill="both", expand=True, pady=5)
         
-        # Right panel: Settings and progress
-        right_panel = ctk.CTkFrame(content_frame, width=520)
-        right_panel.pack(side="right", fill="both", padx=(10, 0))
-        right_panel.pack_propagate(False)
+        # Column 2: Settings (same expand so it doesn't look squeezed)
+        col_settings = ctk.CTkFrame(content_frame)
+        col_settings.pack(side="left", fill="both", expand=True, padx=6)
+        self._create_settings_panel(col_settings)
         
-        # Settings
-        self._create_settings_panel(right_panel)
+        # Column 3: Progress
+        col_progress = ctk.CTkFrame(content_frame)
+        col_progress.pack(side="left", fill="both", expand=True, padx=(6, 0))
+        self._create_progress_panel(col_progress)
         
-        # Progress section
-        self._create_progress_panel(right_panel)
-        
-        # Process button at bottom
+        # Process buttons at bottom
+        btn_frame = ctk.CTkFrame(self, fg_color="transparent")
+        btn_frame.pack(pady=20)
         self.process_btn = ctk.CTkButton(
-            self,
+            btn_frame,
             text="Start Processing",
             command=self._start_processing,
-            width=200,
-            height=45,
-            font=ctk.CTkFont(size=16, weight="bold"),
+            width=180,
+            height=40,
+            font=ctk.CTkFont(size=14, weight="bold"),
             fg_color="#28a745",
             hover_color="#218838",
             text_color="white",
             text_color_disabled="white"
         )
-        self.process_btn.pack(pady=20)
+        self.process_btn.pack(side="left", padx=(0, 12))
+        self.stop_btn = ctk.CTkButton(
+            btn_frame,
+            text="Stop",
+            command=self._stop_processing,
+            width=180,
+            height=40,
+            font=ctk.CTkFont(size=14, weight="bold"),
+            fg_color="#dc3545",
+            hover_color="#c82333",
+            text_color="white",
+            text_color_disabled="white",
+            state="disabled"
+        )
+        self.stop_btn.configure(fg_color=BTN_DISABLED_FG)  # initial disabled look
+        self.stop_btn.pack(side="left")
     
     def _create_settings_panel(self, parent):
         """Create settings panel."""
         settings_frame = ctk.CTkFrame(parent)
-        settings_frame.pack(fill="x", padx=10, pady=10)
+        settings_frame.pack(fill="both", expand=True, padx=10, pady=10)
         
         ctk.CTkLabel(
             settings_frame,
@@ -719,7 +802,7 @@ class VideoProcessingTab(ctk.CTkFrame):
         ctk.CTkLabel(conf_frame, text="Min Confidence:", width=120, anchor="w").pack(side="left")
         self.min_confidence_stage1_var = ctk.DoubleVar(value=0.0)
         ctk.CTkEntry(conf_frame, textvariable=self.min_confidence_stage1_var, width=80).pack(side="left", padx=5)
-        ctk.CTkLabel(conf_frame, text="(0.0-1.0)", text_color="gray", font=ctk.CTkFont(size=9)).pack(side="left")
+        ctk.CTkLabel(conf_frame, text="(0.0-1.0)", text_color="gray", font=ctk.CTkFont(size=12)).pack(side="left")
         
         # GPU checkbox
         self.use_gpu_var = ctk.BooleanVar(value=False)
@@ -879,7 +962,12 @@ class VideoProcessingTab(ctk.CTkFrame):
     def set_project_dir(self, project_dir: Path):
         """Called by app when project directory changes."""
         self.project_dir = project_dir
-        self.dir_label.configure(text=str(project_dir))
+        self.tree_widget.build_tree(str(project_dir))
+
+    def update_project_and_reviewer(self, project_dir: Path, reviewer_id: str):
+        """Called when user changes project or reviewer via Back to setup."""
+        self.project_dir = project_dir
+        self.reviewer_id = reviewer_id
         self.tree_widget.build_tree(str(project_dir))
     
     def _get_min_confidence(self):
@@ -911,6 +999,16 @@ class VideoProcessingTab(ctk.CTkFrame):
         self.settings.set("stage2.batch_size", self._get_batch_size())
         self.settings.save_settings()
     
+    def _stop_processing(self):
+        """Request stop and terminate the current subprocess."""
+        self._stop_requested = True
+        proc = self._current_process_holder[0] if self._current_process_holder else None
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+    
     def _start_processing(self):
         """Start processing in background thread."""
         if self.is_processing:
@@ -928,18 +1026,46 @@ class VideoProcessingTab(ctk.CTkFrame):
             messagebox.showerror("Error", "Please select at least one session to process!")
             return
         
+        # Warn if any selected session already has face detection (re-run will overwrite and discard annotations)
+        sessions_already_done = [
+            (p, s, path) for (p, s, path) in selected_sessions
+            if (path / "face_detections.csv").exists()
+        ]
+        if sessions_already_done:
+            n = len(sessions_already_done)
+            session_list = "\n".join(f"  • {p} / {s}" for (p, s, _) in sessions_already_done[:10])
+            if n > 10:
+                session_list += f"\n  ... and {n - 10} more"
+            ok = messagebox.askyesno(
+                "Overwrite face detection — annotations will be lost",
+                "The following session(s) already have face detection results:\n\n"
+                + session_list
+                + "\n\nRe-running will:\n"
+                "  • Overwrite face_detections.csv for these sessions\n"
+                "  • Permanently delete all reviewer annotations (Tab 2, Tab 3, Tab 4) that depend on these sessions\n\n"
+                "This cannot be undone. Are you sure you want to continue?",
+                icon=messagebox.WARNING,
+                default="no"
+            )
+            if not ok:
+                return
+        
         # Save settings
         self._save_settings()
         
         # Clear log
         self.log_textbox.delete("1.0", "end")
         
-        # Disable button and change appearance
+        self._stop_requested = False
+        self._current_process_holder[0] = None
+        
+        # Disable Start, enable Stop
         self.process_btn.configure(
             state="disabled",
             text="Processing...",
-            fg_color="#6c757d"  # Gray color for disabled state
+            fg_color=BTN_DISABLED_FG
         )
+        self.stop_btn.configure(state="normal", fg_color="#dc3545")
         self.is_processing = True
         
         # Start processing thread
@@ -1006,8 +1132,20 @@ class VideoProcessingTab(ctk.CTkFrame):
                         reporter=reporter,
                         debug_mode=self.debug_mode_var.get(),
                         settings=self.settings,
+                        process_holder=self._current_process_holder,
+                        stop_check=lambda: self._stop_requested,
                     )
                     self.after(0, lambda sid=step_id_s1: reporter.update_step_status(sid, "completed"))
+                    # Discard all annotations that depended on previous face detection for this session
+                    _discard_annotations_for_session(
+                        self.project_dir, participant_name, session_name
+                    )
+                    self.after(0, lambda p=participant_name, s=session_name: reporter.log(
+                        f"Discarded previous annotations for {p}/{s} (Tab 2, 3, 4)."
+                    ))
+                except ProcessingStopped:
+                    self.after(0, lambda sid=step_id_s1: reporter.update_step_status(sid, "error"))
+                    raise
                 except Exception as e:
                     self.after(0, lambda sid=step_id_s1: reporter.update_step_status(sid, "error"))
                     raise
@@ -1028,8 +1166,13 @@ class VideoProcessingTab(ctk.CTkFrame):
                         reporter=reporter,
                         debug_mode=self.debug_mode_var.get(),
                         settings=self.settings,
+                        process_holder=self._current_process_holder,
+                        stop_check=lambda: self._stop_requested,
                     )
                     self.after(0, lambda sid=step_id_s2: reporter.update_step_status(sid, "completed"))
+                except ProcessingStopped:
+                    self.after(0, lambda sid=step_id_s2: reporter.update_step_status(sid, "error"))
+                    raise
                 except Exception as e:
                     self.after(0, lambda sid=step_id_s2: reporter.update_step_status(sid, "error"))
                     raise
@@ -1045,6 +1188,10 @@ class VideoProcessingTab(ctk.CTkFrame):
                 f"Successfully processed {total_sessions} session(s)!"
             ))
         
+        except ProcessingStopped:
+            self.after(0, lambda: reporter.log("\n[STOPPED] Processing stopped by user."))
+            self.after(0, lambda: reporter.update_status("[Stopped] Processing stopped by user."))
+            self.after(0, lambda: messagebox.showinfo("Stopped", "Processing was stopped."))
         except Exception as e:
             import traceback
             error_details = traceback.format_exc()
@@ -1057,12 +1204,12 @@ class VideoProcessingTab(ctk.CTkFrame):
             ))
         
         finally:
-            # Re-enable button and restore color
             self.after(0, lambda: self.process_btn.configure(
                 state="normal",
                 text="Start Processing",
                 fg_color="#28a745"
             ))
+            self.after(0, lambda: self.stop_btn.configure(state="disabled", fg_color=BTN_DISABLED_FG))
             self.is_processing = False
 
 
@@ -1090,106 +1237,109 @@ class FaceInstanceReviewTab(ctk.CTkFrame):
 
         # Image cache
         self.image_cache: Dict[int, Image.Image] = {}
+        self._session_display_to_raw: Dict[str, str] = {}
 
         self._setup_ui()
         self._load_settings()
     
     def _setup_ui(self):
-        """Setup UI components."""
+        """Setup UI: compact top form, gallery expands to use all space, action buttons fixed at bottom."""
         # Title
         ctk.CTkLabel(
             self,
-            text="Face Instance Review - Manual Detection Verification",
+            text="Face Instance Review",
             font=ctk.CTkFont(size=20, weight="bold")
-        ).pack(pady=(10, 20))
+        ).pack(pady=(10, 15), fill="x")
 
-        # Reviewer info bar
-        info_frame = ctk.CTkFrame(self)
-        info_frame.pack(fill="x", padx=20, pady=(0, 10))
+        # Top form: participant/session, stats, controls, pagination (compact, no scroll)
+        self.form_frame = ctk.CTkFrame(self, fg_color="transparent")
+        self.form_frame.pack(fill="x", padx=20, pady=(0, 6))
 
-        ctk.CTkLabel(
-            info_frame,
-            text="Reviewing as:",
-            font=ctk.CTkFont(size=13, weight="bold")
-        ).pack(side="left", padx=(10, 4))
-        ctk.CTkLabel(
-            info_frame,
-            text=self.reviewer_id or "—",
-            font=ctk.CTkFont(size=13),
-            text_color="#3b8ed0"
-        ).pack(side="left", padx=(0, 20))
+        # Participant / session selector — dropdowns
+        sel_frame = ctk.CTkFrame(self.form_frame)
+        sel_frame.pack(fill="x", pady=(0, 6))
 
-        # Participant / session selector
-        sel_frame = ctk.CTkFrame(self)
-        sel_frame.pack(fill="x", padx=20, pady=(0, 10))
-
-        # --- Left: participants ---
-        p_col = ctk.CTkFrame(sel_frame)
-        p_col.pack(side="left", fill="both", expand=True, padx=(0, 5))
+        row = ctk.CTkFrame(sel_frame, fg_color="transparent")
+        row.pack(fill="x", padx=10, pady=8)
 
         ctk.CTkLabel(
-            p_col, text="Participant", font=ctk.CTkFont(size=13, weight="bold")
-        ).pack(anchor="w", padx=5, pady=(4, 2))
-
-        self.participant_listbox = ctk.CTkScrollableFrame(p_col, height=90)
-        self.participant_listbox.pack(fill="both", expand=True, padx=5, pady=(0, 4))
-
-        # --- Right: sessions ---
-        s_col = ctk.CTkFrame(sel_frame)
-        s_col.pack(side="left", fill="both", expand=True, padx=(5, 0))
+            row, text="Participant:", font=ctk.CTkFont(size=13, weight="bold"), width=90
+        ).pack(side="left", padx=(0, 6))
+        self.participant_var = ctk.StringVar(value="— select —")
+        self.participant_dropdown = ctk.CTkOptionMenu(
+            row,
+            variable=self.participant_var,
+            values=["— select —"],
+            width=220,
+            command=self._on_participant_selected_dropdown
+        )
+        self.participant_dropdown.pack(side="left", padx=(0, 20))
 
         ctk.CTkLabel(
-            s_col, text="Session", font=ctk.CTkFont(size=13, weight="bold")
-        ).pack(anchor="w", padx=5, pady=(4, 2))
+            row, text="Session:", font=ctk.CTkFont(size=13, weight="bold"), width=70
+        ).pack(side="left", padx=(0, 6))
+        self.session_var = ctk.StringVar(value="— select —")
+        self.session_dropdown = ctk.CTkOptionMenu(
+            row,
+            variable=self.session_var,
+            values=["— select —"],
+            width=220,
+            command=self._on_session_selected_dropdown
+        )
+        self.session_dropdown.pack(side="left", padx=(0, 15))
 
-        self.session_listbox = ctk.CTkScrollableFrame(s_col, height=90)
-        self.session_listbox.pack(fill="both", expand=True, padx=5, pady=(0, 4))
-
-        # Load button
         self.load_btn = ctk.CTkButton(
-            sel_frame,
+            row,
             text="Load Session",
             command=self._load_session,
             width=120,
-            height=35,
+            height=32,
             state="disabled"
         )
-        self.load_btn.pack(side="left", padx=10, pady=5, anchor="s")
+        self.load_btn.pack(side="left", padx=(0, 15))
 
-        # Populate participant list immediately
-        self._populate_participants()
-        
-        # Statistics panel
-        self.stats_frame = ctk.CTkFrame(self)
-        self.stats_frame.pack(fill="x", padx=20, pady=(0, 10))
-        
+        self.reviewed_var = ctk.BooleanVar(value=False)
+        self.reviewed_checkbox = ctk.CTkCheckBox(
+            row,
+            text="I have fully reviewed this session",
+            variable=self.reviewed_var,
+            command=self._on_reviewed_checkbox_changed,
+            font=ctk.CTkFont(size=12),
+            state="disabled"
+        )
+        self.reviewed_checkbox.pack(side="left", padx=(0, 5), pady=0)
+
+        self._populate_participants_dropdown()
+
+        # Control panel (items per page, Apply, Check all, Uncheck all)
+        self._create_control_panel()
+
+        # Statistics (total instances, valid faces, non-face) — below controls, above pages
+        self.stats_frame = ctk.CTkFrame(self.form_frame)
+        self.stats_frame.pack(fill="x", pady=(0, 6))
         self.stats_label = ctk.CTkLabel(
             self.stats_frame,
             text="No session loaded",
             font=ctk.CTkFont(size=12)
         )
-        self.stats_label.pack(pady=10)
-        
-        # Control panel
-        self._create_control_panel()
-        
-        # Pagination controls
+        self.stats_label.pack(pady=(10, 10))
+
+        # Pagination
         self._create_pagination_controls()
-        
-        # Gallery frame
+
+        # Gallery: takes all remaining space (expand=True) so more images visible
         self.gallery_container = ctk.CTkFrame(self)
-        self.gallery_container.pack(fill="both", expand=True, padx=20, pady=(0, 10))
-        
-        self.gallery_frame = ctk.CTkScrollableFrame(self.gallery_container, height=400)
+        self.gallery_container.pack(fill="both", expand=True, padx=20, pady=(0, 6))
+        self.gallery_frame = ctk.CTkScrollableFrame(self.gallery_container)
         self.gallery_frame.pack(fill="both", expand=True, padx=5, pady=5)
-        
-        # Action buttons
+
+        # Action buttons fixed at bottom
         self._create_action_buttons()
     
     def _create_control_panel(self):
         """Create control panel with filters and settings."""
-        panel = ctk.CTkFrame(self)
-        panel.pack(fill="x", padx=20, pady=(0, 10))
+        panel = ctk.CTkFrame(self.form_frame)
+        panel.pack(fill="x", pady=(0, 6))
         
         # Items per page
         ctk.CTkLabel(
@@ -1199,22 +1349,13 @@ class FaceInstanceReviewTab(ctk.CTkFrame):
         ).pack(side="left", padx=(10, 5))
         
         self.items_per_page_var = ctk.IntVar(value=100)
-        self.items_per_page_entry = ctk.CTkEntry(
+        ctk.CTkEntry(
             panel,
             width=80,
             textvariable=self.items_per_page_var
-        )
-        self.items_per_page_entry.pack(side="left", padx=(0, 5))
-        
-        ctk.CTkButton(
-            panel,
-            text="Load",
-            command=self._on_items_per_page_changed,
-            width=80,
-            height=30
         ).pack(side="left", padx=(0, 15))
         
-        # Confidence filter
+        # Min confidence
         ctk.CTkLabel(
             panel,
             text="Min Confidence:",
@@ -1228,146 +1369,125 @@ class FaceInstanceReviewTab(ctk.CTkFrame):
             textvariable=self.min_confidence_var
         ).pack(side="left", padx=(0, 5))
         
-        ctk.CTkButton(
+        # Apply (items per page + min confidence)
+        self.apply_btn = ctk.CTkButton(
             panel,
-            text="Apply Filter",
-            command=self._apply_filter,
-            width=100,
-            height=30
-        ).pack(side="left", padx=(10, 5))
+            text="Apply",
+            command=self._on_apply_filters,
+            width=80,
+            height=30,
+            state="disabled"
+        )
+        self.apply_btn.pack(side="left", padx=(10, 10))
+        
+        # Check all / Uncheck all (page)
+        self.check_all_page_btn = ctk.CTkButton(
+            panel, text="Check all (page)", command=self._check_all_page, width=110, height=30, state="disabled"
+        )
+        self.check_all_page_btn.pack(side="left", padx=(5, 5))
+        self.uncheck_all_page_btn = ctk.CTkButton(
+            panel, text="Uncheck all (page)", command=self._uncheck_all_page, width=120, height=30, state="disabled"
+        )
+        self.uncheck_all_page_btn.pack(side="left", padx=(0, 5))
     
     def _create_pagination_controls(self):
-        """Create pagination controls (matching popup gallery style)."""
-        self.pagination_frame = ctk.CTkFrame(self)
-        self.pagination_frame.pack(fill="x", padx=20, pady=(0, 10))
-        
-        # Page info label (showing current range)
+        """Create pagination controls (single horizontal row when empty or filled)."""
+        self.pagination_frame = ctk.CTkFrame(self.form_frame, fg_color="transparent")
+        self.pagination_frame.pack(fill="x", pady=(0, 6))
+        row = ctk.CTkFrame(self.pagination_frame, fg_color="transparent")
+        row.pack(fill="x", padx=0, pady=4)
+        # Page info (left); page numbers (right) — one row so no big empty square when nothing loaded
         self.page_info_label = ctk.CTkLabel(
-            self.pagination_frame,
-            text="",
+            row,
+            text="Load a session to see instances and pages",
             font=ctk.CTkFont(size=11),
             text_color="gray"
         )
-        self.page_info_label.pack(pady=(5, 5))
-        
-        # Page numbers frame (will be populated dynamically)
-        self.page_numbers_frame = ctk.CTkFrame(self.pagination_frame)
-        self.page_numbers_frame.pack(padx=10, pady=5)
+        self.page_info_label.pack(side="left", padx=(0, 15))
+        self.page_numbers_frame = ctk.CTkFrame(row, fg_color="transparent")
+        self.page_numbers_frame.pack(side="left", padx=0, pady=0)
     
     def _create_action_buttons(self):
-        """Create action buttons at bottom."""
+        """Create action buttons fixed at bottom of tab."""
         action_frame = ctk.CTkFrame(self)
-        action_frame.pack(fill="x", padx=20, pady=(0, 10))
-        
-        # Selection info
-        self.selection_label = ctk.CTkLabel(
-            action_frame,
-            text="0 instances selected",
-            font=ctk.CTkFont(size=12)
-        )
-        self.selection_label.pack(side="left", padx=10)
-        
-        # Mark as non-face button
-        self.mark_nonface_btn = ctk.CTkButton(
-            action_frame,
-            text="Mark as Non-Face",
-            command=self._mark_as_nonface,
-            width=160,
-            height=40,
-            font=ctk.CTkFont(size=13, weight="bold"),
-            fg_color="#dc3545",
-            hover_color="#c82333",
-            state="disabled"
-        )
-        self.mark_nonface_btn.pack(side="left", padx=5)
-        
-        # Mark as face button (restore mistakenly marked non-faces)
-        self.mark_face_btn = ctk.CTkButton(
-            action_frame,
-            text="Mark as Face",
-            command=self._mark_as_face,
-            width=140,
-            height=40,
-            font=ctk.CTkFont(size=13, weight="bold"),
-            fg_color="#28a745",
-            hover_color="#218838",
-            state="disabled"
-        )
-        self.mark_face_btn.pack(side="left", padx=5)
-        
-        # Clear selection button
-        self.clear_btn = ctk.CTkButton(
-            action_frame,
-            text="Clear Selection",
-            command=self._clear_selection,
-            width=140,
-            height=40,
-            font=ctk.CTkFont(size=13),
-            state="disabled"
-        )
-        self.clear_btn.pack(side="left", padx=5)
-        
-        # Save annotations button
+        action_frame.pack(fill="x", padx=20, pady=(6, 10))
+        # Save annotations button (centered)
         self.save_btn = ctk.CTkButton(
             action_frame,
             text="Save Annotations",
             command=self._save_annotations,
-            width=160,
+            width=180,
             height=40,
-            font=ctk.CTkFont(size=13, weight="bold"),
-            fg_color="#007bff",
-            hover_color="#0056b3",
+            font=ctk.CTkFont(size=14, weight="bold"),
+            fg_color="#28a745",
+            hover_color="#218838",
+            text_color="white",
+            text_color_disabled="white",
             state="disabled"
         )
-        self.save_btn.pack(side="left", padx=5)
+        self.save_btn.configure(fg_color=BTN_DISABLED_FG)  # initial disabled look
+        self.save_btn.pack(anchor="center", pady=5)
     
-    def _populate_participants(self):
-        """Populate the participant list from the project directory."""
-        for w in self.participant_listbox.winfo_children():
-            w.destroy()
-        self._participant_btn_vars: Dict[str, ctk.StringVar] = {}
+    def _get_review_status_path(self, participant: str, session: str) -> Path:
+        """Path to review_status.json for this reviewer/participant/session."""
+        registry = ReviewerRegistry(self.project_dir)
+        ann_path = registry.get_tab2_annotation_path(self.reviewer_id, participant, session)
+        return ann_path.parent / "review_status.json"
 
-        if not self.project_dir or not self.project_dir.exists():
-            ctk.CTkLabel(
-                self.participant_listbox, text="No project loaded", text_color="gray"
-            ).pack()
+    def _load_review_status(self, participant: str, session: str) -> Dict:
+        """Load {reviewed: bool, last_save: str|None} for this session."""
+        path = self._get_review_status_path(participant, session)
+        if path.exists():
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                return {
+                    "reviewed": bool(data.get("reviewed", False)),
+                    "last_save": data.get("last_save"),
+                }
+            except Exception:
+                pass
+        # If no status file, use tab2 CSV mtime as last_save for display
+        registry = ReviewerRegistry(self.project_dir)
+        ann_path = registry.get_tab2_annotation_path(self.reviewer_id, participant, session)
+        last_save = None
+        if ann_path.exists():
+            try:
+                from datetime import datetime
+                mtime = ann_path.stat().st_mtime
+                last_save = datetime.fromtimestamp(mtime).isoformat()
+            except Exception:
+                pass
+        return {"reviewed": False, "last_save": last_save}
+
+    def _save_review_status(self, participant: str, session: str, reviewed: bool, last_save: Optional[str] = None):
+        """Save review status. If last_save is None, keep existing value."""
+        path = self._get_review_status_path(participant, session)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        current = self._load_review_status(participant, session)
+        if last_save is not None:
+            current["last_save"] = last_save
+        current["reviewed"] = reviewed
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(current, f, indent=2)
+
+    def _format_last_save(self, last_save_iso: Optional[str]) -> str:
+        """Format last_save ISO string or None for display in session list."""
+        if not last_save_iso:
+            return "not saved"
+        try:
+            from datetime import datetime
+            dt = datetime.fromisoformat(last_save_iso.replace("Z", "+00:00"))
+            return dt.strftime("%d %b %Y, %H:%M")
+        except Exception:
+            return last_save_iso[:16] if last_save_iso else "not saved"
+
+    def _refresh_session_dropdown(self):
+        """Rebuild session list for current participant and keep current session selected."""
+        if not self.selected_participant or not self.selected_session:
             return
-
-        participants = sorted([
-            d.name for d in self.project_dir.iterdir()
-            if d.is_dir() and not d.name.startswith('_') and not d.name.startswith('.')
-        ])
-
-        for pname in participants:
-            btn = ctk.CTkButton(
-                self.participant_listbox,
-                text=pname,
-                height=28,
-                anchor="w",
-                fg_color="transparent",
-                hover_color=("gray85", "gray30"),
-                command=lambda p=pname: self._on_participant_selected(p)
-            )
-            btn.pack(fill="x", padx=2, pady=1)
-            self._participant_btn_vars[pname] = btn
-
-    def _on_participant_selected(self, participant: str):
-        """Called when a participant is clicked."""
-        self.selected_participant = participant
-        self.selected_session = None
-        self.load_btn.configure(state="disabled")
-
-        # Highlight selected participant
-        for pname, btn in self._participant_btn_vars.items():
-            btn.configure(
-                fg_color=("#3b8ed0" if pname == participant else "transparent")
-            )
-
-        # Populate sessions
-        for w in self.session_listbox.winfo_children():
-            w.destroy()
-
-        p_path = self.project_dir / participant
+        choice = self.selected_participant
+        p_path = self.project_dir / choice
         sessions = sorted([
             d.name for d in p_path.iterdir()
             if d.is_dir()
@@ -1375,36 +1495,130 @@ class FaceInstanceReviewTab(ctk.CTkFrame):
             and not d.name.startswith('.')
             and (d / "face_detections.csv").exists()
         ])
-
-        self._session_btn_vars: Dict[str, ctk.CTkButton] = {}
+        display_values = []
         for sname in sessions:
-            # Check if reviewer already has annotations for this session
-            registry = ReviewerRegistry(self.project_dir)
-            ann_path = registry.get_tab2_annotation_path(
-                self.reviewer_id, participant, sname
-            )
-            done_marker = " ✓" if ann_path.exists() else ""
-            btn = ctk.CTkButton(
-                self.session_listbox,
-                text=sname + done_marker,
-                height=28,
-                anchor="w",
-                fg_color="transparent",
-                hover_color=("gray85", "gray30"),
-                command=lambda s=sname: self._on_session_selected(s)
-            )
-            btn.pack(fill="x", padx=2, pady=1)
-            self._session_btn_vars[sname] = btn
+            status = self._load_review_status(choice, sname)
+            last_save_str = self._format_last_save(status["last_save"])
+            label = f"{sname} — last save: {last_save_str}"
+            if status["reviewed"]:
+                label += " ✓ Reviewed"
+            display_values.append(label)
+        self._session_display_to_raw = {display_values[i]: sessions[i] for i in range(len(sessions))}
+        self.session_dropdown.configure(values=["— select —"] + display_values)
+        # Keep current session selected (find display string for selected_session)
+        for disp, raw in self._session_display_to_raw.items():
+            if raw == self.selected_session:
+                self.session_var.set(disp)
+                break
 
-    def _on_session_selected(self, session: str):
-        """Called when a session is clicked."""
-        self.selected_session = session
+    def update_project_and_reviewer(self, project_dir: Path, reviewer_id: str):
+        """Called when user changes project or reviewer via Back to setup."""
+        self.project_dir = project_dir
+        self.reviewer_id = reviewer_id
+
+    def _on_reviewed_checkbox_changed(self):
+        """User toggled 'I have fully reviewed this session'."""
+        if not self.selected_participant or not self.selected_session:
+            return
+        reviewed = self.reviewed_var.get()
+        self._save_review_status(
+            self.selected_participant,
+            self.selected_session,
+            reviewed=reviewed,
+            last_save=None,
+        )
+        # Refresh session dropdown without clearing selection
+        self._refresh_session_dropdown()
+        # Confirm to user
+        session_label = f"{self.selected_participant} / {self.selected_session}"
+        if reviewed:
+            messagebox.showinfo("Session reviewed", f"Marked as fully reviewed:\n{session_label}")
+        else:
+            messagebox.showinfo("Session not reviewed", f"Marked as not fully reviewed:\n{session_label}")
+
+    def _populate_participants_dropdown(self):
+        """Populate the participant dropdown from the project directory."""
+        if not self.project_dir or not self.project_dir.exists():
+            self.participant_dropdown.configure(values=["— select —"])
+            self.participant_var.set("— select —")
+            self.session_dropdown.configure(values=["— select —"])
+            self.session_var.set("— select —")
+            return
+
+        participants = sorted([
+            d.name for d in self.project_dir.iterdir()
+            if d.is_dir() and not d.name.startswith('_') and not d.name.startswith('.')
+        ])
+        values = ["— select —"] + participants
+        self.participant_dropdown.configure(values=values)
+        self.participant_var.set("— select —")
+        self.session_dropdown.configure(values=["— select —"])
+        self.session_var.set("— select —")
+        self.selected_participant = None
+        self.selected_session = None
+        self.load_btn.configure(state="disabled")
+
+    def _set_session_loaded_controls(self, enabled: bool):
+        """Enable or disable all controls that require a loaded session (checkbox, save, filter controls)."""
+        state = "normal" if enabled else "disabled"
+        self.reviewed_checkbox.configure(state=state)
+        self.save_btn.configure(
+            state=state,
+            fg_color="#28a745" if enabled else BTN_DISABLED_FG
+        )
+        self.check_all_page_btn.configure(state=state)
+        self.uncheck_all_page_btn.configure(state=state)
+        self.apply_btn.configure(state=state)
+        if not enabled:
+            self.page_info_label.configure(text="Load a session to see instances and pages")
+            for w in self.page_numbers_frame.winfo_children():
+                w.destroy()
+
+    def _on_participant_selected_dropdown(self, choice: str):
+        """Called when participant dropdown selection changes."""
+        if choice == "— select —":
+            self.selected_participant = None
+            self.session_dropdown.configure(values=["— select —"])
+            self.session_var.set("— select —")
+            self.selected_session = None
+            self.load_btn.configure(state="disabled")
+            self._set_session_loaded_controls(False)
+            return
+        self.selected_participant = choice
+        self.selected_session = None
+        self.load_btn.configure(state="disabled")
+        self._set_session_loaded_controls(False)
+
+        p_path = self.project_dir / choice
+        sessions = sorted([
+            d.name for d in p_path.iterdir()
+            if d.is_dir()
+            and not d.name.startswith('_')
+            and not d.name.startswith('.')
+            and (d / "face_detections.csv").exists()
+        ])
+        display_values = []
+        for sname in sessions:
+            status = self._load_review_status(choice, sname)
+            last_save_str = self._format_last_save(status["last_save"])
+            label = f"{sname} — last save: {last_save_str}"
+            if status["reviewed"]:
+                label += " ✓ Reviewed"
+            display_values.append(label)
+        self._session_display_to_raw = {display_values[i]: sessions[i] for i in range(len(sessions))}
+        self.session_dropdown.configure(values=["— select —"] + display_values)
+        self.session_var.set("— select —")
+
+    def _on_session_selected_dropdown(self, choice: str):
+        """Called when session dropdown selection changes."""
+        if choice == "— select —":
+            self.selected_session = None
+            self.load_btn.configure(state="disabled")
+            self._set_session_loaded_controls(False)
+            return
+        raw = getattr(self, "_session_display_to_raw", {}).get(choice, choice)
+        self.selected_session = raw
         self.load_btn.configure(state="normal")
-
-        for sname, btn in self._session_btn_vars.items():
-            btn.configure(
-                fg_color=("#3b8ed0" if sname == session else "transparent")
-            )
 
     def _load_session(self):
         """Load face detections from the selected participant/session."""
@@ -1430,10 +1644,13 @@ class FaceInstanceReviewTab(ctk.CTkFrame):
                 ))
                 return
             
+            # Clear annotations so we don't carry over the previous session's flags (index-based)
+            self.annotations.clear()
+            
             # Load CSV
             self.df = pd.read_csv(csv_path)
             
-            # Load existing annotations if they exist
+            # Load existing annotations if they exist (for this session only)
             self._load_existing_annotations()
             
             # Sort by confidence (lowest first)
@@ -1445,10 +1662,13 @@ class FaceInstanceReviewTab(ctk.CTkFrame):
                 if idx not in self.annotations:
                     self.annotations[idx] = {'is_face': True, 'reviewed_at': None}
             
-            # Update UI
+            # Update UI and enable session-dependent controls
             self.after(0, self._update_stats)
             self.after(0, self._display_gallery)
-            self.after(0, lambda: self.save_btn.configure(state="normal"))
+            self.after(0, lambda: self._set_session_loaded_controls(True))
+            # Show user-controlled "session reviewed" checkbox state
+            status = self._load_review_status(self.selected_participant, self.selected_session)
+            self.after(0, lambda: self.reviewed_var.set(status["reviewed"]))
             
         except Exception as e:
             import traceback
@@ -1501,32 +1721,22 @@ class FaceInstanceReviewTab(ctk.CTkFrame):
         )
         
         self.stats_label.configure(text=stats_text)
+        self._update_face_nonface_label()
     
-    def _on_items_per_page_changed(self):
-        """Handle items per page change."""
+    def _on_apply_filters(self):
+        """Apply items per page and min confidence, then refresh gallery."""
+        if self.df is None:
+            return
         try:
             new_value = int(self.items_per_page_var.get())
             if new_value < 1:
                 new_value = 100
                 self.items_per_page_var.set(100)
-            
-            batch_changed = (new_value != self.items_per_page)
             self.items_per_page = new_value
-            
-            # Reset to page 0 if batch size changed
-            if batch_changed:
-                self.current_page = 0
-            
-            self._display_gallery()
-        except ValueError:
+        except (ValueError, tkinter.TclError):
             self.items_per_page_var.set(self.items_per_page)
             messagebox.showerror("Invalid Input", "Please enter a valid number for items per page.")
-    
-    def _apply_filter(self):
-        """Apply confidence filter and reload gallery."""
-        if self.df is None:
             return
-        
         self.current_page = 0
         self._display_gallery()
     
@@ -1632,13 +1842,14 @@ class FaceInstanceReviewTab(ctk.CTkFrame):
         """Create gallery grid layout matching popup gallery style."""
         # Ensure gallery is completely clear (no pack widgets left)
         self._clear_gallery()
-        
+        self._card_nonface_labels = {}
+
         images_per_row = self._calculate_images_per_row()
-        
+
         # Store images for resize handling
         self.gallery_frame.images_data = images_data
         self.gallery_frame.images_per_row = images_per_row
-        
+
         for i, (instance_idx, row_data, image) in enumerate(images_data):
             row_idx = i // images_per_row
             col_idx = i % images_per_row
@@ -1657,25 +1868,24 @@ class FaceInstanceReviewTab(ctk.CTkFrame):
             img_label.image = img_tk  # Keep reference
             img_label.place(x=5, y=5, relwidth=0.92, relheight=0.77)
             
-            # Checkbox overlay (top-left corner)
-            checkbox_var = ctk.BooleanVar(value=instance_idx in self.selected_instances)
+            # Checkbox: checked = face, unchecked = non-face (red text shown below)
+            is_face = self.annotations.get(instance_idx, {}).get('is_face', True)
+            checkbox_var = ctk.BooleanVar(value=is_face)
             checkbox = ctk.CTkCheckBox(
                 img_container,
                 text="",
                 variable=checkbox_var,
                 width=20,
-                command=lambda idx=instance_idx, var=checkbox_var: self._on_checkbox_toggle(idx, var),
+                command=lambda idx=instance_idx, var=checkbox_var: self._on_face_checkbox_toggle(idx, var),
                 checkbox_width=18,
-                checkbox_height=18,
-                fg_color="#3b8ed0",
-                hover_color="#2a6fa5"
+                checkbox_height=18
             )
             checkbox.place(x=10, y=10)
             
-            # Make entire image clickable to toggle selection
+            # Make entire image clickable to toggle face/non-face
             def toggle_on_click(event, idx=instance_idx, var=checkbox_var):
                 var.set(not var.get())
-                self._on_checkbox_toggle(idx, var)
+                self._on_face_checkbox_toggle(idx, var)
             
             img_label.bind("<Button-1>", toggle_on_click)
             img_container.configure(cursor="hand2")
@@ -1704,18 +1914,19 @@ class FaceInstanceReviewTab(ctk.CTkFrame):
                 text_color="gray"
             )
             idx_label.pack(side="right")
-            
-            # Show non-face marker if marked (overlay in center)
-            if not self.annotations.get(instance_idx, {}).get('is_face', True):
-                nonface_label = ctk.CTkLabel(
-                    img_container,
-                    text="NON-FACE",
-                    font=ctk.CTkFont(size=10, weight="bold"),
-                    text_color="red",
-                    fg_color="black"
-                )
+
+            # NON-FACE label (always create; show/hide on toggle so unchecked shows red flag)
+            nonface_label = ctk.CTkLabel(
+                img_container,
+                text="NON-FACE",
+                font=ctk.CTkFont(size=10, weight="bold"),
+                text_color="red",
+                fg_color="black"
+            )
+            self._card_nonface_labels[instance_idx] = nonface_label
+            if not is_face:
                 nonface_label.place(relx=0.5, rely=0.4, anchor="center")
-        
+
         # Configure grid to enable proper scrolling
         for col in range(images_per_row):
             self.gallery_frame.grid_columnconfigure(col, weight=1, minsize=140)
@@ -1743,10 +1954,11 @@ class FaceInstanceReviewTab(ctk.CTkFrame):
         # Only regenerate if images per row changed
         if new_images_per_row != self.gallery_frame.images_per_row:
             self.gallery_frame.images_per_row = new_images_per_row
-            
+
             # Regenerate grid layout with new column count
             self._clear_gallery()
-            
+            self._card_nonface_labels = {}
+
             for i, (instance_idx, row_data, image) in enumerate(self.gallery_frame.images_data):
                 row_idx = i // new_images_per_row
                 col_idx = i % new_images_per_row
@@ -1765,25 +1977,24 @@ class FaceInstanceReviewTab(ctk.CTkFrame):
                 img_label.image = img_tk
                 img_label.place(x=5, y=5, relwidth=0.92, relheight=0.77)
                 
-                # Checkbox
-                checkbox_var = ctk.BooleanVar(value=instance_idx in self.selected_instances)
+                # Checkbox: checked = face, unchecked = non-face (red text shown below)
+                is_face = self.annotations.get(instance_idx, {}).get('is_face', True)
+                checkbox_var = ctk.BooleanVar(value=is_face)
                 checkbox = ctk.CTkCheckBox(
                     img_container,
                     text="",
                     variable=checkbox_var,
                     width=20,
-                    command=lambda idx=instance_idx, var=checkbox_var: self._on_checkbox_toggle(idx, var),
+                    command=lambda idx=instance_idx, var=checkbox_var: self._on_face_checkbox_toggle(idx, var),
                     checkbox_width=18,
-                    checkbox_height=18,
-                    fg_color="#3b8ed0",
-                    hover_color="#2a6fa5"
+                    checkbox_height=18
                 )
                 checkbox.place(x=10, y=10)
                 
                 # Make clickable
                 def toggle_on_click(event, idx=instance_idx, var=checkbox_var):
                     var.set(not var.get())
-                    self._on_checkbox_toggle(idx, var)
+                    self._on_face_checkbox_toggle(idx, var)
                 
                 img_label.bind("<Button-1>", toggle_on_click)
                 img_container.configure(cursor="hand2")
@@ -1807,17 +2018,19 @@ class FaceInstanceReviewTab(ctk.CTkFrame):
                     font=ctk.CTkFont(size=9),
                     text_color="gray"
                 ).pack(side="right")
-                
-                # Non-face marker
-                if not self.annotations.get(instance_idx, {}).get('is_face', True):
-                    ctk.CTkLabel(
-                        img_container,
-                        text="NON-FACE",
-                        font=ctk.CTkFont(size=10, weight="bold"),
-                        text_color="red",
-                        fg_color="black"
-                    ).place(relx=0.5, rely=0.4, anchor="center")
-            
+
+                # NON-FACE label (always create; show/hide on toggle)
+                nonface_label = ctk.CTkLabel(
+                    img_container,
+                    text="NON-FACE",
+                    font=ctk.CTkFont(size=10, weight="bold"),
+                    text_color="red",
+                    fg_color="black"
+                )
+                self._card_nonface_labels[instance_idx] = nonface_label
+                if not is_face:
+                    nonface_label.place(relx=0.5, rely=0.4, anchor="center")
+
             # Configure grid columns and rows
             for col in range(new_images_per_row):
                 self.gallery_frame.grid_columnconfigure(col, weight=1, minsize=140)
@@ -1886,112 +2099,51 @@ class FaceInstanceReviewTab(ctk.CTkFrame):
         img = Image.new('RGB', (120, 120), color=(100, 100, 100))
         return img
     
-    def _on_checkbox_toggle(self, instance_idx: int, checkbox_var: ctk.BooleanVar):
-        """Handle checkbox toggle."""
-        if checkbox_var.get():
-            self.selected_instances.add(instance_idx)
-        else:
-            self.selected_instances.discard(instance_idx)
-        
-        self._update_selection_label()
-    
-    def _update_selection_label(self):
-        """Update selection count label."""
-        count = len(self.selected_instances)
-        if count == 0:
-            text = "0 instances selected"
-        elif count == 1:
-            text = "1 instance selected"
-        else:
-            text = f"{count} instances selected"
-        
-        self.selection_label.configure(text=text)
-        
-        # Enable/disable buttons based on selection
-        if count > 0:
-            self.mark_nonface_btn.configure(state="normal")
-            self.mark_face_btn.configure(state="normal")
-            self.clear_btn.configure(state="normal")
-        else:
-            self.mark_nonface_btn.configure(state="disabled")
-            self.mark_face_btn.configure(state="disabled")
-            self.clear_btn.configure(state="disabled")
-    
-    def _mark_as_nonface(self):
-        """Mark selected instances as non-face."""
-        if not self.selected_instances:
-            return
-        
-        # Confirm action
-        count = len(self.selected_instances)
-        response = messagebox.askyesno(
-            "Confirm",
-            f"Mark {count} instance(s) as non-face?\n\n"
-            "These instances will be excluded from clustering."
-        )
-        
-        if not response:
-            return
-        
-        # Mark as non-face
+    def _on_face_checkbox_toggle(self, instance_idx: int, checkbox_var: ctk.BooleanVar):
+        """Toggle face/non-face for this instance; annotations persist across pages."""
         from datetime import datetime
-        timestamp = datetime.now().isoformat()
-        
-        for idx in self.selected_instances:
-            self.annotations[idx] = {
-                'is_face': False,
-                'reviewed_at': timestamp
-            }
-        
-        # Clear selection
-        self.selected_instances.clear()
-        
-        # Refresh display
+        is_face = checkbox_var.get()
+        self.annotations[instance_idx] = {
+            'is_face': is_face,
+            'reviewed_at': datetime.now().isoformat()
+        }
+        # Update NON-FACE label visibility on current page
+        if getattr(self, "_card_nonface_labels", None) and instance_idx in self._card_nonface_labels:
+            lbl = self._card_nonface_labels[instance_idx]
+            if is_face:
+                lbl.place_forget()
+            else:
+                lbl.place(relx=0.5, rely=0.4, anchor="center")
         self._update_stats()
-        self._display_gallery()
-        
-        messagebox.showinfo("Success", f"Marked {count} instance(s) as non-face.")
-    
-    def _mark_as_face(self):
-        """Restore selected instances as valid faces."""
-        if not self.selected_instances:
+        self._update_face_nonface_label()
+
+    def _check_all_page(self):
+        """Mark all instances on the current page as face."""
+        if not getattr(self.gallery_frame, "images_data", None):
             return
-        
-        # Confirm action
-        count = len(self.selected_instances)
-        response = messagebox.askyesno(
-            "Confirm",
-            f"Mark {count} instance(s) as valid face(s)?\n\n"
-            "These instances will be included in clustering."
-        )
-        
-        if not response:
-            return
-        
-        # Mark as face
         from datetime import datetime
-        timestamp = datetime.now().isoformat()
-        
-        for idx in self.selected_instances:
-            self.annotations[idx] = {
-                'is_face': True,
-                'reviewed_at': timestamp
-            }
-        
-        # Clear selection
-        self.selected_instances.clear()
-        
-        # Refresh display
+        now = datetime.now().isoformat()
+        for instance_idx, _, _ in self.gallery_frame.images_data:
+            self.annotations[instance_idx] = {"is_face": True, "reviewed_at": now}
+        self._create_gallery_grid(self.gallery_frame.images_data)
         self._update_stats()
-        self._display_gallery()
-        
-        messagebox.showinfo("Success", f"Marked {count} instance(s) as valid face(s).")
+        self._update_face_nonface_label()
+
+    def _uncheck_all_page(self):
+        """Mark all instances on the current page as non-face."""
+        if not getattr(self.gallery_frame, "images_data", None):
+            return
+        from datetime import datetime
+        now = datetime.now().isoformat()
+        for instance_idx, _, _ in self.gallery_frame.images_data:
+            self.annotations[instance_idx] = {"is_face": False, "reviewed_at": now}
+        self._create_gallery_grid(self.gallery_frame.images_data)
+        self._update_stats()
+        self._update_face_nonface_label()
     
-    def _clear_selection(self):
-        """Clear all selections."""
-        self.selected_instances.clear()
-        self._update_selection_label()
-        self._display_gallery()
+    def _update_face_nonface_label(self):
+        """No-op: face/non-face count was removed from bottom bar."""
+        pass
     
     def _save_annotations(self):
         """Save annotations to reviewer overlay CSV."""
@@ -2021,9 +2173,19 @@ class FaceInstanceReviewTab(ctk.CTkFrame):
             marked_nonface = sum(1 for r in annotation_records if not r['is_face'])
             valid_faces = total - marked_nonface
 
-            # Refresh session list to show ✓ marker
-            if self.selected_participant:
-                self._on_participant_selected(self.selected_participant)
+            # Update review status with last_save = now (keep user's "reviewed" choice)
+            from datetime import datetime
+            now_iso = datetime.now().isoformat()
+            self._save_review_status(
+                self.selected_participant,
+                self.selected_session,
+                reviewed=self.reviewed_var.get(),
+                last_save=now_iso,
+            )
+
+            # Refresh session dropdown to show last save and reviewed state (keep selection)
+            if self.selected_participant and self.selected_session:
+                self._refresh_session_dropdown()
 
             messagebox.showinfo(
                 "Saved",
@@ -2166,8 +2328,522 @@ class FaceInstanceReviewTab(ctk.CTkFrame):
             self._display_gallery()
 
 
+class MismatchResolutionTab(ctk.CTkFrame):
+    """Tab: Resolve face/non-face mismatches (consensus). Left = session list (click to select), right = gallery + Save."""
+
+    def __init__(self, master, settings_manager: SettingsManager, project_dir: Path, reviewer_id: str):
+        super().__init__(master)
+        self.settings = settings_manager
+        self.project_dir = Path(project_dir) if project_dir else None
+        self.reviewer_id = reviewer_id or ""
+        self.registry = ReviewerRegistry(project_dir) if project_dir else None
+        self.selected_participant: Optional[str] = None
+        self.selected_session: Optional[str] = None
+        self.session_dir: Optional[Path] = None
+        self.df: Optional[pd.DataFrame] = None
+        self.mismatch_indices: List[int] = []
+        self.reviewer_labels: Dict[int, Dict[str, bool]] = {}
+        self.reviewer_ids: List[str] = []
+        self.annotations: Dict[int, bool] = {}
+        self.image_cache: Dict[int, Image.Image] = {}
+        self.items_per_page = 24
+        self.current_page = 0
+        self.current_df_filtered: Optional[pd.DataFrame] = None
+        self.current_total_pages = 1
+        self._session_rows: List[Tuple[ctk.CTkFrame, str, str]] = []
+        self._setup_ui()
+        # Session list is loaded when tab is first shown (via <Map>), not at startup, to avoid blocking main window
+
+    def _setup_ui(self):
+        ctk.CTkLabel(
+            self,
+            text="Resolve Mismatches",
+            font=ctk.CTkFont(size=20, weight="bold")
+        ).pack(pady=(10, 15))
+        content = ctk.CTkFrame(self, fg_color="transparent")
+        content.pack(fill="both", expand=True, padx=20, pady=(0, 10))
+        content.grid_columnconfigure(0, weight=0, minsize=360)
+        content.grid_columnconfigure(1, weight=1, uniform="mismatch")
+        content.grid_rowconfigure(0, weight=1)
+        # Left: session list (narrower)
+        left = ctk.CTkFrame(content)
+        left.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
+        left.grid_rowconfigure(1, weight=1)
+        left.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(left, text="Participants & Sessions", font=ctk.CTkFont(size=14, weight="bold")).pack(pady=5)
+        ctk.CTkLabel(
+            left,
+            text="Click a session (2+ reviewers) to resolve mismatches.",
+            font=ctk.CTkFont(size=11),
+            text_color="gray"
+        ).pack(pady=(0, 5))
+        self.session_list_frame = ctk.CTkScrollableFrame(left, height=450)
+        self.session_list_frame.pack(fill="both", expand=True, padx=5, pady=5)
+        # Right: gallery panel
+        right = ctk.CTkFrame(content)
+        right.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
+        right.grid_rowconfigure(0, weight=1)
+        right.grid_columnconfigure(0, weight=1)
+        self.right_placeholder = ctk.CTkLabel(
+            right,
+            text="Select a session with 2+ reviewers to resolve mismatches.",
+            font=ctk.CTkFont(size=13),
+            text_color="gray"
+        )
+        self.right_placeholder.grid(row=0, column=0, rowspan=4, sticky="nsew", padx=20, pady=40)
+        self.gallery_panel = ctk.CTkFrame(right, fg_color="transparent")
+        self.gallery_panel.grid(row=0, column=0, rowspan=6, sticky="nsew")
+        self.gallery_panel.grid_remove()
+        self.gallery_panel.grid_columnconfigure(0, weight=1)
+        self.gallery_panel.grid_rowconfigure(4, weight=1)
+        ctk.CTkLabel(
+            self.gallery_panel,
+            text="Mismatch instances (default: face; uncheck for non-face)",
+            font=ctk.CTkFont(size=12),
+            text_color="gray"
+        ).grid(row=0, column=0, sticky="w", padx=10, pady=(10, 4))
+        stats_frame = ctk.CTkFrame(self.gallery_panel, fg_color="transparent")
+        stats_frame.grid(row=1, column=0, sticky="ew", padx=10, pady=4)
+        self.mismatch_stats_label = ctk.CTkLabel(stats_frame, text="", font=ctk.CTkFont(size=12))
+        self.mismatch_stats_label.pack(side="left")
+        self.resolved_var = ctk.BooleanVar(value=False)
+        self.resolved_checkbox = ctk.CTkCheckBox(
+            stats_frame,
+            text="All mismatches resolved",
+            variable=self.resolved_var,
+            font=ctk.CTkFont(size=12),
+            command=self._on_resolved_checkbox_changed
+        )
+        self.resolved_checkbox.pack(side="left", padx=(20, 0))
+        ctrl = ctk.CTkFrame(self.gallery_panel, fg_color="transparent")
+        ctrl.grid(row=2, column=0, sticky="ew", padx=10, pady=4)
+        ctk.CTkLabel(ctrl, text="Items per page:", font=ctk.CTkFont(size=12)).pack(side="left", padx=(0, 5))
+        self.items_per_page_var = ctk.IntVar(value=self.items_per_page)
+        ctk.CTkEntry(ctrl, textvariable=self.items_per_page_var, width=60).pack(side="left", padx=(0, 5))
+        ctk.CTkButton(ctrl, text="Apply", command=self._on_items_per_page_apply, width=60).pack(side="left", padx=(0, 15))
+        ctk.CTkButton(ctrl, text="Check all (page)", command=self._check_all_page, width=110).pack(side="left", padx=(10, 5))
+        ctk.CTkButton(ctrl, text="Uncheck all (page)", command=self._uncheck_all_page, width=120).pack(side="left", padx=(0, 5))
+        self.page_info_label = ctk.CTkLabel(ctrl, text="", font=ctk.CTkFont(size=11), text_color="gray")
+        self.page_info_label.pack(side="left", padx=(10, 0))
+        self.page_numbers_frame = ctk.CTkFrame(self.gallery_panel, fg_color="transparent")
+        self.page_numbers_frame.grid(row=3, column=0, sticky="w", padx=10, pady=4)
+        self.gallery_frame = ctk.CTkScrollableFrame(self.gallery_panel)
+        self.gallery_frame.grid(row=4, column=0, sticky="nsew", padx=10, pady=5)
+        self.gallery_panel.grid_rowconfigure(4, weight=1)
+        btn_row = ctk.CTkFrame(self.gallery_panel, fg_color="transparent")
+        btn_row.grid(row=5, column=0, sticky="ew", pady=10)
+        ctk.CTkButton(
+            btn_row,
+            text="Save consensus",
+            command=self._save_consensus,
+            width=180,
+            height=40,
+            font=ctk.CTkFont(size=14, weight="bold"),
+            fg_color="#28a745",
+            hover_color="#218838",
+            text_color="white"
+        ).pack(side="left")
+
+    def _load_session_list(self):
+        """Load session list in background so tab opens immediately; paint when ready."""
+        for w in self.session_list_frame.winfo_children():
+            w.destroy()
+        self._session_rows.clear()
+        if not self.project_dir or not self.project_dir.exists():
+            return
+        ctk.CTkLabel(
+            self.session_list_frame,
+            text="Loading sessions…",
+            font=ctk.CTkFont(size=12),
+            text_color="gray"
+        ).pack(pady=20)
+        project_dir = self.project_dir
+
+        def _fetch():
+            items = _get_sessions_with_review_status(project_dir)
+            self.after(0, lambda: self._paint_session_list(items))
+
+        threading.Thread(target=_fetch, daemon=True).start()
+
+    def _paint_session_list(self, items: List[Dict]):
+        """Paint session list (must run on main thread). Called after background fetch."""
+        for w in self.session_list_frame.winfo_children():
+            w.destroy()
+        self._session_rows.clear()
+        if not items:
+            ctk.CTkLabel(self.session_list_frame, text="No sessions found.", font=ctk.CTkFont(size=12), text_color="gray").pack(pady=20)
+            return
+        by_participant: Dict[str, List[Dict]] = defaultdict(list)
+        for item in items:
+            by_participant[item["participant"]].append(item)
+        for participant_name in sorted(by_participant.keys()):
+            ctk.CTkLabel(
+                self.session_list_frame,
+                text=participant_name,
+                font=ctk.CTkFont(size=12, weight="bold")
+            ).pack(anchor="w", padx=8, pady=(10, 2))
+            for item in sorted(by_participant[participant_name], key=lambda x: x["session"]):
+                session = item["session"]
+                reviewer_ids = item["reviewer_ids"]
+                mismatch_count = item["mismatch_count"]
+                resolved = item.get("resolved", False)
+                n = len(reviewer_ids)
+                if resolved:
+                    status_text = "Mismatches resolved"
+                    status_color = "#28a745"  # green
+                elif n == 0:
+                    status_text = "Not reviewed"
+                    status_color = "#dc3545"  # red
+                elif n == 1:
+                    status_text = "1 reviewer"
+                    status_color = "#ffc107"  # yellow
+                else:
+                    status_text = f"2+ reviewers ({mismatch_count} mismatches)"
+                    status_color = "#007bff"  # blue
+                row = ctk.CTkFrame(self.session_list_frame, fg_color=("gray92", "gray18"))
+                row.pack(fill="x", padx=5, pady=2)
+                ctk.CTkLabel(row, text="   ", width=20).pack(side="left")
+                session_lbl = ctk.CTkLabel(row, text=session, font=ctk.CTkFont(size=12), anchor="w")
+                session_lbl.pack(side="left", padx=(0, 8), pady=3)
+                status_lbl = ctk.CTkLabel(row, text=status_text, font=ctk.CTkFont(size=12), text_color=status_color)
+                status_lbl.pack(side="left", padx=(0, 8), pady=3)
+                can_select = item.get("reviewers_with_tab2_count", 0) >= 2
+                if can_select:
+                    self._session_rows.append((row, participant_name, session))
+                    for w in (row, session_lbl, status_lbl):
+                        w.bind("<Button-1>", lambda e, p=participant_name, s=session: self._on_session_click(p, s))
+                        w.configure(cursor="hand2")
+                    row.bind("<Button-1>", lambda e, p=participant_name, s=session: self._on_session_click(p, s))
+
+    def _on_session_click(self, participant: str, session: str):
+        if self.selected_participant == participant and self.selected_session == session:
+            return
+        self.selected_participant = participant
+        self.selected_session = session
+        self.session_dir = self.project_dir / participant / session
+        for (row, p, s) in self._session_rows:
+            if p == participant and s == session:
+                row.configure(fg_color=("gray75", "gray25"))
+            else:
+                row.configure(fg_color=("gray92", "gray18"))
+        self.right_placeholder.grid_remove()
+        self.gallery_panel.grid(row=0, column=0, rowspan=6, sticky="nsew")
+        self._load_mismatch_data()
+
+    def _load_mismatch_data(self):
+        self.mismatch_stats_label.configure(text="Loading…")
+        for w in self.gallery_frame.winfo_children():
+            w.destroy()
+        thread = threading.Thread(target=self._load_mismatch_data_thread, daemon=True)
+        thread.start()
+
+    def _load_mismatch_data_thread(self):
+        try:
+            df = pd.read_csv(self.session_dir / "face_detections.csv")
+            # Match Tab 2: instance_index in tab2 files is in sorted-by-confidence order (ascending)
+            if "confidence" in df.columns:
+                df = df.sort_values("confidence", ascending=True).reset_index(drop=True)
+            reviewer_ids_all = self.registry.get_reviewer_ids()
+            reviewers_with_tab2 = [r for r in reviewer_ids_all if self.registry.get_tab2_annotation_path(r, self.selected_participant, self.selected_session).exists()]
+            if len(reviewers_with_tab2) < 2:
+                self.after(0, lambda: self.mismatch_stats_label.configure(text="Need 2+ reviewers for this session."))
+                return
+            per_reviewer = {}
+            for rid in reviewers_with_tab2:
+                ann_df = pd.read_csv(self.registry.get_tab2_annotation_path(rid, self.selected_participant, self.selected_session))
+                per_reviewer[rid] = dict(zip(ann_df["instance_index"].astype(int), ann_df["is_face"].astype(bool)))
+            mismatch_indices = []
+            reviewer_labels = {}
+            for idx in df.index:
+                vals = [per_reviewer[r].get(idx, True) for r in reviewers_with_tab2]
+                if len(set(vals)) > 1:
+                    mismatch_indices.append(idx)
+                    reviewer_labels[idx] = {r: per_reviewer[r].get(idx, True) for r in reviewers_with_tab2}
+            self.df = df
+            self.mismatch_indices = mismatch_indices
+            self.reviewer_labels = reviewer_labels
+            self.reviewer_ids = reviewers_with_tab2
+            self.annotations = {idx: True for idx in mismatch_indices}
+            # Load global consensus from _annotations/consensus/ if it exists
+            consensus_path = self.registry.get_consensus_annotation_path(self.selected_participant, self.selected_session)
+            if consensus_path.exists():
+                try:
+                    ann_df = pd.read_csv(consensus_path)
+                    for _, row in ann_df.iterrows():
+                        idx = int(row["instance_index"])
+                        self.annotations[idx] = bool(row["is_face"])
+                except Exception:
+                    pass
+            self.image_cache.clear()
+            self.current_page = 0
+            self.after(0, self._on_mismatch_data_loaded)
+        except Exception as e:
+            self.after(0, lambda: self.mismatch_stats_label.configure(text=f"Error: {str(e)}"))
+
+    def _on_mismatch_data_loaded(self):
+        n = len(self.mismatch_indices)
+        self.mismatch_stats_label.configure(text=f"{n} instance(s) with mismatches. Default: face; uncheck to mark non-face.")
+        # Load global resolved flag from _annotations/consensus/
+        self.resolved_var.set(_load_mismatches_resolved_flag(self.registry, self.selected_participant, self.selected_session))
+        if n == 0:
+            self._clear_gallery()
+            self.page_info_label.configure(text="No mismatches in this session.")
+            return
+        try:
+            self.items_per_page = int(self.items_per_page_var.get())
+            if self.items_per_page < 1:
+                self.items_per_page = 24
+                self.items_per_page_var.set(24)
+        except (ValueError, tkinter.TclError):
+            self.items_per_page = 24
+        self._display_gallery()
+
+    def _display_gallery(self):
+        for w in self.gallery_frame.winfo_children():
+            w.destroy()
+        if not self.mismatch_indices:
+            return
+        total = len(self.mismatch_indices)
+        total_pages = max(1, (total + self.items_per_page - 1) // self.items_per_page)
+        if self.current_page >= total_pages:
+            self.current_page = total_pages - 1
+        start = self.current_page * self.items_per_page
+        end = min(start + self.items_per_page, total)
+        page_indices = self.mismatch_indices[start:end]
+        self.current_df_filtered = self.df.loc[page_indices] if hasattr(self.df, 'loc') else None
+        self.current_total_pages = total_pages
+        self.page_info_label.configure(text=f"Showing {start + 1}-{end} of {total} | Page {self.current_page + 1} of {total_pages}")
+        self._update_page_numbers()
+        threading.Thread(target=self._load_gallery_page_images, args=(page_indices,), daemon=True).start()
+
+    def _load_gallery_page_images(self, indices: List[int]):
+        video_files = list(self.session_dir.glob("scenevideo.*"))
+        video_path = video_files[0] if video_files else None
+        images_data = []
+        for idx in indices:
+            row = self.df.loc[idx].to_dict()
+            crop = self._extract_face_crop(row, video_path)
+            if crop:
+                self.image_cache[idx] = crop
+                images_data.append((idx, row, crop))
+            else:
+                from PIL import Image as PILImage
+                import numpy as np
+                ph = np.zeros((80, 80, 3), dtype=np.uint8)
+                ph[:] = (60, 60, 60)
+                images_data.append((idx, row, Image.fromarray(ph)))
+        self.after(0, lambda: self._paint_gallery_grid(images_data))
+
+    def _extract_face_crop(self, face_info: dict, video_path: Optional[Path]) -> Optional[Image.Image]:
+        if not video_path:
+            return None
+        try:
+            frame_number = int(face_info["frame_number"])
+            x, y, w, h = int(face_info["x"]), int(face_info["y"]), int(face_info["w"]), int(face_info["h"])
+            cap = cv2.VideoCapture(str(video_path))
+            if not cap.isOpened():
+                return None
+            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_number)
+            ret, frame = cap.read()
+            cap.release()
+            if not ret:
+                return None
+            h_img, w_img = frame.shape[:2]
+            pad = int(max(w, h) * 0.1)
+            x1, y1 = max(0, x - pad), max(0, y - pad)
+            x2, y2 = min(w_img, x + w + pad), min(h_img, y + h + pad)
+            if x2 <= x1 or y2 <= y1:
+                return None
+            face_crop = frame[y1:y2, x1:x2]
+            if face_crop.size == 0:
+                return None
+            face_crop_rgb = cv2.cvtColor(face_crop, cv2.COLOR_BGR2RGB)
+            return Image.fromarray(face_crop_rgb)
+        except Exception:
+            return None
+
+    def _paint_gallery_grid(self, images_data: List):
+        for w in self.gallery_frame.winfo_children():
+            w.destroy()
+        self._current_page_images_data = images_data
+        # Same tight layout as Tab 2: 140px per image, container 130x155
+        try:
+            self.gallery_frame.update_idletasks()
+            frame_width = max(self.gallery_frame.winfo_width(), 140)
+            per_row = max(1, frame_width // 140)
+        except Exception:
+            per_row = 6
+        for i, (idx, row_data, image) in enumerate(images_data):
+            r, c = i // per_row, i % per_row
+            container = ctk.CTkFrame(self.gallery_frame, width=130, height=155)
+            container.grid(row=r, column=c, padx=5, pady=5)
+            container.grid_propagate(False)
+            img_resized = image.resize((120, 120), Image.LANCZOS)
+            img_tk = ImageTk.PhotoImage(img_resized)
+            img_label = ctk.CTkLabel(container, image=img_tk, text="")
+            img_label.image = img_tk
+            img_label.place(x=5, y=5, relwidth=0.92, relheight=0.77)
+            is_face = self.annotations.get(idx, True)
+            var = ctk.BooleanVar(value=is_face)
+            cb = ctk.CTkCheckBox(
+                container, text="", variable=var, width=20,
+                command=lambda idx=idx, v=var: self._on_mismatch_check(idx, v),
+                checkbox_width=18, checkbox_height=18
+            )
+            cb.place(x=10, y=10)
+            ctk.CTkLabel(container, text=f"#{idx}", font=ctk.CTkFont(size=10), text_color="gray").place(x=5, y=128)
+            if not is_face:
+                ctk.CTkLabel(container, text="NON-FACE", font=ctk.CTkFont(size=9, weight="bold"), text_color="red", fg_color="black").place(relx=0.5, rely=0.45, anchor="center")
+            def toggle(e, idx=idx, v=var):
+                v.set(not v.get())
+                self._on_mismatch_check(idx, v)
+            img_label.bind("<Button-1>", toggle)
+        for col in range(per_row):
+            self.gallery_frame.grid_columnconfigure(col, weight=1, minsize=130)
+        total_rows = (len(images_data) + per_row - 1) // per_row
+        for row in range(total_rows):
+            self.gallery_frame.grid_rowconfigure(row, weight=0, minsize=160)
+
+    def _on_mismatch_check(self, idx: int, var: ctk.BooleanVar):
+        self.annotations[idx] = var.get()
+
+    def _check_all_page(self):
+        """Mark all instances on the current page as face."""
+        data = getattr(self, "_current_page_images_data", None)
+        if not data:
+            return
+        for idx, _, _ in data:
+            self.annotations[idx] = True
+        self._paint_gallery_grid(data)
+
+    def _uncheck_all_page(self):
+        """Mark all instances on the current page as non-face."""
+        data = getattr(self, "_current_page_images_data", None)
+        if not data:
+            return
+        for idx, _, _ in data:
+            self.annotations[idx] = False
+        self._paint_gallery_grid(data)
+
+    def _on_resolved_checkbox_changed(self):
+        """Save resolved flag immediately (independent of Save consensus); refresh session list."""
+        if not self.selected_participant or not self.selected_session:
+            return
+        try:
+            resolved_path = self.registry.get_mismatches_resolved_path(self.selected_participant, self.selected_session)
+            resolved_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(resolved_path, "w", encoding="utf-8") as f:
+                json.dump({"resolved": self.resolved_var.get()}, f, indent=2)
+            self._load_session_list()
+            if self.resolved_var.get():
+                messagebox.showinfo("Resolved", "Session marked as resolved.")
+            else:
+                messagebox.showinfo("Resolved", "Session unmarked as resolved.")
+        except Exception as e:
+            messagebox.showerror("Error", f"Could not save resolved status:\n{str(e)}")
+
+    def _clear_gallery(self):
+        for w in self.gallery_frame.winfo_children():
+            w.destroy()
+
+    def _update_page_numbers(self):
+        for w in self.page_numbers_frame.winfo_children():
+            w.destroy()
+        total_pages = getattr(self, 'current_total_pages', 1)
+        cur = self.current_page
+        if total_pages <= 0:
+            return
+        def go(p):
+            if 0 <= p < total_pages:
+                self.current_page = p
+                self._display_gallery()
+        first = ctk.CTkLabel(self.page_numbers_frame, text="<<", font=ctk.CTkFont(size=12), cursor="hand2")
+        first.pack(side="left", padx=3)
+        if cur > 0:
+            first.bind("<Button-1>", lambda e: go(0))
+            first.configure(text_color="#3b8ed0")
+        else:
+            first.configure(text_color="gray")
+        prev = ctk.CTkLabel(self.page_numbers_frame, text="<", font=ctk.CTkFont(size=12), cursor="hand2")
+        prev.pack(side="left", padx=3)
+        if cur > 0:
+            prev.bind("<Button-1>", lambda e: go(cur - 1))
+            prev.configure(text_color="#3b8ed0")
+        else:
+            prev.configure(text_color="gray")
+        for p in range(total_pages):
+            lbl = ctk.CTkLabel(self.page_numbers_frame, text=str(p + 1), font=ctk.CTkFont(size=12, weight="bold" if p == cur else "normal"), cursor="hand2")
+            lbl.pack(side="left", padx=3)
+            if p == cur:
+                lbl.configure(text_color="#3b8ed0")
+            else:
+                lbl.bind("<Button-1>", lambda e, p=p: go(p))
+                lbl.configure(text_color="#3b8ed0")
+        nxt = ctk.CTkLabel(self.page_numbers_frame, text=">", font=ctk.CTkFont(size=12), cursor="hand2")
+        nxt.pack(side="left", padx=3)
+        if cur < total_pages - 1:
+            nxt.bind("<Button-1>", lambda e: go(cur + 1))
+            nxt.configure(text_color="#3b8ed0")
+        else:
+            nxt.configure(text_color="gray")
+        last = ctk.CTkLabel(self.page_numbers_frame, text=">>", font=ctk.CTkFont(size=12), cursor="hand2")
+        last.pack(side="left", padx=3)
+        if cur < total_pages - 1:
+            last.bind("<Button-1>", lambda e: go(total_pages - 1))
+            last.configure(text_color="#3b8ed0")
+        else:
+            last.configure(text_color="gray")
+
+    def _on_items_per_page_apply(self):
+        try:
+            v = int(self.items_per_page_var.get())
+            if v < 1:
+                v = 24
+                self.items_per_page_var.set(24)
+            self.items_per_page = v
+            self.current_page = 0
+            if self.mismatch_indices:
+                self._display_gallery()
+        except (ValueError, tkinter.TclError):
+            pass
+
+    def _save_consensus(self):
+        if self.df is None or not self.selected_participant or not self.selected_session:
+            return
+        try:
+            # Global consensus and resolved flag under _annotations/consensus/{participant}/{session}/
+            consensus_path = self.registry.get_consensus_annotation_path(self.selected_participant, self.selected_session)
+            consensus_path.parent.mkdir(parents=True, exist_ok=True)
+            records = []
+            for idx in self.df.index:
+                is_face = self.annotations.get(idx, True)
+                records.append({"instance_index": idx, "is_face": is_face})
+            pd.DataFrame(records).to_csv(consensus_path, index=False)
+            resolved_path = self.registry.get_mismatches_resolved_path(self.selected_participant, self.selected_session)
+            with open(resolved_path, "w", encoding="utf-8") as f:
+                json.dump({"resolved": self.resolved_var.get()}, f, indent=2)
+            messagebox.showinfo("Saved", f"Consensus saved for {self.selected_participant} / {self.selected_session}.")
+            self._load_session_list()
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to save:\n{str(e)}")
+
+    def set_project_dir(self, project_dir: Path):
+        self.project_dir = Path(project_dir) if project_dir else None
+        self.registry = ReviewerRegistry(project_dir) if project_dir else None
+        if self.project_dir and self.project_dir.exists():
+            self._load_session_list()
+
+    def update_project_and_reviewer(self, project_dir: Path, reviewer_id: str):
+        """Called when user changes project or reviewer via Back to setup."""
+        self.project_dir = Path(project_dir) if project_dir else None
+        self.reviewer_id = reviewer_id or ""
+        self.registry = ReviewerRegistry(project_dir) if project_dir else None
+        if self.project_dir and self.project_dir.exists():
+            self._load_session_list()
+
+
 class FaceIDAssignmentTab(ctk.CTkFrame):
-    """Tab 3: Face ID Assignment (Stage 3)."""
+    """Tab 4: Face ID Assignment (Stage 3) — select participants for clustering."""
 
     def __init__(self, master, settings_manager: SettingsManager,
                  project_dir: Path, reviewer_id: str):
@@ -2178,118 +2854,122 @@ class FaceIDAssignmentTab(ctk.CTkFrame):
         self.participant_widgets: Dict = {}
         self.processing_thread: Optional[threading.Thread] = None
         self.is_processing = False
+        self._current_process_holder: List = [None]
+        self._stop_requested = False
 
         self._setup_ui()
         self._load_settings()
-        self._load_participant_list()
-    
+        # Participant/session list is loaded when tab is first shown (via <Map>), not at startup
+
     def _setup_ui(self):
         """Setup UI components."""
         # Title
         ctk.CTkLabel(
             self,
-            text="Face ID Assignment: Global Clustering",
+            text="Face ID Clustering",
             font=ctk.CTkFont(size=20, weight="bold")
-        ).pack(pady=(10, 20))
+        ).pack(pady=(10, 15))
 
-        # Read-only info bar
-        info_frame = ctk.CTkFrame(self)
-        info_frame.pack(fill="x", padx=20, pady=(0, 10))
-
-        ctk.CTkLabel(
-            info_frame,
-            text="Project:",
-            font=ctk.CTkFont(size=13, weight="bold")
-        ).pack(side="left", padx=(10, 4))
-        self.dir_label = ctk.CTkLabel(
-            info_frame,
-            text=str(self.project_dir) if self.project_dir else "—",
-            font=ctk.CTkFont(size=12),
-            text_color="gray"
-        )
-        self.dir_label.pack(side="left", padx=(0, 20))
-
-        ctk.CTkLabel(
-            info_frame,
-            text="Reviewer:",
-            font=ctk.CTkFont(size=13, weight="bold")
-        ).pack(side="left", padx=(10, 4))
-        ctk.CTkLabel(
-            info_frame,
-            text=self.reviewer_id or "—",
-            font=ctk.CTkFont(size=13),
-            text_color="#3b8ed0"
-        ).pack(side="left", padx=(0, 10))
-        
-        # Main content area
+        # Main content area: three equal columns — Participants & Sessions | Settings | Progress
+        # Use uniform so all three columns get the same width regardless of content
         content_frame = ctk.CTkFrame(self)
         content_frame.pack(fill="both", expand=True, padx=20, pady=10)
+        content_frame.grid_columnconfigure(0, weight=1, uniform="tab3cols")
+        content_frame.grid_columnconfigure(1, weight=1, uniform="tab3cols")
+        content_frame.grid_columnconfigure(2, weight=1, uniform="tab3cols")
+        content_frame.grid_rowconfigure(0, weight=1)
         
-        # Left panel: Participant list
-        left_panel = ctk.CTkFrame(content_frame, width=600)
-        left_panel.pack(side="left", fill="both", expand=True, padx=(0, 10))
-        left_panel.pack_propagate(False)
+        # Column 1: Participants & Sessions
+        col_list = ctk.CTkFrame(content_frame)
+        col_list.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
+        col_list.grid_columnconfigure(0, weight=1)
+        col_list.grid_rowconfigure(2, weight=1)
+        
+        # Column 2: Settings
+        col_settings = ctk.CTkFrame(content_frame)
+        col_settings.grid(row=0, column=1, sticky="nsew", padx=6)
+        col_settings.grid_columnconfigure(0, weight=1)
+        col_settings.grid_rowconfigure(0, weight=1)
+        self._create_settings_panel(col_settings)
+        
+        # Column 3: Progress
+        col_progress = ctk.CTkFrame(content_frame)
+        col_progress.grid(row=0, column=2, sticky="nsew", padx=(6, 0))
+        col_progress.grid_columnconfigure(0, weight=1)
+        col_progress.grid_rowconfigure(0, weight=1)
+        self._create_progress_panel(col_progress)
         
         ctk.CTkLabel(
-            left_panel,
-            text="Select Participants",
+            col_list,
+            text="Participants & Sessions",
             font=ctk.CTkFont(size=14, weight="bold")
         ).pack(pady=5)
         
-        # Select all/deselect all
-        select_frame = ctk.CTkFrame(left_panel)
-        select_frame.pack(fill="x", padx=5, pady=5)
+        ctk.CTkLabel(
+            col_list,
+            text="Check participants to include in clustering. Double-click a session (green) to resolve mismatches.",
+            font=ctk.CTkFont(size=11),
+            text_color="gray"
+        ).pack(pady=(0, 5))
+        
+        select_frame = ctk.CTkFrame(col_list, fg_color="transparent")
+        select_frame.pack(fill="x", padx=5, pady=2)
         
         ctk.CTkButton(
             select_frame,
             text="Select All",
             command=self._select_all_participants,
-            width=100,
-            height=28
-        ).pack(side="left", padx=5)
+            width=90,
+            height=26
+        ).pack(side="left", padx=3)
         
         ctk.CTkButton(
             select_frame,
             text="Deselect All",
             command=self._deselect_all_participants,
-            width=100,
-            height=28
-        ).pack(side="left", padx=5)
+            width=90,
+            height=26
+        ).pack(side="left", padx=3)
         
-        # Participant list
-        self.participant_list_frame = ctk.CTkScrollableFrame(left_panel, height=400)
+        self.participant_list_frame = ctk.CTkScrollableFrame(col_list, height=400)
         self.participant_list_frame.pack(fill="both", expand=True, padx=5, pady=5)
         
-        # Right panel: Settings and progress
-        right_panel = ctk.CTkFrame(content_frame, width=520)
-        right_panel.pack(side="right", fill="both", padx=(10, 0))
-        right_panel.pack_propagate(False)
-        
-        # Settings
-        self._create_settings_panel(right_panel)
-        
-        # Progress
-        self._create_progress_panel(right_panel)
-        
-        # Process button
+        # Process buttons
+        btn_frame = ctk.CTkFrame(self, fg_color="transparent")
+        btn_frame.pack(pady=20)
         self.process_btn = ctk.CTkButton(
-            self,
+            btn_frame,
             text="Assign Face IDs",
             command=self._start_processing,
-            width=200,
-            height=45,
-            font=ctk.CTkFont(size=16, weight="bold"),
-            fg_color="#007ACC",
-            hover_color="#0066AA",
+            width=180,
+            height=40,
+            font=ctk.CTkFont(size=14, weight="bold"),
+            fg_color="#28a745",
+            hover_color="#218838",
             text_color="white",
             text_color_disabled="white"
         )
-        self.process_btn.pack(pady=20)
+        self.process_btn.pack(side="left", padx=(0, 12))
+        self.stop_btn = ctk.CTkButton(
+            btn_frame,
+            text="Stop",
+            command=self._stop_processing,
+            width=180,
+            height=40,
+            font=ctk.CTkFont(size=14, weight="bold"),
+            fg_color="#dc3545",
+            hover_color="#c82333",
+            text_color="white",
+            text_color_disabled="white",
+            state="disabled"
+        )
+        self.stop_btn.configure(fg_color=BTN_DISABLED_FG)  # initial disabled look
+        self.stop_btn.pack(side="left")
     
     def _create_settings_panel(self, parent):
         """Create settings panel."""
-        settings_frame = ctk.CTkScrollableFrame(parent, height=300)
-        settings_frame.pack(fill="x", padx=10, pady=10)
+        settings_frame = ctk.CTkScrollableFrame(parent)
+        settings_frame.pack(fill="both", expand=True, padx=10, pady=10)
         
         ctk.CTkLabel(
             settings_frame,
@@ -2364,17 +3044,6 @@ class FaceIDAssignmentTab(ctk.CTkFrame):
         ctk.CTkLabel(mv_frame, text="Min Votes:", width=130, anchor="w").pack(side="left")
         self.min_votes_var = ctk.IntVar(value=5)
         ctk.CTkEntry(mv_frame, textvariable=self.min_votes_var, width=70).pack(side="left", padx=5)
-        
-        # Info: reviewer annotations will be applied automatically
-        rev_info_frame = ctk.CTkFrame(settings_frame)
-        rev_info_frame.pack(fill="x", padx=5, pady=10)
-        ctk.CTkLabel(
-            rev_info_frame,
-            text="Face instance filters from Tab 2 will be applied\nautomatically using the current reviewer's annotations.",
-            font=ctk.CTkFont(size=10),
-            text_color="gray",
-            justify="left"
-        ).pack(side="left", padx=5)
     
     def _create_progress_panel(self, parent):
         """Create progress panel."""
@@ -2453,123 +3122,116 @@ class FaceIDAssignmentTab(ctk.CTkFrame):
         else:
             self.log_textbox.pack_forget()
     
-    def _toggle_detailed_log(self):
-        """Toggle detailed log visibility."""
-        if self.show_log_var.get():
-            self.log_textbox.pack(fill="both", expand=True, padx=10, pady=(5, 10))
-        else:
-            self.log_textbox.pack_forget()
-    
     def set_project_dir(self, project_dir: Path):
         """Called by app when project directory changes."""
         self.project_dir = project_dir
-        self.dir_label.configure(text=str(project_dir))
-        self._load_participant_list()
+        self._load_participants_and_sessions()
 
-    def _load_participant_list(self):
-        """Load participants from project directory."""
-        # Clear existing
-        for widget in self.participant_list_frame.winfo_children():
-            widget.destroy()
+    def update_project_and_reviewer(self, project_dir: Path, reviewer_id: str):
+        """Called when user changes project or reviewer via Back to setup."""
+        self.project_dir = project_dir
+        self.reviewer_id = reviewer_id
+        self._load_participants_and_sessions()
+
+    def _load_participants_and_sessions(self):
+        """Load participant/session list in background so tab opens immediately; paint when ready."""
+        for w in self.participant_list_frame.winfo_children():
+            w.destroy()
         self.participant_widgets.clear()
-        
         if not self.project_dir or not self.project_dir.exists():
-            # Show instruction message
-            msg_frame = ctk.CTkFrame(self.participant_list_frame)
-            msg_frame.pack(fill="both", expand=True, padx=20, pady=40)
-            
-            ctk.CTkLabel(
-                msg_frame,
-                text="No project directory selected",
-                font=ctk.CTkFont(size=14, weight="bold"),
-                text_color="gray"
-            ).pack(pady=(10, 5))
-            
-            ctk.CTkLabel(
-                msg_frame,
-                text="Click 'Browse' above to select your project directory",
-                font=ctk.CTkFont(size=12),
-                text_color="gray"
-            ).pack(pady=5)
-            return
-        
-        # Find participants (skip hidden and reserved dirs)
-        participants = sorted([
-            d for d in self.project_dir.iterdir()
-            if d.is_dir()
-            and not d.name.startswith('.')
-            and not d.name.startswith('_')
-        ])
-        
-        if not participants:
             ctk.CTkLabel(
                 self.participant_list_frame,
-                text="No participant directories found",
-                text_color="orange"
+                text="No project directory",
+                font=ctk.CTkFont(size=12),
+                text_color="gray"
             ).pack(pady=20)
             return
-        
-        # Create participant checkboxes
-        participants_with_data = []
-        for participant_dir in participants:
-            participant_name = participant_dir.name
-            
-            # Count sessions with face_detections.csv
-            sessions = [
-                d for d in participant_dir.iterdir()
-                if d.is_dir() and (d / "face_detections.csv").exists()
-            ]
-            
-            if not sessions:
-                continue  # Skip participants with no processed sessions
-            
-            participants_with_data.append((participant_name, participant_dir, sessions))
-            
-            # Create frame
-            frame = ctk.CTkFrame(self.participant_list_frame)
-            frame.pack(fill="x", padx=5, pady=3)
-            
-            # Checkbox
+        ctk.CTkLabel(
+            self.participant_list_frame,
+            text="Loading participants & sessions…",
+            font=ctk.CTkFont(size=12),
+            text_color="gray"
+        ).pack(pady=20)
+        project_dir = self.project_dir
+
+        def _fetch():
+            items = _get_sessions_with_review_status(project_dir)
+            self.after(0, lambda: self._paint_participants_and_sessions(items))
+
+        threading.Thread(target=_fetch, daemon=True).start()
+
+    def _paint_participants_and_sessions(self, items: List[Dict]):
+        """Paint participant/session list (must run on main thread). Called after background fetch."""
+        for w in self.participant_list_frame.winfo_children():
+            w.destroy()
+        self.participant_widgets.clear()
+        if not items:
+            ctk.CTkLabel(
+                self.participant_list_frame,
+                text="No sessions with face_detections.csv found.",
+                font=ctk.CTkFont(size=12),
+                text_color="gray"
+            ).pack(pady=20)
+            return
+        by_participant: Dict[str, List[Dict]] = defaultdict(list)
+        for item in items:
+            by_participant[item["participant"]].append(item)
+        for participant_name in sorted(by_participant.keys()):
+            session_items = by_participant[participant_name]
+            participant_dir = self.project_dir / participant_name
+            part_frame = ctk.CTkFrame(self.participant_list_frame)
+            part_frame.pack(fill="x", padx=5, pady=(8, 2))
             var = ctk.BooleanVar(value=True)
             cb = ctk.CTkCheckBox(
-                frame,
-                text=f"{participant_name} ({len(sessions)} sessions)",
+                part_frame,
+                text=f"{participant_name} ({len(session_items)} sessions)",
                 variable=var,
-                font=ctk.CTkFont(size=12),
+                font=ctk.CTkFont(size=12, weight="bold"),
                 checkbox_width=18,
                 checkbox_height=18
             )
             cb.pack(side="left", padx=10, pady=5)
-            
             self.participant_widgets[participant_name] = {
-                'frame': frame,
-                'checkbox_var': var,
-                'path': participant_dir,
-                'session_count': len(sessions)
+                "frame": part_frame,
+                "checkbox_var": var,
+                "path": participant_dir,
+                "session_count": len(session_items),
             }
-        
-        # Show message if no participants have processed data
-        if not participants_with_data:
-            msg_frame = ctk.CTkFrame(self.participant_list_frame)
-            msg_frame.pack(fill="both", expand=True, padx=20, pady=20)
-            
-            ctk.CTkLabel(
-                msg_frame,
-                text="No processed participants found",
-                font=ctk.CTkFont(size=14, weight="bold"),
-                text_color="orange"
-            ).pack(pady=(10, 5))
-            
-            ctk.CTkLabel(
-                msg_frame,
-                text=f"Found {len(participants)} participant(s), but none have processed sessions.\n\n"
-                     f"Please process sessions in Tab 1 first.\n"
-                     f"Tab 2 requires face_detections.csv files from Tab 1.",
-                font=ctk.CTkFont(size=12),
-                text_color="gray",
-                justify="center"
-            ).pack(pady=5)
-    
+            for item in sorted(session_items, key=lambda x: x["session"]):
+                session = item["session"]
+                reviewer_ids = item["reviewer_ids"]
+                n = len(reviewer_ids)
+                resolved = item.get("resolved", False)
+                if resolved:
+                    status_text = "Mismatches resolved"
+                    status_color = "#28a745"  # green
+                elif n == 0:
+                    status_text = "Not reviewed"
+                    status_color = "#dc3545"
+                elif n == 1:
+                    status_text = "1 reviewer"
+                    status_color = "#ffc107"  # yellow
+                else:
+                    status_text = "2+ reviewers"
+                    status_color = "#007bff"  # blue
+                row = ctk.CTkFrame(self.participant_list_frame, fg_color=("gray92", "gray18"))
+                row.pack(fill="x", padx=5, pady=1)
+                ctk.CTkLabel(row, text="   ", width=20).pack(side="left")
+                session_lbl = ctk.CTkLabel(
+                    row,
+                    text=session,
+                    font=ctk.CTkFont(size=12),
+                    anchor="w"
+                )
+                session_lbl.pack(side="left", padx=(0, 8), pady=3)
+                status_lbl = ctk.CTkLabel(
+                    row,
+                    text=status_text,
+                    font=ctk.CTkFont(size=12),
+                    text_color=status_color
+                )
+                status_lbl.pack(side="left", padx=(0, 8), pady=3)
+
     def _select_all_participants(self):
         """Select all participants."""
         for data in self.participant_widgets.values():
@@ -2603,6 +3265,16 @@ class FaceIDAssignmentTab(ctk.CTkFrame):
         self.settings.set("stage3.min_votes", self.min_votes_var.get())
         self.settings.save_settings()
     
+    def _stop_processing(self):
+        """Request stop and terminate the current subprocess."""
+        self._stop_requested = True
+        proc = self._current_process_holder[0] if self._current_process_holder else None
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+    
     def _start_processing(self):
         """Start processing in background thread."""
         if self.is_processing:
@@ -2624,20 +3296,48 @@ class FaceIDAssignmentTab(ctk.CTkFrame):
             messagebox.showerror("Error", "Please select at least one participant!")
             return
         
+        # Warn if any selected participant already has face ID clustering (re-run will overwrite results based on consensus)
+        registry = ReviewerRegistry(self.project_dir)
+        participants_already_done = [
+            name for (name, _) in selected_participants
+            if registry.get_tab3_face_ids_path(self.reviewer_id, name).exists()
+        ]
+        if participants_already_done:
+            n = len(participants_already_done)
+            participant_list = "\n".join(f"  • {p}" for p in participants_already_done[:10])
+            if n > 10:
+                participant_list += f"\n  ... and {n - 10} more"
+            ok = messagebox.askyesno(
+                "Overwrite face ID clustering — results based on consensus",
+                "The following participant(s) already have face ID clustering results:\n\n"
+                + participant_list
+                + "\n\nRe-running will overwrite tab3_face_ids.csv for these participants. "
+                "These results are based on consensus faces from Tab 2/3. This cannot be undone.\n\n"
+                "Are you sure you want to continue?",
+                icon=messagebox.WARNING,
+                default="no"
+            )
+            if not ok:
+                return
+        
         # Save settings
         self._save_settings()
         
         # Clear log
         self.log_textbox.delete("1.0", "end")
         
-        # Disable button and change appearance
+        self._stop_requested = False
+        self._current_process_holder[0] = None
+        
+        # Disable Start, enable Stop
         self.process_btn.configure(
             state="disabled",
             text="Processing...",
-            fg_color="#6c757d"  # Gray color for disabled state
+            fg_color=BTN_DISABLED_FG
         )
+        self.stop_btn.configure(state="normal", fg_color="#dc3545")
         self.is_processing = True
-        
+
         # Start processing thread
         self.processing_thread = threading.Thread(
             target=self._processing_worker,
@@ -2698,9 +3398,14 @@ class FaceIDAssignmentTab(ctk.CTkFrame):
                         k_voting=self.k_voting_var.get(),
                         min_votes=self.min_votes_var.get(),
                         reporter=reporter,
+                        process_holder=self._current_process_holder,
+                        stop_check=lambda: self._stop_requested,
                     )
                     self.after(0, lambda sid=step_id: reporter.update_step_status(sid, "completed"))
                 
+                except ProcessingStopped:
+                    self.after(0, lambda sid=step_id: reporter.update_step_status(sid, "error"))
+                    raise
                 except Exception as e:
                     self.after(0, lambda sid=step_id: reporter.update_step_status(sid, "error"))
                     raise
@@ -2716,6 +3421,10 @@ class FaceIDAssignmentTab(ctk.CTkFrame):
                 f"Successfully assigned face IDs for {total_participants} participant(s)!"
             ))
         
+        except ProcessingStopped:
+            self.after(0, lambda: reporter.log("\n[STOPPED] Processing stopped by user."))
+            self.after(0, lambda: reporter.update_status("[Stopped] Processing stopped by user."))
+            self.after(0, lambda: messagebox.showinfo("Stopped", "Processing was stopped."))
         except Exception as e:
             import traceback
             error_details = traceback.format_exc()
@@ -2728,12 +3437,12 @@ class FaceIDAssignmentTab(ctk.CTkFrame):
             ))
         
         finally:
-            # Re-enable button and restore color
             self.after(0, lambda: self.process_btn.configure(
                 state="normal",
                 text="Assign Face IDs",
-                fg_color="#007ACC"
+                fg_color="#28a745"
             ))
+            self.after(0, lambda: self.stop_btn.configure(state="disabled", fg_color=BTN_DISABLED_FG))
             self.is_processing = False
 
 
@@ -2777,52 +3486,48 @@ class ManualReviewTab(ctk.CTkFrame):
         # Title
         ctk.CTkLabel(
             self,
-            text="Manual Review & Face ID Merging",
+            text="Face ID Review",
             font=ctk.CTkFont(size=20, weight="bold")
-        ).pack(pady=(10, 20))
+        ).pack(pady=(10, 15))
 
-        # Reviewer info bar
-        info_frame = ctk.CTkFrame(self)
-        info_frame.pack(fill="x", padx=20, pady=(0, 10))
-
-        ctk.CTkLabel(
-            info_frame,
-            text="Reviewing as:",
-            font=ctk.CTkFont(size=13, weight="bold")
-        ).pack(side="left", padx=(10, 4))
-        ctk.CTkLabel(
-            info_frame,
-            text=self.reviewer_id or "—",
-            font=ctk.CTkFont(size=13),
-            text_color="#3b8ed0"
-        ).pack(side="left", padx=(0, 20))
-
-        # Participant selector
-        sel_frame = ctk.CTkFrame(self)
-        sel_frame.pack(fill="x", padx=20, pady=(0, 10))
+        # Participant selector (dropdown like Tab 2)
+        self.sel_frame_tab4 = ctk.CTkFrame(self)
+        self.sel_frame_tab4.pack(fill="x", padx=20, pady=(0, 10))
 
         ctk.CTkLabel(
-            sel_frame,
+            self.sel_frame_tab4,
             text="Participant:",
             font=ctk.CTkFont(size=13, weight="bold")
         ).pack(side="left", padx=(10, 4))
 
-        self.participant_listbox_tab4 = ctk.CTkScrollableFrame(
-            sel_frame, height=80, width=300
+        self.participant_var_tab4 = ctk.StringVar(value="— select —")
+        self.participant_dropdown_tab4 = ctk.CTkOptionMenu(
+            self.sel_frame_tab4,
+            variable=self.participant_var_tab4,
+            values=["— select —"],
+            width=280,
+            command=self._on_participant_selected_tab4_dropdown
         )
-        self.participant_listbox_tab4.pack(side="left", fill="x", padx=5, pady=4)
+        self.participant_dropdown_tab4.pack(side="left", padx=5, pady=8)
 
-        self.review_btn = ctk.CTkButton(
-            sel_frame,
+        self.load_participant_btn = ctk.CTkButton(
+            self.sel_frame_tab4,
             text="Load Participant",
-            command=self._review_with_filters,
+            command=self._load_participant_face_ids,
             width=140,
             height=35,
             state="disabled",
             fg_color="#007ACC",
             hover_color="#0066AA"
         )
-        self.review_btn.pack(side="left", padx=10)
+        self.load_participant_btn.pack(side="left", padx=10)
+        self.load_status_label = ctk.CTkLabel(
+            self.sel_frame_tab4,
+            text="",
+            font=ctk.CTkFont(size=12),
+            text_color="gray"
+        )
+        self.load_status_label.pack(side="left", padx=(5, 10), pady=8)
 
         self._populate_participants_tab4()
         
@@ -2919,17 +3624,17 @@ class ManualReviewTab(ctk.CTkFrame):
             textvariable=self.min_confidence_var
         ).pack(side="left", padx=(0, 5))
         
-        # Review button
-        self.review_btn = ctk.CTkButton(
+        # Apply button (applies min instances and min confidence filter to loaded data)
+        self.apply_filter_btn_tab4 = ctk.CTkButton(
             panel,
-            text="Review",
-            command=self._review_with_filters,
+            text="Apply",
+            command=self._apply_min_filters,
             width=80,
             height=35,
             font=ctk.CTkFont(size=13),
             state="disabled"
         )
-        self.review_btn.pack(side="left", padx=(10, 10))
+        self.apply_filter_btn_tab4.pack(side="left", padx=(10, 10))
     
     def _create_merge_controls(self):
         """Create merge/unmerge control buttons."""
@@ -2941,13 +3646,16 @@ class ManualReviewTab(ctk.CTkFrame):
             controls,
             text="Merge Selected",
             command=self._merge_selected,
-            width=150,
+            width=180,
             height=40,
             font=ctk.CTkFont(size=14, weight="bold"),
             fg_color="#28a745",
             hover_color="#218838",
+            text_color="white",
+            text_color_disabled="white",
             state="disabled"
         )
+        self.merge_btn.configure(fg_color=BTN_DISABLED_FG)  # initial disabled look
         self.merge_btn.pack(side="left", padx=(10, 10))
         
         # Selection info
@@ -2991,75 +3699,61 @@ class ManualReviewTab(ctk.CTkFrame):
             text="Save Annotations",
             command=self._save_results,
             width=180,
-            height=45,
-            font=ctk.CTkFont(size=14, weight="bold"),
-            fg_color="#007ACC",
-            hover_color="#0066AA",
-            state="disabled"
-        )
-        self.save_btn.pack(side="left", padx=5)
-        
-        self.export_btn = ctk.CTkButton(
-            button_container,
-            text="Export Final CSV",
-            command=self._export_final_csv,
-            width=180,
-            height=45,
+            height=40,
             font=ctk.CTkFont(size=14, weight="bold"),
             fg_color="#28a745",
             hover_color="#218838",
+            text_color="white",
+            text_color_disabled="white",
             state="disabled"
         )
-        self.export_btn.pack(side="left", padx=5)
+        self.save_btn.configure(fg_color=BTN_DISABLED_FG)  # initial disabled look
+        self.save_btn.pack(side="left", padx=5)
     
     def _populate_participants_tab4(self):
-        """Populate the participant list from the project directory."""
-        for w in self.participant_listbox_tab4.winfo_children():
-            w.destroy()
-        self._participant_btn_tab4: Dict[str, ctk.CTkButton] = {}
-
+        """Populate the participant dropdown from the project directory."""
         if not self.project_dir or not self.project_dir.exists():
-            ctk.CTkLabel(
-                self.participant_listbox_tab4, text="No project loaded", text_color="gray"
-            ).pack()
+            self.participant_dropdown_tab4.configure(values=["— select —"])
             return
 
-        participants = sorted([
-            d.name for d in self.project_dir.iterdir()
-            if d.is_dir()
-            and not d.name.startswith('_')
-            and not d.name.startswith('.')
-        ])
-
-        for pname in participants:
-            # Only show participants that have tab3_face_ids.csv
-            registry = ReviewerRegistry(self.project_dir)
-            face_ids_path = registry.get_tab3_face_ids_path(self.reviewer_id, pname)
-            if not face_ids_path.exists():
+        registry = ReviewerRegistry(self.project_dir)
+        participants = []
+        for d in sorted(self.project_dir.iterdir()):
+            if not d.is_dir() or d.name.startswith(("_", ".")):
                 continue
-            btn = ctk.CTkButton(
-                self.participant_listbox_tab4,
-                text=pname,
-                height=28,
-                anchor="w",
-                fg_color="transparent",
-                hover_color=("gray85", "gray30"),
-                command=lambda p=pname: self._on_participant_selected_tab4(p)
-            )
-            btn.pack(fill="x", padx=2, pady=1)
-            self._participant_btn_tab4[pname] = btn
+            face_ids_path = registry.get_tab3_face_ids_path(self.reviewer_id, d.name)
+            if face_ids_path.exists():
+                participants.append(d.name)
 
-    def _on_participant_selected_tab4(self, participant: str):
-        """Called when a participant is clicked in Tab 4."""
-        self.selected_participant = participant
-        self.participant_dir = self.project_dir / participant
-        self.review_btn.configure(state="normal")
+        values = ["— select —"] + participants
+        self.participant_dropdown_tab4.configure(values=values)
+        if not participants:
+            self.participant_var_tab4.set("— select —")
 
-        for pname, btn in self._participant_btn_tab4.items():
-            btn.configure(
-                fg_color=("#3b8ed0" if pname == participant else "transparent")
-            )
-    
+    def _on_participant_selected_tab4_dropdown(self, choice: str):
+        """Called when participant dropdown selection changes."""
+        if choice == "— select —" or not choice:
+            self.selected_participant = None
+            self.participant_dir = None
+            self.load_participant_btn.configure(state="disabled")
+            return
+        self.selected_participant = choice
+        self.participant_dir = self.project_dir / choice
+        self.load_participant_btn.configure(state="normal")
+
+    def _load_participant_face_ids(self):
+        """Load all face IDs for the selected participant (no min instances/confidence filter)."""
+        if not self.selected_participant:
+            messagebox.showerror("Error", "Please select a participant first.")
+            return
+        self._validate_and_load()
+
+    def update_project_and_reviewer(self, project_dir: Path, reviewer_id: str):
+        """Called when user changes project or reviewer via Back to setup."""
+        self.project_dir = project_dir
+        self.reviewer_id = reviewer_id
+        self._populate_participants_tab4()
+
     def _select_all_sessions(self):
         """Select all session checkboxes."""
         for var in self.session_checkboxes.values():
@@ -3134,12 +3828,17 @@ class ManualReviewTab(ctk.CTkFrame):
             sorted(self.face_groups.items(), key=lambda x: x[1]['count'], reverse=True)
         )
     
-    def _review_with_filters(self):
-        """Load and filter data using current settings."""
-        if not self.selected_participant:
-            messagebox.showerror("Error", "Please select a participant first.")
+    def _apply_min_filters(self):
+        """Apply min instances and min confidence to loaded data and refresh the face list."""
+        if self.df_full is None:
             return
-        self._validate_and_load()
+        self._recalculate_face_groups()
+        if not self.face_groups:
+            messagebox.showwarning(
+                "No Results",
+                "No face IDs meet the selected Min Instances / Min Confidence filters."
+            )
+        self._display_face_list()
 
     def _validate_and_load(self):
         """Validate that clustering has been run for this reviewer/participant, then load."""
@@ -3153,10 +3852,12 @@ class ManualReviewTab(ctk.CTkFrame):
                 "Error",
                 f"No face ID assignments found for reviewer '{self.reviewer_id}' "
                 f"and participant '{self.selected_participant}'.\n\n"
-                f"Please run Tab 3 (Face ID Clustering) first."
+                f"Please run Tab 4 (Face ID Clustering) first."
             )
             return
 
+        self.load_status_label.configure(text="Loading…")
+        self.load_participant_btn.configure(state="disabled")
         thread = threading.Thread(target=self._load_data_thread, daemon=True)
         thread.start()
 
@@ -3185,6 +3886,8 @@ class ManualReviewTab(ctk.CTkFrame):
                 session_dfs.append(sdf)
 
             if not session_dfs:
+                self.after(0, lambda: self.load_status_label.configure(text=""))
+                self.after(0, lambda: self.load_participant_btn.configure(state="normal"))
                 self.after(0, lambda: messagebox.showerror(
                     "Error", "No face_detections.csv files found for this participant."
                 ))
@@ -3212,24 +3915,16 @@ class ManualReviewTab(ctk.CTkFrame):
             # Create session filter UI
             self.after(0, self._create_session_checkboxes)
             
-            # Apply confidence filter
-            min_conf = float(self.min_confidence_var.get())
-            if 'confidence' in self.df.columns and min_conf > 0.0:
-                self.df = self.df[self.df['confidence'] >= min_conf].reset_index(drop=True)
+            # Load all face IDs (no min instances / min confidence filter yet; Apply does that)
+            min_instances_load = 1
+            min_conf_load = 0.0
+            df_for_build = self.df.copy()
+            if 'confidence' in df_for_build.columns and min_conf_load > 0.0:
+                df_for_build = df_for_build[df_for_build['confidence'] >= min_conf_load].reset_index(drop=True)
+            face_counts = df_for_build['face_id'].value_counts()
+            eligible_ids = face_counts[face_counts >= min_instances_load].index.tolist()
             
-            # Compute counts and apply min instances
-            min_instances = int(self.min_instances_var.get())
-            face_counts = self.df['face_id'].value_counts()
-            eligible_ids = face_counts[face_counts >= min_instances].index.tolist()
-            
-            if not eligible_ids:
-                self.after(0, lambda: messagebox.showwarning(
-                    "No Results",
-                    "No face IDs meet the selected filters."
-                ))
-                return
-            
-            # Compute per-session bbox extents
+            # Compute per-session bbox extents (use full df)
             self.session_bbox_stats = {}
             for session_name, session_df in self.df.groupby('session_name'):
                 max_x2 = float((session_df['x'] + session_df['w']).max())
@@ -3239,37 +3934,32 @@ class ManualReviewTab(ctk.CTkFrame):
                     'max_y2': max_y2,
                 }
             
-            # Build face groups
+            # Build face groups (all face IDs)
             self.face_groups = {}
             for face_id in eligible_ids:
-                face_instances = self.df[self.df['face_id'] == face_id]
+                face_instances = df_for_build[df_for_build['face_id'] == face_id]
                 count = len(face_instances)
-                
                 representative = self._find_representative_face(face_instances)
                 thumbnail = self._extract_face_crop(representative) if representative else None
-                
                 self.face_groups[face_id] = {
                     'count': count,
                     'representative': representative,
                     'thumbnail': thumbnail,
                     'original_ids': [face_id]
                 }
-                
                 self.face_id_to_merged[face_id] = face_id
             
-            # Sort by count
             self.face_groups = dict(
                 sorted(self.face_groups.items(), key=lambda x: x[1]['count'], reverse=True)
             )
-            
-            # Store all groups
             self.face_groups_all = self.face_groups.copy()
             
             # Display results
             self.after(0, self._display_face_list)
-            self.after(0, lambda: self.save_btn.configure(state="normal"))
-            self.after(0, lambda: self.export_btn.configure(state="normal"))
-            self.after(0, lambda: self.review_btn.configure(state="normal"))
+            self.after(0, lambda: self.load_status_label.configure(text=""))
+            self.after(0, lambda: self.save_btn.configure(state="normal", fg_color="#28a745"))
+            self.after(0, lambda: self.load_participant_btn.configure(state="normal"))
+            self.after(0, lambda: self.apply_filter_btn_tab4.configure(state="normal"))
             
         except Exception as e:
             import traceback
@@ -3277,6 +3967,8 @@ class ManualReviewTab(ctk.CTkFrame):
             print(f"\n[ERROR] Error during data loading:")
             print(error_details)
             
+            self.after(0, lambda: self.load_status_label.configure(text=""))
+            self.after(0, lambda: self.load_participant_btn.configure(state="normal"))
             self.after(0, lambda: messagebox.showerror(
                 "Error",
                 f"Failed to load data:\n{str(e)}\n\nCheck terminal for details."
@@ -3305,7 +3997,7 @@ class ManualReviewTab(ctk.CTkFrame):
         
         # Pack the filter frame
         if not self.session_filter_frame.winfo_ismapped():
-            self.session_filter_frame.pack(fill="x", padx=20, pady=(0, 10), after=self.path_entry.master)
+            self.session_filter_frame.pack(fill="x", padx=20, pady=(0, 10), after=self.sel_frame_tab4)
     
     def _find_representative_face(self, face_instances: pd.DataFrame) -> Optional[dict]:
         """Find the face closest to centroid (simplified from original)."""
@@ -3506,9 +4198,9 @@ class ManualReviewTab(ctk.CTkFrame):
         
         # Enable/disable merge button
         if len(self.selected_ids) >= 2:
-            self.merge_btn.configure(state="normal")
+            self.merge_btn.configure(state="normal", fg_color="#28a745")
         else:
-            self.merge_btn.configure(state="disabled")
+            self.merge_btn.configure(state="disabled", fg_color=BTN_DISABLED_FG)
     
     def _update_selection_label(self):
         """Update the selection info label."""
@@ -4406,51 +5098,6 @@ class ManualReviewTab(ctk.CTkFrame):
             traceback.print_exc()
             messagebox.showerror("Error", f"Failed to save annotations:\n{str(e)}")
     
-    def _export_final_csv(self):
-        """
-        Export on-demand: join base data + tab3_face_ids + tab4_merges into a
-        single wide CSV.  The large shared files are never duplicated on disk;
-        this export is produced once per reviewer when explicitly requested.
-        """
-        if self.df_full is None:
-            return
-
-        try:
-            registry = ReviewerRegistry(self.project_dir)
-            participant = self.selected_participant
-
-            # Reload the full base + reviewer face_ids (df_full already has face_id)
-            df_out = self.df_full.copy()
-
-            # Apply merge mapping → final_face_id
-            df_out['final_face_id'] = df_out['face_id'].map(self.face_id_to_merged)
-            df_out['final_face_id'].fillna(df_out['face_id'], inplace=True)
-
-            # Save to reviewer-specific export
-            export_dir = registry.get_reviewer_dir(self.reviewer_id) / participant
-            export_dir.mkdir(parents=True, exist_ok=True)
-            output_path = export_dir / f"final_faces_{self.reviewer_id}.csv"
-            df_out.to_csv(output_path, index=False)
-
-            unique_original_ids = len(set(self.face_id_to_merged.keys()))
-            unique_merged_ids = len(set(self.face_id_to_merged.values()))
-
-            messagebox.showinfo(
-                "Exported",
-                f"Final CSV exported!\n\n"
-                f"File: {output_path}\n"
-                f"Reviewer: {self.reviewer_id}\n\n"
-                f"Total faces: {len(df_out)}\n"
-                f"Original unique IDs: {unique_original_ids}\n"
-                f"Final unique IDs: {unique_merged_ids}\n"
-                f"Reduction: {unique_original_ids - unique_merged_ids} IDs"
-            )
-
-        except Exception as e:
-            import traceback
-            traceback.print_exc()
-            messagebox.showerror("Error", f"Failed to export CSV:\n{str(e)}")
-    
     def _load_settings(self):
         """Load settings into UI."""
         self.min_instances_var.set(self.settings.get("tab3.min_instances", 1))
@@ -4470,8 +5117,9 @@ class StartupDialog(ctk.CTkToplevel):
         self.result_reviewer_id: Optional[str] = None
 
         self.title("Face-Diet — Setup")
-        self.geometry("640x480")
-        self.resizable(False, False)
+        self.geometry("720x580")
+        self.minsize(620, 520)
+        self.resizable(True, True)
         self.grab_set()   # make modal
         self.focus_force()
 
@@ -4536,73 +5184,19 @@ class StartupDialog(ctk.CTkToplevel):
             rev_frame, text="+ New", width=80, command=self._show_new_reviewer_panel
         ).pack(side="left", padx=(6, 0))
 
-        # New reviewer panel (hidden initially)
+        # New reviewer panel (hidden initially) — ID only
         self.new_rev_frame = ctk.CTkFrame(self)
-
         ctk.CTkLabel(
             self.new_rev_frame, text="New reviewer ID (no spaces):",
             font=ctk.CTkFont(size=12)
-        ).pack(side="left", padx=6)
-
-        self.new_id_entry = ctk.CTkEntry(self.new_rev_frame, width=120,
+        ).pack(side="left", padx=(10, 6), pady=10)
+        self.new_id_entry = ctk.CTkEntry(self.new_rev_frame, width=200,
                                           placeholder_text="e.g. alice")
-        self.new_id_entry.pack(side="left", padx=4)
-
-        ctk.CTkLabel(
-            self.new_rev_frame, text="Display name:", font=ctk.CTkFont(size=12)
-        ).pack(side="left", padx=6)
-
-        self.new_name_entry = ctk.CTkEntry(self.new_rev_frame, width=140,
-                                            placeholder_text="e.g. Alice Smith")
-        self.new_name_entry.pack(side="left", padx=4)
-
+        self.new_id_entry.pack(side="left", padx=4, pady=10)
         ctk.CTkButton(
-            self.new_rev_frame, text="Create", width=70, command=self._create_reviewer
-        ).pack(side="left", padx=6)
-
-        # Processing environment (collapsible)
-        proc_toggle_frame = ctk.CTkFrame(self, fg_color="transparent")
-        proc_toggle_frame.pack(fill="x", padx=30, pady=(4, 0))
-
-        self.show_proc_var = ctk.BooleanVar(value=False)
-        ctk.CTkCheckBox(
-            proc_toggle_frame,
-            text="Configure processing environment (Tab 1 — face detection & attributes)",
-            variable=self.show_proc_var,
-            command=self._toggle_proc_panel,
-            font=ctk.CTkFont(size=11),
-            checkbox_width=14, checkbox_height=14,
-        ).pack(anchor="w")
-
-        self.proc_frame = ctk.CTkFrame(self)
-        proc_row = ctk.CTkFrame(self.proc_frame, fg_color="transparent")
-        proc_row.pack(fill="x", padx=6, pady=6)
-
-        ctk.CTkLabel(
-            proc_row,
-            text="Python 3.10 venv  \n(insightface + deepface):",
-            font=ctk.CTkFont(size=11),
-            justify="right"
-        ).pack(side="left", padx=(0, 6))
-
-        self.proc_entry = ctk.CTkEntry(
-            proc_row,
-            placeholder_text="e.g. C:\\path\\to\\venv_processing\\Scripts\\python.exe",
-            width=300
-        )
-        self.proc_entry.pack(side="left", fill="x", expand=True)
-
-        ctk.CTkButton(
-            proc_row, text="Browse", width=70,
-            command=self._browse_processing_python
-        ).pack(side="left", padx=(6, 0))
-
-        ctk.CTkLabel(
-            self.proc_frame,
-            text="Leave blank to auto-detect venv_processing or venv_tf210 next to the project.",
-            font=ctk.CTkFont(size=10),
-            text_color="gray"
-        ).pack(anchor="w", padx=10, pady=(0, 4))
+            self.new_rev_frame, text="Create", width=100, height=32,
+            command=self._create_reviewer
+        ).pack(side="left", padx=(10, 12), pady=10)
 
         # Status label
         self.status_label = ctk.CTkLabel(self, text="", font=ctk.CTkFont(size=11),
@@ -4651,7 +5245,7 @@ class StartupDialog(ctk.CTkToplevel):
             self.new_rev_frame.pack_forget()
 
     def _show_new_reviewer_panel(self):
-        self.new_rev_frame.pack(fill="x", padx=30, pady=4)
+        self.new_rev_frame.pack(fill="x", padx=30, pady=8)
         self.new_id_entry.focus()
 
     def _create_reviewer(self):
@@ -4661,42 +5255,24 @@ class StartupDialog(ctk.CTkToplevel):
             return
 
         raw_id = self.new_id_entry.get().strip()
-        display_name = self.new_name_entry.get().strip()
         if not raw_id:
             self.status_label.configure(text="Reviewer ID cannot be empty.")
             return
 
         reviewer_id = ReviewerRegistry.sanitize_id(raw_id)
-        if not display_name:
-            display_name = reviewer_id
 
         registry = ReviewerRegistry(Path(project_dir_str))
         if registry.reviewer_exists(reviewer_id):
             self.status_label.configure(text=f"Reviewer '{reviewer_id}' already exists.")
             return
 
-        registry.add_reviewer(reviewer_id, display_name)
+        registry.add_reviewer(reviewer_id, reviewer_id)
         self.status_label.configure(
             text=f"Reviewer '{reviewer_id}' created.", text_color="#28a745"
         )
         self._refresh_reviewer_list(Path(project_dir_str))
         self.reviewer_var.set(reviewer_id)
         self.new_rev_frame.pack_forget()
-
-    def _toggle_proc_panel(self):
-        if self.show_proc_var.get():
-            self.proc_frame.pack(fill="x", padx=30, pady=(2, 0))
-        else:
-            self.proc_frame.pack_forget()
-
-    def _browse_processing_python(self):
-        path = filedialog.askopenfilename(
-            title="Select Python interpreter for processing venv",
-            filetypes=[("Python executable", "python.exe python"), ("All files", "*")]
-        )
-        if path:
-            self.proc_entry.delete(0, "end")
-            self.proc_entry.insert(0, path)
 
     def _load_last_values(self):
         """Pre-fill fields from last session."""
@@ -4711,11 +5287,6 @@ class StartupDialog(ctk.CTkToplevel):
                    for i in range(len(self.reviewer_option.cget("values")))]
             if last_reviewer in ids:
                 self.reviewer_var.set(last_reviewer)
-
-        # Pre-fill processing python if saved
-        saved_proc = self.settings.get("processing_python", "")
-        if saved_proc:
-            self.proc_entry.insert(0, saved_proc)
 
     def _confirm(self):
         project_dir_str = self.dir_entry.get().strip()
@@ -4738,12 +5309,6 @@ class StartupDialog(ctk.CTkToplevel):
         # Persist
         self.settings.set("last_project_dir", str(self.result_project_dir))
         self.settings.set("reviewer_id", self.result_reviewer_id)
-
-        # Save processing python if explicitly set
-        proc_python = self.proc_entry.get().strip()
-        if proc_python:
-            self.settings.set("processing_python", proc_python)
-
         self.settings.save_settings()
 
         self.grab_release()
@@ -4753,29 +5318,77 @@ class StartupDialog(ctk.CTkToplevel):
 class FaceDietApp(ctk.CTk):
     """Main application with tabbed interface."""
 
-    def __init__(self):
+    def __init__(self, project_dir: Optional[Path] = None, reviewer_id: Optional[str] = None,
+                 settings: Optional[SettingsManager] = None):
         super().__init__()
 
         self.title("Face-Diet: Comprehensive Face Processing Pipeline")
         self.geometry("1600x1000")
 
-        # Initialize settings
-        self.settings = SettingsManager()
+        self.settings = settings or SettingsManager()
+        self.restart_to_setup = False  # Set to True by "Back to setup" to re-show setup dialog
 
-        # Show startup dialog (modal — blocks until dismissed)
-        self.withdraw()  # hide main window until setup is complete
-        dialog = StartupDialog(self, self.settings)
-        self.wait_window(dialog)
+        # If project_dir/reviewer_id were passed (dialog already run in separate root), use them
+        if project_dir is not None and reviewer_id is not None:
+            self.project_dir = Path(project_dir)
+            self.reviewer_id = str(reviewer_id)
+        else:
+            # Show startup dialog in this window (modal)
+            self.withdraw()
+            dialog = StartupDialog(self, self.settings)
+            self.wait_window(dialog)
 
-        if dialog.result_project_dir is None:
-            # User closed the dialog without confirming
-            self.destroy()
-            return
+            result_project_dir = getattr(dialog, "result_project_dir", None)
+            result_reviewer_id = getattr(dialog, "result_reviewer_id", None)
 
-        self.project_dir: Path = dialog.result_project_dir
-        self.reviewer_id: str = dialog.result_reviewer_id
+            if result_project_dir is None:
+                self.quit()
+                self.destroy()
+                return
 
-        self.deiconify()  # show main window now
+            self.project_dir = Path(result_project_dir)
+            self.reviewer_id = str(result_reviewer_id or "")
+
+            self.deiconify()
+            self.update_idletasks()
+            self.lift()
+            self.focus_force()
+
+        # Global top bar (consistent on all tabs): project path, reviewer, Back to setup
+        self.top_bar = ctk.CTkFrame(self, fg_color=("gray90", "gray17"))
+        self.top_bar.pack(fill="x", padx=10, pady=(10, 0))
+        ctk.CTkLabel(
+            self.top_bar,
+            text="Project:",
+            font=ctk.CTkFont(size=13, weight="bold")
+        ).pack(side="left", padx=(12, 4), pady=8)
+        self.top_bar_dir_label = ctk.CTkLabel(
+            self.top_bar,
+            text=str(self.project_dir) if self.project_dir else "—",
+            font=ctk.CTkFont(size=12),
+            text_color="gray"
+        )
+        self.top_bar_dir_label.pack(side="left", padx=(0, 20), pady=8)
+        ctk.CTkLabel(
+            self.top_bar,
+            text="Reviewer:",
+            font=ctk.CTkFont(size=13, weight="bold")
+        ).pack(side="left", padx=(10, 4), pady=8)
+        self.top_bar_reviewer_label = ctk.CTkLabel(
+            self.top_bar,
+            text=self.reviewer_id or "—",
+            font=ctk.CTkFont(size=12),
+            text_color="#3b8ed0"
+        )
+        self.top_bar_reviewer_label.pack(side="left", padx=(0, 20), pady=8)
+        ctk.CTkButton(
+            self.top_bar,
+            text="Back to setup",
+            command=self._on_back_to_setup,
+            width=120,
+            height=28,
+            font=ctk.CTkFont(size=12)
+        ).pack(side="right", padx=10, pady=6)
 
         # Create tabview
         self.tabview = ctk.CTkTabview(self, width=1580, height=980)
@@ -4784,6 +5397,7 @@ class FaceDietApp(ctk.CTk):
         # Add tabs
         self.tabview.add("Face Detection")
         self.tabview.add("Face Instance Review")
+        self.tabview.add("Resolve Mismatches")
         self.tabview.add("Face ID Clustering")
         self.tabview.add("Face ID Review")
 
@@ -4800,6 +5414,12 @@ class FaceDietApp(ctk.CTk):
         )
         self.tab2.pack(fill="both", expand=True)
 
+        self.tab_mismatch = MismatchResolutionTab(
+            self.tabview.tab("Resolve Mismatches"),
+            self.settings, self.project_dir, self.reviewer_id
+        )
+        self.tab_mismatch.pack(fill="both", expand=True)
+
         self.tab3 = FaceIDAssignmentTab(
             self.tabview.tab("Face ID Clustering"),
             self.settings, self.project_dir, self.reviewer_id
@@ -4812,13 +5432,74 @@ class FaceDietApp(ctk.CTk):
         )
         self.tab4.pack(fill="both", expand=True)
 
+        # Refresh lists when user switches to these tabs (e.g. after reviewing in Tab 2)
+        self.tab_mismatch.bind("<Map>", self._on_resolve_mismatches_tab_shown)
+        self.tab3.bind("<Map>", self._on_face_id_clustering_tab_shown)
+        self.tab4.bind("<Map>", self._on_face_id_review_tab_shown)
+
+    def _on_resolve_mismatches_tab_shown(self, event=None):
+        """Refresh session list when Resolve Mismatches tab is shown."""
+        if hasattr(self.tab_mismatch, "_load_session_list"):
+            self.tab_mismatch._load_session_list()
+
+    def _on_face_id_clustering_tab_shown(self, event=None):
+        """Refresh participants/sessions list when Face ID Clustering tab is shown."""
+        if hasattr(self.tab3, "_load_participants_and_sessions"):
+            self.tab3._load_participants_and_sessions()
+
+    def _on_face_id_review_tab_shown(self, event=None):
+        """Refresh participant list when Face ID Review tab is shown."""
+        if hasattr(self.tab4, "_populate_participants_tab4"):
+            self.tab4._populate_participants_tab4()
+
+    def _on_back_to_setup(self):
+        """Close the tabs window and return to setup (main() will show the setup dialog again)."""
+        self.restart_to_setup = True
+        self.destroy()
+
 
 def main():
     """Main entry point."""
     ctk.set_appearance_mode("dark")
     ctk.set_default_color_theme("blue")
-    app = FaceDietApp()
-    app.mainloop()
+
+    settings = SettingsManager()
+    while True:
+        # Run startup dialog in its own root so closing it cannot affect the main window
+        dialog_root = ctk.CTk()
+        dialog_root.withdraw()
+        dialog = StartupDialog(dialog_root, settings)
+        dialog_root.wait_window(dialog)
+
+        result_project_dir = getattr(dialog, "result_project_dir", None)
+        result_reviewer_id = getattr(dialog, "result_reviewer_id", None)
+
+        # Cancel pending "after" callbacks so they don't run after we destroy the dialog root
+        try:
+            ids_str = dialog_root.tk.eval("after info")
+            for id_str in ids_str.split():
+                try:
+                    dialog_root.after_cancel(id_str)
+                except (tkinter.TclError, ValueError):
+                    pass
+        except Exception:
+            pass
+        dialog_root.destroy()
+
+        if result_project_dir is None:
+            return
+
+        try:
+            app = FaceDietApp(project_dir=result_project_dir, reviewer_id=result_reviewer_id, settings=settings)
+        except Exception:
+            import traceback
+            print("Face-Diet failed to start:", file=sys.stderr)
+            traceback.print_exc()
+            raise
+        app.mainloop()
+        # If user clicked "Back to setup", restart_to_setup is True: show setup dialog again
+        if not getattr(app, "restart_to_setup", False):
+            break
 
 
 if __name__ == "__main__":
