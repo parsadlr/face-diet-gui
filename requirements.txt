@@ -1,22 +1,45 @@
-# Core dependencies
-numpy<2  # InsightFace requires NumPy 1.x
+# ============================================================
+# Face-Diet — single virtual environment (Python 3.10)
+# ============================================================
+# TensorFlow 2.10 and InsightFace require Python 3.10. Use one venv for
+# the GUI and all processing (Tabs 1–4).
+#
+# Setup:
+#   python -m venv venv
+#   venv\Scripts\activate
+#   pip install -r requirements.txt
+#   pip install whls/insightface-0.7.3-cp310-cp310-win_amd64.whl  # Windows wheel
+#
+# GPU: use onnxruntime-gpu below. For CPU-only, swap to onnxruntime>=1.16.0.
+
+# --- NumPy (InsightFace requires 1.x) ---
+numpy<2
+
+# --- GUI ---
+customtkinter>=5.2.0
+
+# --- Data handling ---
+pandas>=2.0.0
+
+# --- Image / video ---
 opencv-python>=4.8.0
 Pillow>=10.0.0
 
-# ONNX for InsightFace (specific versions required)
-protobuf>=3.20.0
-onnx==1.16.1
-onnxruntime-gpu==1.18.1  # Compatible with CUDA 11.8 and cuDNN 8.x
+# --- ONNX runtime (InsightFace); GPU or CPU ---
+onnxruntime-gpu==1.18.1
+# onnxruntime>=1.16.0   # CPU-only: uncomment and comment line above
 
-# InsightFace for face detection (install from .whl file)
-# insightface>=0.7.3  # Install manually: pip install whls/insightface-0.7.3-cp312-cp312-win_amd64.whl
+# TensorFlow 2.10 needs protobuf<3.20; onnx 1.14+ needs >=3.20.2 — use onnx 1.12.x which allows 3.12–3.20
+protobuf>=3.9.2,<3.20
+onnx>=1.12.0,<1.14
 
-# DeepFace for attribute analysis
+# --- DeepFace (Tab 1 attribute extraction) ---
 deepface>=0.0.79
+tensorflow==2.10.*
 
-# Scikit-learn for clustering
-scikit-learn>=1.3.0
-
-# Modern GUI styling (for gui.py only)
-customtkinter>=5.2.0
-ttkthemes>=3.2.0
+# --- Stage 3: graph clustering ---
+scipy>=1.11.0
+faiss-cpu>=1.7.0
+python-igraph>=0.10.0
+leidenalg>=0.10.0
+networkx>=3.0

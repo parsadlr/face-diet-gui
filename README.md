@@ -1,248 +1,269 @@
-# Face-Diet: Video Face Analysis and Tracking
+# Face-Diet
 
-A comprehensive tool for analyzing faces in egocentric videos with face detection, identity tracking, and attribute extraction.
+A GUI application for processing egocentric (first-person) video to detect, review, and identify faces seen by the camera wearer. Designed for multi-reviewer research workflows where several annotators work on the same dataset independently, then reconcile disagreements.
 
-## Features
+---
 
-### Video Processing (New!)
-- **Two-Pass Face Detection**: Collect all faces first, then assign consistent IDs via clustering
-- **Face Identity Tracking**: Track same individuals across video frames using embedding similarity
-- **Attribute Extraction**: Age, gender, race, emotion, head pose, and distance estimation
-- **Smart Representative Selection**: For each identity, find the best instance (closest to cluster centroid)
-- **Configurable Clustering**: Threshold-based or DBSCAN clustering methods
-- **CSV & Video Output**: Results in CSV format + annotated video with face boxes and IDs
+## Pipeline Overview
 
-### Image Analysis (GUI)
-- Face detection with bounding boxes
-- Pose estimation (yaw, pitch, roll)
-- 106-point facial landmarks with color coding
-- Interactive tooltips showing face attributes
-- SQLite database storage
+The workflow combines three automated processing stages with two manual review steps.
 
-## Setup
-
-1. Create a conda environment with Python 3.9:
-
-```bash
-conda create -n face-diet python=3.9 -y
-conda activate face-diet
+```
+Video files
+    │
+    ▼
+[Tab 1]  Face Detection          (InsightFace)
+         → bounding boxes, embeddings, pose, attended flag
+    │
+    ▼
+[Tab 1]  Attribute Extraction    (DeepFace)
+         → age, gender, race, emotion appended to detections
+    │
+    ▼
+[Tab 2]  Manual Review — Face Instance Review
+         → per-reviewer valid/non-face labels
+    │
+    ▼
+[Tab 3]  Mismatch Resolution     (multi-reviewer)
+         → reconcile disagreements across reviewers
+    │
+    ▼
+[Tab 4]  Face ID Clustering      (FAISS k-NN + Louvain/Leiden)
+         → global face IDs assigned across all sessions
+    │
+    ▼
+[Tab 5]  Manual Review — Face ID Review
+         → merge/correct face IDs
 ```
 
-2. Install dependencies:
+---
+
+## ⚙️ Setup
+
+### Requirements
+
+- **Python 3.10** — required by TensorFlow 2.10 (used in attribute extraction) and InsightFace.
+
+### Create and activate a virtual environment
+
+```bash
+# Windows
+python -m venv venv
+venv\Scripts\activate
+
+# macOS / Linux
+python -m venv venv
+source venv/bin/activate
+```
+
+### Install dependencies
 
 ```bash
 pip install -r requirements.txt
 ```
 
-## Usage
+### InsightFace on Windows
 
-### Video Processing (Command Line)
-
-Process a video to detect and track faces:
+InsightFace has no official pip wheel for Windows. Install from a local build:
 
 ```bash
-python main.py path/to/video.mp4
+pip install whls/insightface-0.7.3-cp310-cp310-win_amd64.whl
 ```
 
-This will create `video_faces.csv` with all detected face instances.
+Place the `.whl` file in a `whls/` folder at the project root. Pre-built wheels for Python 3.10 on Windows can be found in the InsightFace community releases.
 
-#### Options
+### GPU vs CPU
 
-**Output Control:**
-```bash
-python main.py video.mp4 -o results.csv              # Custom CSV output path
-python main.py video.mp4 -v annotated.mp4            # Also create annotated video
+`requirements.txt` installs `onnxruntime-gpu` (for ONNX-based face detection). To run on CPU only, open `requirements.txt` and swap:
+
+```
+# Comment out:
+onnxruntime-gpu==1.18.1
+# Uncomment:
+# onnxruntime>=1.16.0
 ```
 
-**Sampling Rate:**
-```bash
-python main.py video.mp4 -s 30                       # Process every 30 frames
-python main.py video.mp4 -s 1                        # Process every frame (slow!)
-```
+---
 
-**Clustering Methods:**
-```bash
-# Threshold-based (simple, interpretable)
-python main.py video.mp4 -c threshold -t 0.6         # Similarity threshold = 0.6
+## ▶️ Running
 
-# DBSCAN (automatic, handles noise)
-python main.py video.mp4 -c dbscan --dbscan-eps 0.4 --dbscan-min-samples 2
-```
-
-**Hardware:**
-```bash
-python main.py video.mp4 --gpu                       # Use GPU if available
-```
-
-**Full Example:**
-```bash
-python main.py my_video.mp4 \
-  -o results/faces.csv \
-  -v results/annotated_video.mp4 \
-  -s 15 \
-  -c threshold \
-  -t 0.65 \
-  --gpu
-```
-
-#### Output Format
-
-**CSV Structure:**
-Each row represents one face instance in a frame:
-```
-frame_number, time_seconds, face_id, bbox_x, bbox_y, bbox_w, bbox_h, 
-pose_yaw, pose_pitch, pose_roll, age, gender, race, emotion, distance_estimate
-```
-
-Example:
-```csv
-frame_number,time_seconds,face_id,bbox_x,bbox_y,bbox_w,bbox_h,pose_yaw,pose_pitch,pose_roll,age,gender,race,emotion,distance_estimate
-0,0.000,FACE_000,320,180,150,180,5.23,-2.15,1.03,28,Man,white,happy,1.000
-30,1.000,FACE_000,325,185,145,175,8.45,-1.22,0.98,28,Man,white,neutral,1.034
-30,1.000,FACE_001,580,220,120,140,15.32,3.45,-2.11,35,Woman,asian,neutral,1.250
-```
-
-**Annotated Video:**
-- Bounding boxes around detected faces
-- Face ID labels
-- Attributes (age, gender, emotion) displayed as text overlay
-
-### Image Analysis (GUI)
-
-For static image analysis with interactive GUI:
+Activate the virtual environment first, then run from the project root:
 
 ```bash
-python gui.py
+# Windows
+venv\Scripts\activate
+# macOS / Linux
+source venv/bin/activate
+
+python main.py
+# or
+python -m face_diet_gui
 ```
 
-**GUI Usage:**
-1. Click **Open Image** to load a photo
-2. Click **Detect Faces** to find all faces
-3. Hover over faces to see attributes
-4. Click **Landmarks** to show 106-point landmarks
-5. Click **Save to DB** to persist results
+### Startup dialog
 
-## Project Structure
+On launch a setup dialog appears asking for:
 
-### Video Processing Modules
-- `main.py` - Command-line entry point with configuration
-- `video_processor.py` - Two-pass video processing orchestration
-- `face_detection.py` - Face detection, embedding extraction, and clustering
-- `face_attributes.py` - Attribute extraction (pose, age, gender, race, emotion, distance)
-- `utils.py` - Helper functions (quality scoring, blur detection, CSV utilities)
+- **Project directory** — the root folder containing participant subfolders.
+- **Reviewer ID** — select an existing reviewer or type a new name to create one. The reviewer list is stored in `{project_dir}/_annotations/reviewers.json` and is shared across all users of the same project directory.
 
-### Image Analysis Modules (Legacy)
-- `gui.py` - GUI for static image analysis
-- `face_utils.py` - Face detection utilities
-- `attribute_analysis.py` - DeepFace attribute analysis
-- `db.py` - SQLite database operations
-- `compare_faces.py` - Face similarity comparison
+The last-used values are remembered across sessions (`~/.face_diet_config.json`).
 
-## Two-Pass Processing Pipeline
+---
 
-### Why Two-Pass?
+## Using the GUI
 
-Traditional single-pass tracking suffers from:
-- **Drift**: Embeddings change slightly frame-by-frame, causing ID switches
-- **Occlusions**: Face disappearing and reappearing gets new ID
-- **Poor Representatives**: First detection might not be best quality
+### Tab 1 — Face Detection & Attribute Extraction
 
-Two-pass approach solves these issues:
+Runs face detection and optionally attribute extraction via subprocess, one session at a time or in parallel.
 
-**Pass 1: Collection**
-1. Process sampled frames
-2. Detect all faces and extract embeddings
-3. Extract attributes for each face instance
-4. Store everything in memory
+| Setting | Description |
+|---|---|
+| Sampling rate | Process every N frames (e.g. 30 = 1 fps for 30 fps video) |
+| Min confidence | Filter out low-confidence detections (0.0–1.0) |
+| GPU | Use ONNX GPU runtime for faster detection |
+| Start / end time | Restrict processing to a time window |
 
-**Pass 2: Clustering & Assignment**
-1. Cluster all embeddings using similarity/DBSCAN
-2. Assign consistent face IDs based on clusters
-3. Find representative instance per ID (closest to cluster centroid)
-4. Write CSV and annotated video
+**Output per session:** `face_detections.csv` — bounding boxes, 512-dim face embeddings, yaw/pitch/roll pose angles, and an `attended` flag (derived from eye-tracking data if `eye_tracking.tsv` is present). Attribute extraction (age, gender, race, emotion) updates this same file in-place.
 
-### Clustering Methods
+> Re-running face detection for a session automatically invalidates and removes that session's existing reviewer annotations (face/non-face labels and manual merges) to keep data consistent.
 
-**Threshold-based** (default, `threshold=0.6`):
-- Simple and interpretable
-- Two faces with similarity > threshold = same person
-- Good for high-quality videos with clear faces
+---
 
-**DBSCAN** (`eps=0.4, min_samples=2`):
-- Automatic clustering
-- Handles noise and outliers
-- Good for varying lighting/angles
+### Tab 2 — Face Instance Review
 
-## Technical Details
+Manual review of every detected face crop in a session. The reviewer marks each detection as **valid face** or **non-face** (e.g. poster, photo, partial detection).
 
-### Face Detection
-- **InsightFace**: ONNX-based face detector (buffalo_l model)
-- 512-dimensional embeddings for identity matching
-- 106-point landmarks + 3D head pose estimation
+Labels are saved as a per-reviewer overlay and never modify the base detection CSV, so multiple reviewers can label the same session independently.
 
-### Attribute Analysis
-- **DeepFace**: Age, gender, race, emotion prediction
-- Separate models for each attribute
-- Runs on cropped face regions
+**Output:** `_annotations/{reviewer_id}/{participant}/{session}/is_face.csv`
 
-### Distance Estimation
-- Simple inverse relationship: `distance = reference_height / bbox_height`
-- Reference: 150px face height = distance 1.0
-- Larger distance value = face is farther away
+---
 
-### Performance
-- **Sampling Rate**: For 30fps video, use `-s 30` to process 1 fps (good balance)
-- **Memory**: ~2KB per face instance (embeddings + attributes)
-- **Speed**: ~1-2 seconds per frame (CPU), ~0.3-0.5 seconds (GPU)
+### Tab 3 — Mismatch Resolution
 
-## Examples
+When two or more reviewers have labeled the same session, this tab highlights detections where they disagree. The current reviewer can inspect each mismatch and cast a deciding vote, producing a shared consensus label used downstream by clustering.
 
-### Process entire video at 1 fps sampling
-```bash
-python main.py meeting.mp4 -s 30 -o meeting_faces.csv
+**Output:** `_annotations/consensus/{participant}/{session}/consensus_is_face.csv` — stored in a shared `consensus/` directory (not per-reviewer).
+
+---
+
+### Tab 4 — Face ID Clustering
+
+Runs graph-based community detection for a selected participant. Loads all sessions' embeddings, builds a k-NN similarity graph with FAISS, enforces a same-frame constraint (two faces in the same frame cannot be the same person), then runs community detection to assign a global face ID to every detection.
+
+| Setting | Description |
+|---|---|
+| Similarity threshold | Cosine similarity edge threshold for k-NN graph |
+| k neighbors | Number of nearest neighbors per node |
+| Algorithm | Leiden (default, higher quality) or Louvain |
+| Enable refinement | Re-assign small clusters via k-NN voting |
+
+**Output:** `{participant}/face_ids.csv` and `{participant}/clustering_stats.txt` — written directly to the participant folder and shared across reviewers.
+
+---
+
+### Tab 5 — Face ID Review
+
+Manual review and correction of the clustering output. The reviewer can browse face IDs, view sample crops, and merge two IDs that the algorithm split incorrectly.
+
+**Output:** `_annotations/{reviewer_id}/{participant}/merges.csv` — merge decisions and media flags.
+
+---
+
+## 🗂️ Data Directory Structure
+
+```
+project_root/
+├── _annotations/
+│   ├── reviewers.json                        ← shared reviewer registry
+│   ├── alice/                                ← per-reviewer overlays
+│   │   └── participant_01/
+│   │       ├── session_a/
+│   │       │   ├── is_face.csv               ← Tab 2: face/non-face labels
+│   │       │   └── review_status.json        ← Tab 2: reviewed flag
+│   │       └── merges.csv                    ← Tab 5: ID merge decisions
+│   ├── bob/
+│   │   └── ...
+│   └── consensus/                            ← shared across reviewers (Tab 3)
+│       └── participant_01/
+│           └── session_a/
+│               ├── consensus_is_face.csv     ← Tab 3: resolved consensus labels
+│               └── mismatches_resolved.json  ← Tab 3: resolution flag
+├── participant_01/
+│   ├── face_ids.csv                          ← Tab 4 clustering output (shared)
+│   ├── clustering_stats.txt                  ← Tab 4 clustering stats (shared)
+│   ├── session_a/
+│   │   ├── scenevideo.mp4                    ← required: source video
+│   │   ├── eye_tracking.tsv                  ← optional: gaze data
+│   │   └── face_detections.csv               ← Tab 1 output (shared base data)
+│   └── session_b/
+│       └── ...
+└── participant_02/
+    └── ...
 ```
 
-### High-quality annotation video
-```bash
-python main.py presentation.mp4 -s 15 -v annotated.mp4 --gpu
+The GUI skips `_annotations/` when scanning for participants.
+
+---
+
+## 📋 Output Files Reference
+
+| File | Location | Written by | Contents |
+|---|---|---|---|
+| `face_detections.csv` | `{participant}/{session}/` | Tab 1 | Bounding boxes, embeddings, pose, attended flag; demographic attributes added in-place by attribute extraction |
+| `is_face.csv` | `_annotations/{reviewer}/{participant}/{session}/` | Tab 2 | Per-detection face/non-face label |
+| `review_status.json` | `_annotations/{reviewer}/{participant}/{session}/` | Tab 2 | `{"reviewed": true/false}` flag |
+| `consensus_is_face.csv` | `_annotations/consensus/{participant}/{session}/` | Tab 3 | Consensus label after mismatch resolution (shared) |
+| `mismatches_resolved.json` | `_annotations/consensus/{participant}/{session}/` | Tab 3 | Flag marking when all mismatches are resolved (shared) |
+| `face_ids.csv` | `{participant}/` | Tab 4 | Global face ID per detection (shared across reviewers) |
+| `clustering_stats.txt` | `{participant}/` | Tab 4 | Clustering statistics (shared across reviewers) |
+| `merges.csv` | `_annotations/{reviewer}/{participant}/` | Tab 5 | Manual ID merge decisions and media flags |
+
+`face_detections.csv` is the shared base data — written by face detection, updated in-place by attribute extraction, and never modified by the review workflow. `face_ids.csv` and `clustering_stats.txt` are also shared (written to the participant folder directly). All reviewer-specific decisions live under `_annotations/{reviewer_id}/`.
+
+---
+
+## 👥 Multi-Reviewer Workflow
+
+1. All reviewers point the app at the **same project directory** on a shared drive (or each work on a local copy and merge later).
+2. Face detection and attribute extraction are run once — their outputs are shared base data.
+3. Each reviewer completes Tab 2 independently, writing to their own subdirectory under `_annotations/`.
+4. Tab 3 computes pairwise mismatches and lets each reviewer resolve disagreements.
+5. Tab 4 clustering respects each reviewer's consensus annotations when filtering detections.
+6. Tab 5 merge decisions are per-reviewer.
+
+---
+
+## Repo Layout
+
+```
+face-diet/
+├── main.py                          ← entry point: python main.py
+├── requirements.txt                 ← single venv for GUI + all processing
+├── README.md
+├── face_diet_gui/                   ← main package (python -m face_diet_gui)
+│   ├── core/
+│   │   ├── settings_manager.py      ← SettingsManager + ReviewerRegistry
+│   │   └── pipeline_helpers.py      ← subprocess stage runners, session helpers
+│   ├── gui/
+│   │   ├── app.py                   ← StartupDialog + FaceDietApp main window
+│   │   ├── common.py                ← shared GUI helpers (ProgressReporter, etc.)
+│   │   ├── tabs/                    ← one file per tab (tab1_–tab5_)
+│   │   └── widgets/
+│   │       └── directory_tree_widget.py
+│   ├── processing/
+│   │   ├── video_processor.py       ← frame sampling, detection collection
+│   │   ├── face_detection.py        ← InsightFace detector initialisation
+│   │   └── face_attributes.py       ← DeepFace attribute extraction
+│   ├── stages/                      ← scripts invoked via subprocess by the GUI
+│   │   ├── detect_faces.py          ← face detection (InsightFace)
+│   │   ├── extract_attributes.py    ← attribute extraction (DeepFace)
+│   │   └── cluster_face_ids.py      ← graph-based face ID clustering
+│   ├── utils.py                     ← blur score, pose frontality, CSV helpers
+│   └── profiler.py                  ← optional performance profiling
+└── .cursor/
+    └── plans/                       ← AI planning artifacts (not part of the app)
 ```
 
-### Use DBSCAN for difficult conditions
-```bash
-python main.py outdoor.mp4 -c dbscan --dbscan-eps 0.35
-```
-
-### Process every frame (slow but thorough)
-```bash
-python main.py short_clip.mp4 -s 1
-```
-
-## Troubleshooting
-
-**Error: "Cannot open video"**
-- Check video file path and format (MP4, AVI supported)
-- Try re-encoding: `ffmpeg -i input.mp4 -c:v libx264 output.mp4`
-
-**Too many/few unique IDs detected**
-- Adjust similarity threshold: `-t 0.5` (more IDs) or `-t 0.7` (fewer IDs)
-- Try DBSCAN: `-c dbscan --dbscan-eps 0.35`
-
-**Slow processing**
-- Increase sampling rate: `-s 60` (process every 2 seconds)
-- Use GPU: `--gpu`
-- Skip video output (only CSV is much faster)
-
-**AttributeError or import errors**
-- Ensure all dependencies installed: `pip install -r requirements.txt`
-- Check Python version: `python --version` (should be 3.9+)
-
-## Citation
-
-This project uses:
-- [InsightFace](https://github.com/deepinsight/insightface) for face detection
-- [DeepFace](https://github.com/serengil/deepface) for attribute analysis
-- [scikit-learn](https://scikit-learn.org/) for clustering
-
-## License
-
-See individual model licenses for InsightFace and DeepFace.
+The scripts under `face_diet_gui/stages/` are designed to be run in a separate subprocess (possibly under a different Python interpreter) so that heavy ML dependencies are isolated from the GUI process. They can also be run directly from the command line for debugging.
