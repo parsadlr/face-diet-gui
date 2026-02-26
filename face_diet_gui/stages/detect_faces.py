@@ -1,13 +1,13 @@
 """
-Stage 1: Face Detection with InsightFace
+Face Detection with InsightFace
 
 Detects faces in a single session and saves:
 - Bounding boxes
-- Face embeddings  
+- Face embeddings
 - Pose angles
 - Attended flag (if eye tracking available)
 
-Output: <session_dir>/stage1_detections.csv
+Output: <session_dir>/face_detections.csv
 
 Can be run in parallel for multiple sessions!
 """
@@ -16,11 +16,11 @@ import argparse
 import sys
 from pathlib import Path
 
-from video_processor import collect_detections_insightface_only, write_csv_stage1
-from face_detection import initialize_detector
+from face_diet_gui.processing.video_processor import collect_detections_insightface_only, write_csv_stage1
+from face_diet_gui.processing.face_detection import initialize_detector
 
 
-def stage1_detect_faces(
+def detect_faces(
     session_dir: str,
     sampling_rate: int = 30,
     start_time: float = None,
@@ -29,7 +29,7 @@ def stage1_detect_faces(
     min_confidence: float = 0.0,
 ):
     """
-    Stage 1: Detect faces in a single session.
+    Detect faces in a single session.
     
     Parameters
     ----------
@@ -89,7 +89,7 @@ def stage1_detect_faces(
     output_csv = str(session_path / "face_detections.csv")
     
     print("=" * 80)
-    print("STAGE 1: FACE DETECTION")
+    print("FACE DETECTION")
     print("=" * 80)
     print(f"Session: {session_path.name}")
     print(f"Video: {video_path}")
@@ -131,7 +131,7 @@ def stage1_detect_faces(
     write_csv_stage1(output_csv, detections)
     
     print("\n" + "=" * 80)
-    print("STAGE 1 COMPLETE")
+    print("FACE DETECTION COMPLETE")
     print("=" * 80)
     print(f"Output: {output_csv}")
     print(f"Total faces: {len(detections)}")
@@ -143,7 +143,7 @@ def stage1_detect_faces(
         else:
             print(f"Attended faces: {attended_count} (0.0%)")
     
-    print("\nNext: Run stage2_extract_attributes.py on this session")
+    print("\nNext: Run extract_attributes.py on this session")
     print("=" * 80)
     
     return {
@@ -155,7 +155,7 @@ def stage1_detect_faces(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Stage 1: Detect faces in a single session"
+        description="Detect faces in a single session"
     )
     
     parser.add_argument(
@@ -203,7 +203,7 @@ if __name__ == "__main__":
         end_time = args.test_duration
     
     try:
-        stage1_detect_faces(
+        detect_faces(
             session_dir=args.session_dir,
             sampling_rate=args.sampling_rate,
             start_time=args.start_time,

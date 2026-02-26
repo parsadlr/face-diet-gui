@@ -19,7 +19,7 @@ import pandas as pd
 import cv2
 import numpy as np
 
-from face_attributes import (
+from face_diet_gui.processing.face_attributes import (
     extract_all_attributes,
     extract_all_attributes_batch,
     extract_pose_with_pnp,
@@ -27,14 +27,14 @@ from face_attributes import (
     extract_age_gender_race_emotion_batch,
 )
 import deepface
-from face_detection import (
+from face_diet_gui.processing.face_detection import (
     assign_face_ids,
     detect_faces_in_frame,
     find_representative_instances,
     initialize_detector,
 )
-from profiler import get_profiler
-from utils import append_csv_row, frame_to_time, write_csv_header
+from face_diet_gui.profiler import get_profiler
+from face_diet_gui.utils import append_csv_row, frame_to_time, write_csv_header
 
 
 def process_video_stage1(

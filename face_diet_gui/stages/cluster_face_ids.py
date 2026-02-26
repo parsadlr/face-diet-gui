@@ -1,8 +1,8 @@
 """
-Stage 3: Graph-Based Community Detection for Global Face IDs
+Graph-Based Community Detection for Global Face IDs
 
 Uses FAISS k-NN + Louvain/Leiden community detection for global clustering.
-No temporal windowing - all faces clustered globally at once.
+No temporal windowing — all faces clustered globally at once.
 
 Algorithm:
 1. Load all embeddings from all sessions
@@ -484,7 +484,7 @@ def refine_small_clusters(
     return combined_df
 
 
-def stage3_graph_clustering(
+def cluster_face_ids(
     participant_dir: str,
     annotations_dir: str = None,
     consensus_dir: str = None,
@@ -500,7 +500,7 @@ def stage3_graph_clustering(
     reassign_threshold: float = None,
 ):
     """
-    Stage 3: Graph-based community detection for global face IDs.
+    Graph-based community detection for global face IDs.
 
     Parameters
     ----------
@@ -752,7 +752,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     try:
-        stage3_graph_clustering(
+        cluster_face_ids(
             participant_dir=args.participant_dir,
             annotations_dir=args.annotations_dir,
             consensus_dir=args.consensus_dir,

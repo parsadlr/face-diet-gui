@@ -1,14 +1,14 @@
 """
-Stage 2: Extract Face Attributes with DeepFace
+Extract Face Attributes with DeepFace
 
-Reads Stage 1 detections and adds demographic attributes:
+Reads face detections and adds demographic attributes:
 - Age
 - Gender
 - Race
 - Emotion
 
-Input: <session_dir>/stage1_detections.csv
-Output: <session_dir>/stage2_attributes.csv
+Input:  <session_dir>/face_detections.csv
+Output: <session_dir>/face_detections.csv (updated in-place with attribute columns)
 
 Can be run in parallel for multiple sessions!
 """
@@ -17,21 +17,21 @@ import argparse
 import sys
 from pathlib import Path
 
-from video_processor import process_video_stage2
+from face_diet_gui.processing.video_processor import process_video_stage2
 
 
-def stage2_extract_attributes(
+def extract_attributes(
     session_dir: str,
     batch_size: int = 32,
     limit: int = None,
 ):
     """
-    Stage 2: Extract attributes for faces in a single session.
+    Extract attributes for faces in a single session.
     
     Parameters
     ----------
     session_dir : str
-        Path to session directory containing stage1_detections.csv
+        Path to session directory containing face_detections.csv
     batch_size : int
         Batch size for DeepFace processing (larger = more memory, faster)
     """
@@ -51,11 +51,11 @@ def stage2_extract_attributes(
     if not input_csv.exists():
         raise FileNotFoundError(
             f"Stage 1 output not found: {input_csv}\n"
-            f"Run stage1_detect_faces.py first!"
+            f"Run detect_faces.py first!"
         )
     
     print("=" * 80)
-    print("STAGE 2: ATTRIBUTE EXTRACTION")
+    print("ATTRIBUTE EXTRACTION")
     print("=" * 80)
     print(f"Session: {session_path.name}")
     print(f"Video: {video_path}")
@@ -99,11 +99,11 @@ def stage2_extract_attributes(
         os.remove(stage1_csv_to_use)
     
     print("\n" + "=" * 80)
-    print("STAGE 2 COMPLETE")
+    print("ATTRIBUTE EXTRACTION COMPLETE")
     print("=" * 80)
     print(f"Output: {output_csv}")
     print(f"Processed faces: {result['processed_faces']}")
-    print("\nNext: Run stage3_graph_clustering.py to assign global face IDs")
+    print("\nNext: Run cluster_face_ids.py to assign global face IDs")
     print("=" * 80)
     
     return {
@@ -115,12 +115,12 @@ def stage2_extract_attributes(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Stage 2: Extract attributes for faces in a single session"
+        description="Extract demographic attributes for faces in a single session"
     )
     
     parser.add_argument(
         'session_dir',
-        help='Path to session directory (contains stage1_detections.csv)'
+        help='Path to session directory (contains face_detections.csv)'
     )
     parser.add_argument(
         '--batch-size',
@@ -137,7 +137,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
     
     try:
-        stage2_extract_attributes(
+        extract_attributes(
             session_dir=args.session_dir,
             batch_size=args.batch_size,
             limit=args.limit,

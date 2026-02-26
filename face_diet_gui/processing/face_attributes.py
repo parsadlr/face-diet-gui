@@ -18,7 +18,7 @@ import numpy as np
 import tensorflow as tf
 from deepface import DeepFace
 from insightface.app import FaceAnalysis
-from profiler import get_profiler
+from face_diet_gui.profiler import get_profiler
 
 # Configure TensorFlow to use GPU
 gpus = tf.config.list_physical_devices('GPU')
@@ -471,4 +471,3 @@ def extract_all_attributes_batch(
         })
     
     return all_attributes
-

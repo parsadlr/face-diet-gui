@@ -155,6 +155,9 @@ Network Trash Folder
 Temporary Items
 .apdisk
 
+# Face-Diet: entry point main.py; application code under src/
+.face_diet_config.json
+
 # IDE
 .vscode/
 .idea/

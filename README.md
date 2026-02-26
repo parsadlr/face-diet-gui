@@ -1,172 +1,269 @@
 # Face-Diet
 
-A GUI for processing egocentric video recordings to extract, review, cluster, and manually verify face instances across participants and sessions.
-
-## Overview
-
-The pipeline has four stages, each with its own GUI tab:
-
-| Tab | Stage | What it does |
-|-----|-------|--------------|
-| 1 | Face Detection | Runs Stages 1 & 2 (InsightFace detection + DeepFace attribute extraction) on selected sessions. Writes `face_detections.csv` per session. |
-| 2 | Face Instance Review | Reviewer marks individual detections as valid face / non-face. |
-| 3 | Face ID Clustering | Runs graph-based community detection (Leiden/Louvain) across all sessions of a participant to assign global face IDs. |
-| 4 | Face ID Review | Reviewer merges face IDs that were incorrectly split by the clustering step. |
-
-Multiple reviewers can work on the same project completely independently. Their decisions are stored in small per-reviewer overlay files; the large shared data is never duplicated.
+A GUI application for processing egocentric (first-person) video to detect, review, and identify faces seen by the camera wearer. Designed for multi-reviewer research workflows where several annotators work on the same dataset independently, then reconcile disagreements.
 
 ---
 
-## Environment Setup
+## Pipeline Overview
 
-**Python 3.10** and a single virtual environment are required. TensorFlow 2.10 (for face attribute extraction in Tab 1) only supports Python 3.10, so the whole app runs on one venv with Python 3.10.
+The workflow combines three automated processing stages with two manual review steps.
 
-### 1. Create the virtual environment
+```
+Video files
+    │
+    ▼
+[Tab 1]  Face Detection          (InsightFace)
+         → bounding boxes, embeddings, pose, attended flag
+    │
+    ▼
+[Tab 1]  Attribute Extraction    (DeepFace)
+         → age, gender, race, emotion appended to detections
+    │
+    ▼
+[Tab 2]  Manual Review — Face Instance Review
+         → per-reviewer valid/non-face labels
+    │
+    ▼
+[Tab 3]  Mismatch Resolution     (multi-reviewer)
+         → reconcile disagreements across reviewers
+    │
+    ▼
+[Tab 4]  Face ID Clustering      (FAISS k-NN + Louvain/Leiden)
+         → global face IDs assigned across all sessions
+    │
+    ▼
+[Tab 5]  Manual Review — Face ID Review
+         → merge/correct face IDs
+```
+
+---
+
+## ⚙️ Setup
+
+### Requirements
+
+- **Python 3.10** — required by TensorFlow 2.10 (used in attribute extraction) and InsightFace.
+
+### Create and activate a virtual environment
 
 ```bash
-# From the project root — use Python 3.10 (required for TensorFlow 2.10)
+# Windows
 python -m venv venv
-
-# Activate (Windows)
 venv\Scripts\activate
 
-# Install dependencies
+# macOS / Linux
+python -m venv venv
+source venv/bin/activate
+```
+
+### Install dependencies
+
+```bash
 pip install -r requirements.txt
 ```
 
-### 2. Install InsightFace (Windows)
+### InsightFace on Windows
 
-InsightFace has no official Windows pip package. Install from a pre-built wheel:
-
-1. Place the wheel in a `whls/` folder next to the project (e.g. `insightface-0.7.3-cp310-cp310-win_amd64.whl`).
-2. In the activated venv:
+InsightFace has no official pip wheel for Windows. Install from a local build:
 
 ```bash
 pip install whls/insightface-0.7.3-cp310-cp310-win_amd64.whl
 ```
 
-### 3. GPU support (optional)
+Place the `.whl` file in a `whls/` folder at the project root. Pre-built wheels for Python 3.10 on Windows can be found in the InsightFace community releases.
 
-For GPU inference (Tab 1), install CUDA 11.8 and cuDNN 8.x; `requirements.txt` includes `onnxruntime-gpu`. For CPU-only, edit `requirements.txt` and use `onnxruntime>=1.16.0` instead of `onnxruntime-gpu==1.18.1`.
+### GPU vs CPU
 
-### 4. Optional: use a different Python for Tab 1
+`requirements.txt` installs `onnxruntime-gpu` (for ONNX-based face detection). To run on CPU only, open `requirements.txt` and swap:
 
-By default the GUI uses the same Python that runs the app (single venv). To point Tab 1 (face detection + attributes) at another interpreter:
-
-1. Launch the GUI and in the startup dialog expand **"Configure processing environment"**.
-2. Enter or browse to that interpreter’s path (e.g. another venv’s `Scripts\python.exe`).
-3. Click **Continue** — the path is saved for future sessions.
+```
+# Comment out:
+onnxruntime-gpu==1.18.1
+# Uncomment:
+# onnxruntime>=1.16.0
+```
 
 ---
 
-## Running the GUI
+## ▶️ Running
 
-Activate the venv, then:
+Activate the virtual environment first, then run from the project root:
 
 ```bash
-python run_gui.py
+# Windows
+venv\Scripts\activate
+# macOS / Linux
+source venv/bin/activate
+
+python main.py
+# or
+python -m face_diet_gui
 ```
 
-The startup dialog will ask for:
-1. **Project directory** — the root folder containing participant sub-directories.
-2. **Reviewer ID** — select an existing reviewer or create a new one. Reviewer profiles are stored in `{project}/_annotations/reviewers.json`.
+### Startup dialog
+
+On launch a setup dialog appears asking for:
+
+- **Project directory** — the root folder containing participant subfolders.
+- **Reviewer ID** — select an existing reviewer or type a new name to create one. The reviewer list is stored in `{project_dir}/_annotations/reviewers.json` and is shared across all users of the same project directory.
+
+The last-used values are remembered across sessions (`~/.face_diet_config.json`).
 
 ---
 
-## Project Directory Structure
+## Using the GUI
 
-```
-ProjectRoot/
-  _annotations/                          # all reviewer data (skipped when scanning for participants)
-    reviewers.json                       # reviewer registry
-    alice/
-      Participant1/
-        Session1/
-          tab2_is_face.csv               # Tab 2: instance_index, is_face, reviewed_at
-        tab3_face_ids.csv                # Tab 3: session_name, instance_index, face_id
-        tab4_merges.csv                  # Tab 4: face_id, merged_face_id, reviewed_at
-        final_faces_alice.csv            # on-demand export (Tab 4 → Export)
-    bob/
-      ...
-  Participant1/
-    Session1/
-      scenevideo.mp4                     # input video (or .avi, .mov, ...)
-      eye_tracking.tsv                   # optional gaze data
-      face_detections.csv                # written by Tab 1, never modified afterwards
-    Session2/
-      ...
-  Participant2/
-    ...
-```
+### Tab 1 — Face Detection & Attribute Extraction
+
+Runs face detection and optionally attribute extraction via subprocess, one session at a time or in parallel.
+
+| Setting | Description |
+|---|---|
+| Sampling rate | Process every N frames (e.g. 30 = 1 fps for 30 fps video) |
+| Min confidence | Filter out low-confidence detections (0.0–1.0) |
+| GPU | Use ONNX GPU runtime for faster detection |
+| Start / end time | Restrict processing to a time window |
+
+**Output per session:** `face_detections.csv` — bounding boxes, 512-dim face embeddings, yaw/pitch/roll pose angles, and an `attended` flag (derived from eye-tracking data if `eye_tracking.tsv` is present). Attribute extraction (age, gender, race, emotion) updates this same file in-place.
+
+> Re-running face detection for a session automatically invalidates and removes that session's existing reviewer annotations (face/non-face labels and manual merges) to keep data consistent.
 
 ---
-
-## Tab-by-Tab Workflow
-
-### Tab 1 — Face Detection
-
-- Select sessions using the participant/session tree (supports multi-select).
-- Configure sampling rate, GPU usage, and minimum detection confidence.
-- Click **Start Processing**. Progress is streamed in real time.
-- Uses the same Python as the GUI (single venv) unless you configured a different interpreter.
-- Output: `face_detections.csv` per session with columns:
-  `frame_number, time_seconds, x, y, w, h, confidence, sharpness, distance, pitch, yaw, roll, attended, age, gender, race, emotion, embedding`
 
 ### Tab 2 — Face Instance Review
 
-- Select a participant from the left panel, then a session from the right panel.
-  Sessions that already have annotations show a ✓ marker.
-- Click **Load Session** to display the face gallery.
-- Click individual faces to toggle valid / non-face.
-- Use bulk controls (select all, select by confidence, etc.) for efficiency.
-- Click **Save Annotations** to write `tab2_is_face.csv` for the current reviewer.
-- Annotations survive between visits — reload a session to resume where you left off.
+Manual review of every detected face crop in a session. The reviewer marks each detection as **valid face** or **non-face** (e.g. poster, photo, partial detection).
 
-### Tab 3 — Face ID Clustering
+Labels are saved as a per-reviewer overlay and never modify the base detection CSV, so multiple reviewers can label the same session independently.
 
-- Select participants to process.
-- Configure clustering settings (algorithm, similarity threshold, k-neighbors, refinement).
-- Click **Assign Face IDs**. The script reads all sessions' `face_detections.csv`
-  and automatically applies the current reviewer's `tab2_is_face.csv` filters.
-- Runs in the same venv as the GUI.
-- Output: `tab3_face_ids.csv` — a thin overlay file (`session_name, instance_index, face_id`). Stats written to `tab3_stats.txt`.
-
-### Tab 4 — Face ID Review
-
-- Select a participant (only participants with completed Tab 3 results are listed).
-- Click **Load Participant**. The GUI joins the base `face_detections.csv` files
-  with the reviewer's `tab3_face_ids.csv` in memory — no combined CSV is ever written to disk.
-- Browse face IDs in the list; double-click a face ID to open a gallery of all its instances.
-- Select two or more face IDs and click **Merge** to combine them.
-- Click **Save Annotations** to write `tab4_merges.csv`.
-- Click **Export Final CSV** to produce `final_faces_{reviewer_id}.csv` — a full joined CSV written once on demand.
+**Output:** `_annotations/{reviewer_id}/{participant}/{session}/is_face.csv`
 
 ---
 
-## Multi-Reviewer Workflow
+### Tab 3 — Mismatch Resolution
 
-1. Each reviewer runs the GUI, selects the shared project directory, and picks their reviewer ID from the startup dialog (or creates a new one).
-2. Each reviewer works through Tabs 2 → 3 → 4 independently.
-3. All decisions are stored exclusively in `_annotations/{reviewer_id}/`.
-4. The large base files (`face_detections.csv`) are written once by Tab 1 and are **never modified** by any reviewer.
-5. Final outputs per reviewer are small overlay files plus an on-demand export CSV.
+When two or more reviewers have labeled the same session, this tab highlights detections where they disagree. The current reviewer can inspect each mismatch and cast a deciding vote, producing a shared consensus label used downstream by clustering.
+
+**Output:** `_annotations/consensus/{participant}/{session}/consensus_is_face.csv` — stored in a shared `consensus/` directory (not per-reviewer).
 
 ---
 
-## Key Files
+### Tab 4 — Face ID Clustering
 
-| File | Purpose |
-|------|---------|
-| `run_gui.py` | Entry point |
-| `gui_multitab.py` | Main GUI application (all four tabs + startup dialog) |
-| `settings_manager.py` | GUI settings persistence + `ReviewerRegistry` class |
-| `directory_tree_widget.py` | Reusable participant/session tree widget (Tab 1) |
-| `stage1_detect_faces.py` | CLI script for face detection (called via subprocess) |
-| `stage2_extract_attributes.py` | CLI script for attribute extraction (called via subprocess) |
-| `stage3_graph_clustering.py` | CLI script for global face ID clustering (called via subprocess) |
-| `video_processor.py` | Video-level processing utilities used by Stage 1 & 2 |
-| `face_detection.py` | InsightFace detection helpers |
-| `face_attributes.py` | DeepFace attribute extraction helpers |
-| `utils.py` | Shared utility functions |
-| `profiler.py` | Optional performance profiler |
-| `requirements.txt` | Dependencies for the single venv (Python 3.10) |
+Runs graph-based community detection for a selected participant. Loads all sessions' embeddings, builds a k-NN similarity graph with FAISS, enforces a same-frame constraint (two faces in the same frame cannot be the same person), then runs community detection to assign a global face ID to every detection.
+
+| Setting | Description |
+|---|---|
+| Similarity threshold | Cosine similarity edge threshold for k-NN graph |
+| k neighbors | Number of nearest neighbors per node |
+| Algorithm | Leiden (default, higher quality) or Louvain |
+| Enable refinement | Re-assign small clusters via k-NN voting |
+
+**Output:** `{participant}/face_ids.csv` and `{participant}/clustering_stats.txt` — written directly to the participant folder and shared across reviewers.
+
+---
+
+### Tab 5 — Face ID Review
+
+Manual review and correction of the clustering output. The reviewer can browse face IDs, view sample crops, and merge two IDs that the algorithm split incorrectly.
+
+**Output:** `_annotations/{reviewer_id}/{participant}/merges.csv` — merge decisions and media flags.
+
+---
+
+## 🗂️ Data Directory Structure
+
+```
+project_root/
+├── _annotations/
+│   ├── reviewers.json                        ← shared reviewer registry
+│   ├── alice/                                ← per-reviewer overlays
+│   │   └── participant_01/
+│   │       ├── session_a/
+│   │       │   ├── is_face.csv               ← Tab 2: face/non-face labels
+│   │       │   └── review_status.json        ← Tab 2: reviewed flag
+│   │       └── merges.csv                    ← Tab 5: ID merge decisions
+│   ├── bob/
+│   │   └── ...
+│   └── consensus/                            ← shared across reviewers (Tab 3)
+│       └── participant_01/
+│           └── session_a/
+│               ├── consensus_is_face.csv     ← Tab 3: resolved consensus labels
+│               └── mismatches_resolved.json  ← Tab 3: resolution flag
+├── participant_01/
+│   ├── face_ids.csv                          ← Tab 4 clustering output (shared)
+│   ├── clustering_stats.txt                  ← Tab 4 clustering stats (shared)
+│   ├── session_a/
+│   │   ├── scenevideo.mp4                    ← required: source video
+│   │   ├── eye_tracking.tsv                  ← optional: gaze data
+│   │   └── face_detections.csv               ← Tab 1 output (shared base data)
+│   └── session_b/
+│       └── ...
+└── participant_02/
+    └── ...
+```
+
+The GUI skips `_annotations/` when scanning for participants.
+
+---
+
+## 📋 Output Files Reference
+
+| File | Location | Written by | Contents |
+|---|---|---|---|
+| `face_detections.csv` | `{participant}/{session}/` | Tab 1 | Bounding boxes, embeddings, pose, attended flag; demographic attributes added in-place by attribute extraction |
+| `is_face.csv` | `_annotations/{reviewer}/{participant}/{session}/` | Tab 2 | Per-detection face/non-face label |
+| `review_status.json` | `_annotations/{reviewer}/{participant}/{session}/` | Tab 2 | `{"reviewed": true/false}` flag |
+| `consensus_is_face.csv` | `_annotations/consensus/{participant}/{session}/` | Tab 3 | Consensus label after mismatch resolution (shared) |
+| `mismatches_resolved.json` | `_annotations/consensus/{participant}/{session}/` | Tab 3 | Flag marking when all mismatches are resolved (shared) |
+| `face_ids.csv` | `{participant}/` | Tab 4 | Global face ID per detection (shared across reviewers) |
+| `clustering_stats.txt` | `{participant}/` | Tab 4 | Clustering statistics (shared across reviewers) |
+| `merges.csv` | `_annotations/{reviewer}/{participant}/` | Tab 5 | Manual ID merge decisions and media flags |
+
+`face_detections.csv` is the shared base data — written by face detection, updated in-place by attribute extraction, and never modified by the review workflow. `face_ids.csv` and `clustering_stats.txt` are also shared (written to the participant folder directly). All reviewer-specific decisions live under `_annotations/{reviewer_id}/`.
+
+---
+
+## 👥 Multi-Reviewer Workflow
+
+1. All reviewers point the app at the **same project directory** on a shared drive (or each work on a local copy and merge later).
+2. Face detection and attribute extraction are run once — their outputs are shared base data.
+3. Each reviewer completes Tab 2 independently, writing to their own subdirectory under `_annotations/`.
+4. Tab 3 computes pairwise mismatches and lets each reviewer resolve disagreements.
+5. Tab 4 clustering respects each reviewer's consensus annotations when filtering detections.
+6. Tab 5 merge decisions are per-reviewer.
+
+---
+
+## Repo Layout
+
+```
+face-diet/
+├── main.py                          ← entry point: python main.py
+├── requirements.txt                 ← single venv for GUI + all processing
+├── README.md
+├── face_diet_gui/                   ← main package (python -m face_diet_gui)
+│   ├── core/
+│   │   ├── settings_manager.py      ← SettingsManager + ReviewerRegistry
+│   │   └── pipeline_helpers.py      ← subprocess stage runners, session helpers
+│   ├── gui/
+│   │   ├── app.py                   ← StartupDialog + FaceDietApp main window
+│   │   ├── common.py                ← shared GUI helpers (ProgressReporter, etc.)
+│   │   ├── tabs/                    ← one file per tab (tab1_–tab5_)
+│   │   └── widgets/
+│   │       └── directory_tree_widget.py
+│   ├── processing/
+│   │   ├── video_processor.py       ← frame sampling, detection collection
+│   │   ├── face_detection.py        ← InsightFace detector initialisation
+│   │   └── face_attributes.py       ← DeepFace attribute extraction
+│   ├── stages/                      ← scripts invoked via subprocess by the GUI
+│   │   ├── detect_faces.py          ← face detection (InsightFace)
+│   │   ├── extract_attributes.py    ← attribute extraction (DeepFace)
+│   │   └── cluster_face_ids.py      ← graph-based face ID clustering
+│   ├── utils.py                     ← blur score, pose frontality, CSV helpers
+│   └── profiler.py                  ← optional performance profiling
+└── .cursor/
+    └── plans/                       ← AI planning artifacts (not part of the app)
+```
+
+The scripts under `face_diet_gui/stages/` are designed to be run in a separate subprocess (possibly under a different Python interpreter) so that heavy ML dependencies are isolated from the GUI process. They can also be run directly from the command line for debugging.

@@ -129,4 +129,3 @@ def get_profiler() -> PerformanceProfiler:
 def reset_profiler():
     """Reset the global profiler."""
     _profiler.reset()
-

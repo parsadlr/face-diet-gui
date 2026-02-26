@@ -258,4 +258,3 @@ def cosine_similarity(emb_a: np.ndarray, emb_b: np.ndarray) -> float:
     if denom == 0:
         return 0.0
     return float(np.dot(emb_a, emb_b) / denom)
-

@@ -12,8 +12,8 @@ import numpy as np
 from insightface.app import FaceAnalysis
 from sklearn.cluster import DBSCAN
 
-from profiler import get_profiler
-from utils import calculate_face_quality, cosine_similarity
+from face_diet_gui.profiler import get_profiler
+from face_diet_gui.utils import calculate_face_quality, cosine_similarity
 
 
 def initialize_detector(
@@ -354,4 +354,3 @@ def calculate_quality_for_detection(
         pose=detection.get('pose'),
         image_bgr=image_bgr,
     )
-
