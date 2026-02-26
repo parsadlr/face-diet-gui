@@ -53,6 +53,7 @@ def load_all_sessions(
     participant_dir: str,
     min_confidence: float = 0.0,
     annotations_dir: str = None,
+    consensus_dir: str = None,
 ) -> Tuple[pd.DataFrame, np.ndarray, Dict]:
     """
     Load all session data into one combined dataset.
@@ -64,11 +65,15 @@ def load_all_sessions(
     min_confidence : float
         Minimum detection confidence threshold.
     annotations_dir : str, optional
-        Path to the reviewer's per-participant annotation directory, i.e.
-        ``{project}/_annotations/{reviewer_id}/{participant}/``.
-        When provided, each session's ``tab2_is_face.csv`` is loaded from
-        ``{annotations_dir}/{session_name}/tab2_is_face.csv`` and instances
-        marked as non-face are excluded before clustering.
+        Path to the reviewer's per-participant annotation directory.
+        Used as fallback when no consensus is available for a session.
+    consensus_dir : str, optional
+        Path to the consensus annotation directory for this participant
+        (``{project}/_annotations/consensus/{participant}/``).
+        For each session, if ``{consensus_dir}/{session}/consensus_is_face.csv``
+        exists, it is used instead of the reviewer's is_face.csv.
+        Sessions without a consensus file are included with ALL instances
+        (no face filtering), so nothing is silently discarded.
 
     Returns
     -------
@@ -77,6 +82,7 @@ def load_all_sessions(
     """
     participant_path = Path(participant_dir).resolve()
     ann_base = Path(annotations_dir) if annotations_dir else None
+    cons_base = Path(consensus_dir) if consensus_dir else None
 
     # Find all session CSVs (skip hidden / reserved dirs)
     session_csvs = []
@@ -97,7 +103,9 @@ def load_all_sessions(
         raise FileNotFoundError("No face_detections.csv files found")
 
     print(f"Found {len(session_csvs)} sessions")
-    if ann_base:
+    if cons_base:
+        print(f"Using consensus annotations from: {cons_base}")
+    elif ann_base:
         print(f"Applying face instance annotations from: {ann_base}")
 
     # Load all sessions
@@ -113,9 +121,29 @@ def load_all_sessions(
         df['instance_index'] = df.index
         original_count = len(df)
 
-        # Apply reviewer Tab 2 annotations if available
-        if ann_base is not None:
-            annotation_file = ann_base / session['session_name'] / "tab2_is_face.csv"
+        # Priority 1: consensus annotation for this session
+        annotation_applied = False
+        if cons_base is not None:
+            cons_file = cons_base / session['session_name'] / "consensus_is_face.csv"
+            if cons_file.exists():
+                try:
+                    ann_df = pd.read_csv(cons_file)
+                    is_face_map = dict(zip(ann_df['instance_index'], ann_df['is_face']))
+                    valid_mask = df['instance_index'].map(
+                        lambda idx: is_face_map.get(idx, True)
+                    )
+                    df = df[valid_mask].reset_index(drop=True)
+                    filtered_count = original_count - len(df)
+                    if filtered_count > 0:
+                        print(f"    Filtered {filtered_count} non-face instances (consensus)")
+                        total_filtered_by_annotations += filtered_count
+                    annotation_applied = True
+                except Exception as e:
+                    print(f"    Warning: Could not load consensus from {cons_file}: {e}")
+
+        # Priority 2: reviewer face/non-face annotations (only if no consensus for this session)
+        if not annotation_applied and ann_base is not None:
+            annotation_file = ann_base / session['session_name'] / "is_face.csv"
             if annotation_file.exists():
                 try:
                     ann_df = pd.read_csv(annotation_file)
@@ -126,10 +154,11 @@ def load_all_sessions(
                     df = df[valid_mask].reset_index(drop=True)
                     filtered_count = original_count - len(df)
                     if filtered_count > 0:
-                        print(f"    Filtered {filtered_count} non-face instances")
+                        print(f"    Filtered {filtered_count} non-face instances (reviewer annotation)")
                         total_filtered_by_annotations += filtered_count
                 except Exception as e:
                     print(f"    Warning: Could not load annotations from {annotation_file}: {e}")
+        # If no annotation available for this session: all instances are included
         
         # Parse embeddings
         embeddings = []
@@ -458,6 +487,7 @@ def refine_small_clusters(
 def stage3_graph_clustering(
     participant_dir: str,
     annotations_dir: str = None,
+    consensus_dir: str = None,
     output_dir: str = None,
     similarity_threshold: float = 0.6,
     k_neighbors: int = 50,
@@ -479,11 +509,11 @@ def stage3_graph_clustering(
     annotations_dir : str, optional
         Reviewer's per-participant annotation directory
         (``{project}/_annotations/{reviewer_id}/{participant}/``).
-        Per-session ``tab2_is_face.csv`` files are read from here.
+        Per-session ``is_face.csv`` files are read from here.
     output_dir : str, optional
-        Directory where ``tab3_face_ids.csv`` and ``tab3_stats.txt`` are
-        written.  Defaults to *annotations_dir* when provided, otherwise to
-        *participant_dir*.
+        Participant directory. ``face_ids.csv`` and ``clustering_stats.txt`` are
+        written here (shared among reviewers). Defaults to *annotations_dir*
+        when provided, otherwise *participant_dir*.
     similarity_threshold : float
         Cosine similarity threshold for edges.
     k_neighbors : int
@@ -530,7 +560,7 @@ def stage3_graph_clustering(
     print("=" * 80)
     
     combined_df, embeddings, metadata = load_all_sessions(
-        participant_dir, min_confidence, annotations_dir
+        participant_dir, min_confidence, annotations_dir, consensus_dir
     )
     
     print(f"\n[OK] Loaded {len(combined_df):,} faces from {metadata['num_sessions']} sessions")
@@ -607,19 +637,19 @@ def stage3_graph_clustering(
     
     final_num_unique_ids = combined_df['face_id'].nunique()
 
-    # STEP 6: Write thin overlay file (session_name, instance_index, face_id)
+    # STEP 6: Write face IDs CSV in participant folder (one file, shared among reviewers)
     print("\n" + "=" * 80)
     print("STEP 6: SAVING RESULTS")
     print("=" * 80)
 
-    face_ids_file = out_path / "tab3_face_ids.csv"
+    face_ids_file = out_path / "face_ids.csv"
     overlay_df = combined_df[['session_name', 'instance_index', 'face_id']].copy()
     overlay_df.to_csv(face_ids_file, index=False)
     print(f"  [OK] Face ID overlay saved: {face_ids_file}")
     print(f"       {len(overlay_df):,} rows, {final_num_unique_ids} unique IDs")
 
     # Write stats
-    stats_file = out_path / "tab3_stats.txt"
+    stats_file = out_path / "clustering_stats.txt"
     with open(stats_file, 'w') as f:
         f.write("Stage 3 — Global Face ID Assignment Statistics\n")
         f.write("=" * 80 + "\n\n")
@@ -632,7 +662,7 @@ def stage3_graph_clustering(
         f.write(f"Unique global IDs: {final_num_unique_ids}\n")
         f.write(f"Sessions: {metadata['num_sessions']}\n")
         f.write(f"Graph edges: {len(edge_sources):,}\n\n")
-        f.write(f"Filtered by Tab 2 annotations: "
+        f.write(f"Filtered by face/non-face annotations: "
                 f"{metadata['total_filtered_by_annotations']:,}\n\n")
 
         f.write("Per-session breakdown:\n\n")
@@ -699,10 +729,15 @@ if __name__ == "__main__":
     parser.add_argument('--annotations_dir', type=str, default=None,
                         help='Reviewer annotation directory for this participant '
                              '({project}/_annotations/{reviewer_id}/{participant}/). '
-                             'Per-session tab2_is_face.csv files are read from here.')
+                             'Per-session is_face.csv files are read from here.')
+    parser.add_argument('--consensus_dir', type=str, default=None,
+                        help='Consensus annotation directory for this participant '
+                             '({project}/_annotations/consensus/{participant}/). '
+                             'If provided, consensus_is_face.csv takes priority over is_face.csv. '
+                             'Sessions without a consensus file are included with all instances.')
     parser.add_argument('--output_dir', type=str, default=None,
-                        help='Directory where tab3_face_ids.csv is written '
-                             '(defaults to annotations_dir or participant_dir).')
+                        help='Participant directory where face_ids.csv and '
+                             'clustering_stats.txt are written (default: annotations_dir or participant_dir).')
     parser.add_argument('--no-refine', action='store_true',
                         help='Disable small cluster refinement')
     parser.add_argument('--min-cluster-size', type=int, default=5,
@@ -720,6 +755,7 @@ if __name__ == "__main__":
         stage3_graph_clustering(
             participant_dir=args.participant_dir,
             annotations_dir=args.annotations_dir,
+            consensus_dir=args.consensus_dir,
             output_dir=args.output_dir,
             similarity_threshold=args.threshold,
             k_neighbors=args.k_neighbors,

@@ -96,23 +96,26 @@ class ReviewerRegistry:
         """
         return self.project_dir / self.ANNOTATIONS_DIR / reviewer_id
 
-    def get_tab2_annotation_path(self, reviewer_id: str, participant: str, session: str) -> Path:
+    def get_is_face_annotation_path(self, reviewer_id: str, participant: str, session: str) -> Path:
         """
-        {project_dir}/_annotations/{reviewer_id}/{participant}/{session}/tab2_is_face.csv
+        Face/non-face review per session (per reviewer).
+        {project_dir}/_annotations/{reviewer_id}/{participant}/{session}/is_face.csv
         """
-        return self.get_reviewer_dir(reviewer_id) / participant / session / "tab2_is_face.csv"
+        return self.get_reviewer_dir(reviewer_id) / participant / session / "is_face.csv"
 
-    def get_tab3_face_ids_path(self, reviewer_id: str, participant: str) -> Path:
+    def get_face_ids_path(self, participant: str) -> Path:
         """
-        {project_dir}/_annotations/{reviewer_id}/{participant}/tab3_face_ids.csv
+        Face ID clustering output in participant folder (shared among reviewers).
+        {project_dir}/{participant}/face_ids.csv
         """
-        return self.get_reviewer_dir(reviewer_id) / participant / "tab3_face_ids.csv"
+        return self.project_dir / participant / "face_ids.csv"
 
-    def get_tab4_merges_path(self, reviewer_id: str, participant: str) -> Path:
+    def get_merges_path(self, reviewer_id: str, participant: str) -> Path:
         """
-        {project_dir}/_annotations/{reviewer_id}/{participant}/tab4_merges.csv
+        Manual merges and media flags per reviewer, per participant.
+        {project_dir}/_annotations/{reviewer_id}/{participant}/merges.csv
         """
-        return self.get_reviewer_dir(reviewer_id) / participant / "tab4_merges.csv"
+        return self.get_reviewer_dir(reviewer_id) / participant / "merges.csv"
 
     def get_annotations_base_dir(self) -> Path:
         """Return {project_dir}/_annotations/"""
