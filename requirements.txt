@@ -1,12 +1,13 @@
 # ============================================================
 # Face-Diet — single virtual environment (Python 3.10)
 # ============================================================
-# TensorFlow 2.10 and InsightFace require Python 3.10. Use one venv for
-# the GUI and all processing (Tabs 1–4).
+# Python 3.10 is required. Use .python-version (pyenv) or python3.10 -m venv.
+# TensorFlow 2.10 and InsightFace require 3.10.
 #
 # Setup:
+#   pyenv local 3.10  # or use python3.10 directly
 #   python -m venv venv
-#   venv\Scripts\activate
+#   source venv/bin/activate   # or venv\Scripts\activate on Windows
 #   pip install -r requirements.txt
 #   pip install whls/insightface-0.7.3-cp310-cp310-win_amd64.whl  # Windows wheel
 #

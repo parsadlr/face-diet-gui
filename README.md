@@ -44,6 +44,24 @@ Video files
 
 - **Python 3.10** — required by TensorFlow 2.10 (used in attribute extraction) and InsightFace.
 
+### Set Python version
+
+The project includes a `.python-version` file for pyenv/asdf. Use Python 3.10 when creating the venv:
+
+**With pyenv:**
+```bash
+pyenv install 3.10.14   # if not installed
+pyenv local 3.10        # uses .python-version
+```
+
+**Without a version manager:**
+```bash
+# macOS (Homebrew): brew install python@3.10
+# Ubuntu: sudo apt install python3.10 python3.10-venv
+# Then use the full path or python3.10:
+python3.10 -m venv venv
+```
+
 ### Create and activate a virtual environment
 
 ```bash
