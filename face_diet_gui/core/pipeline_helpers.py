@@ -26,16 +26,16 @@ class ProcessingStopped(Exception):
     """Raised when the user stops processing via the Stop button."""
 
 
-def _discard_annotations_for_session(project_dir: Path, participant_name: str, session_name: str) -> None:
+def _discard_annotations_for_session(derivatives_dir: Path, participant_name: str, session_name: str) -> None:
     """
     Remove reviewer annotations that depend on face detection for this session.
     After re-running Stage 1, the following are no longer valid. Deletes for all reviewers:
-    - That session's is_face.csv (face/non-face review)
+    - That session's is_face CSV (face/non-face review)
     - That participant's merges.csv (manual merges and media flags)
-    Face ID clustering output (face_ids.csv in participant folder) is not removed.
+    Face ID clustering output (face-ids.csv in participant folder) is not removed.
     """
     try:
-        registry = ReviewerRegistry(project_dir)
+        registry = ReviewerRegistry(derivatives_dir)
         for reviewer_id in registry.get_reviewer_ids():
             is_face_path = registry.get_is_face_annotation_path(reviewer_id, participant_name, session_name)
             if is_face_path.exists():
@@ -48,12 +48,21 @@ def _discard_annotations_for_session(project_dir: Path, participant_name: str, s
 
 
 def _load_review_status_for_session(registry: ReviewerRegistry, reviewer_id: str, participant: str, session: str) -> Dict:
-    """Load {reviewed: bool} for a session from reviewer's review_status.json. Used for session list."""
-    ann_path = registry.get_is_face_annotation_path(reviewer_id, participant, session)
-    path = ann_path.parent / "review_status.json"
-    if path.exists():
+    """Load {reviewed: bool} for a session from reviewer's review-status.json. Used for session list."""
+    status_path = registry.get_review_status_path(reviewer_id, participant, session)
+    if status_path.exists():
         try:
-            with open(path, "r", encoding="utf-8") as f:
+            with open(status_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return {"reviewed": bool(data.get("reviewed", False))}
+        except Exception:
+            pass
+    # Backward compat: check old-style review_status.json in annotation dir
+    ann_path = registry.get_is_face_annotation_path(reviewer_id, participant, session)
+    legacy_path = ann_path.parent / "review_status.json"
+    if legacy_path.exists():
+        try:
+            with open(legacy_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
             return {"reviewed": bool(data.get("reviewed", False))}
         except Exception:
@@ -62,7 +71,7 @@ def _load_review_status_for_session(registry: ReviewerRegistry, reviewer_id: str
 
 
 def _load_mismatches_resolved_flag(registry: ReviewerRegistry, participant: str, session: str) -> bool:
-    """Load global 'mismatches resolved' flag for a session (Tab 3), from _annotations/consensus/."""
+    """Load global 'mismatches resolved' flag for a session (Tab 3), from annotations/consensus/."""
     path = registry.get_mismatches_resolved_path(participant, session)
     if path.exists():
         try:
@@ -74,32 +83,45 @@ def _load_mismatches_resolved_flag(registry: ReviewerRegistry, participant: str,
     return False
 
 
-def _get_sessions_with_review_status(project_dir: Path) -> List[Dict]:
+def _get_sessions_with_review_status(derivatives_dir: Path) -> List[Dict]:
     """
-    For each session (participant/session with face_detections.csv), return:
-    - reviewers_with_tab2_count: number of reviewers who have submitted AND marked session as fully reviewed
-    - mismatch_count: instances where those reviewers disagree (vs consensus if saved, else pairwise)
-    - resolved: 2+ such reviewers AND mismatch_count == 0
+    Scan derivatives_dir for participants/sessions that have a BIDS face-detections CSV.
+    For each found session, return review status information.
+
+    Skips the 'annotations/' subdirectory.
     """
-    registry = ReviewerRegistry(project_dir)
+    registry = ReviewerRegistry(derivatives_dir)
     reviewer_ids = registry.get_reviewer_ids()
     result = []
-    for participant_dir in sorted(project_dir.iterdir()):
-        if not participant_dir.is_dir() or participant_dir.name.startswith(("_", ".")):
+
+    for participant_dir in sorted(derivatives_dir.iterdir()):
+        if not participant_dir.is_dir():
+            continue
+        if participant_dir.name in ("annotations",) or participant_dir.name.startswith(("_", ".")):
             continue
         participant = participant_dir.name
+
         for session_dir in sorted(participant_dir.iterdir()):
-            if not session_dir.is_dir() or (session_dir / "face_detections.csv").exists() is False:
+            if not session_dir.is_dir() or session_dir.name.startswith(("_", ".")):
                 continue
             session = session_dir.name
-            if session.startswith(("_", ".")):
+
+            # BIDS face-detections CSV
+            bids_csv = session_dir / f"{participant}_{session}_face-detections.csv"
+            if not bids_csv.exists():
                 continue
-            with_tab2 = [rid for rid in reviewer_ids if registry.get_is_face_annotation_path(rid, participant, session).exists()]
-            reviewers_with_tab2 = [rid for rid in with_tab2 if _load_review_status_for_session(registry, rid, participant, session).get("reviewed", False)]
+
+            with_tab2 = [rid for rid in reviewer_ids
+                         if registry.get_is_face_annotation_path(rid, participant, session).exists()]
+            reviewers_with_tab2 = [
+                rid for rid in with_tab2
+                if _load_review_status_for_session(registry, rid, participant, session).get("reviewed", False)
+            ]
+
             mismatch_count = 0
             if len(reviewers_with_tab2) >= 2:
                 try:
-                    df = pd.read_csv(session_dir / "face_detections.csv")
+                    df = pd.read_csv(bids_csv)
                     if "confidence" in df.columns:
                         df = df.sort_values("confidence", ascending=True).reset_index(drop=True)
                     indices = list(df.index)
@@ -107,15 +129,23 @@ def _get_sessions_with_review_status(project_dir: Path) -> List[Dict]:
                     for rid in reviewers_with_tab2:
                         ann_path = registry.get_is_face_annotation_path(rid, participant, session)
                         ann_df = pd.read_csv(ann_path)
-                        per_reviewer[rid] = dict(zip(ann_df["instance_index"].astype(int), ann_df["is_face"].astype(bool)))
+                        per_reviewer[rid] = dict(
+                            zip(ann_df["instance_index"].astype(int), ann_df["is_face"].astype(bool))
+                        )
                     consensus_path = registry.get_consensus_annotation_path(participant, session)
                     if consensus_path.exists():
                         try:
                             consensus_mtime = consensus_path.stat().st_mtime
                             cons_df = pd.read_csv(consensus_path)
-                            consensus = dict(zip(cons_df["instance_index"].astype(int), cons_df["is_face"].astype(bool)))
-                            post_consensus = [rid for rid in reviewers_with_tab2
-                                              if registry.get_is_face_annotation_path(rid, participant, session).stat().st_mtime > consensus_mtime]
+                            consensus = dict(
+                                zip(cons_df["instance_index"].astype(int), cons_df["is_face"].astype(bool))
+                            )
+                            post_consensus = [
+                                rid for rid in reviewers_with_tab2
+                                if registry.get_is_face_annotation_path(
+                                    rid, participant, session
+                                ).stat().st_mtime > consensus_mtime
+                            ]
                             for idx in indices:
                                 cons_val = consensus.get(int(idx), True)
                                 for rid in post_consensus:
@@ -131,6 +161,7 @@ def _get_sessions_with_review_status(project_dir: Path) -> List[Dict]:
                                 mismatch_count += 1
                 except Exception:
                     pass
+
             resolved = (len(reviewers_with_tab2) >= 2 and mismatch_count == 0)
             result.append({
                 "participant": participant,
@@ -158,30 +189,17 @@ def _format_time(seconds: float) -> str:
 
 
 def _run_stage1_via_subprocess(session_dir: str, sampling_rate: int, use_gpu: bool,
-                               min_confidence: float, reporter, debug_mode: bool = False,
+                               min_confidence: float, reporter,
+                               output_csv: Optional[str] = None,
+                               use_interval_sampling: bool = False,
+                               interval_length: float = 30.0,
+                               num_intervals: int = 5,
+                               min_face_fraction: float = 0.1,
                                settings=None,
                                process_holder: Optional[List] = None,
                                stop_check: Optional[Callable[[], bool]] = None):
     """Run detect_faces via subprocess using python -m face_diet_gui.stages.detect_faces."""
-    import cv2
-
     processing_python = Path(sys.executable)
-    end_time = None
-    if debug_mode:
-        session_path = Path(session_dir)
-        video_files = list(session_path.glob("scenevideo.*"))
-        if video_files:
-            try:
-                cap = cv2.VideoCapture(str(video_files[0]))
-                if cap.isOpened():
-                    fps = cap.get(cv2.CAP_PROP_FPS)
-                    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-                    video_duration = total_frames / fps if fps > 0 else 0.0
-                    end_time = video_duration * 0.05
-                    cap.release()
-                    reporter.log(f"DEBUG MODE: Processing only first 5% of video ({end_time:.1f}s)")
-            except Exception as e:
-                reporter.log(f"Warning: Could not calculate video duration for debug mode: {e}")
 
     cmd = [
         str(processing_python),
@@ -194,8 +212,15 @@ def _run_stage1_via_subprocess(session_dir: str, sampling_rate: int, use_gpu: bo
     ]
     if use_gpu:
         cmd.append("--gpu")
-    if end_time is not None:
-        cmd.extend(["--end-time", str(end_time)])
+    if output_csv:
+        cmd.extend(["--output-csv", str(output_csv)])
+    if use_interval_sampling:
+        cmd.extend([
+            "--use-interval-sampling",
+            "--interval-length", str(interval_length),
+            "--num-intervals", str(num_intervals),
+            "--min-face-fraction", str(min_face_fraction),
+        ])
 
     process = subprocess.Popen(
         cmd,
@@ -261,23 +286,12 @@ def _run_stage1_via_subprocess(session_dir: str, sampling_rate: int, use_gpu: bo
 
 
 def _run_stage2_via_subprocess(session_dir: str, batch_size: int, reporter,
-                               debug_mode: bool = False, settings=None,
+                               input_csv: Optional[str] = None,
+                               video_path: Optional[str] = None,
+                               settings=None,
                                process_holder: Optional[List] = None,
                                stop_check: Optional[Callable[[], bool]] = None):
     """Run extract_attributes via subprocess using python -m face_diet_gui.stages.extract_attributes."""
-    limit = None
-    if debug_mode:
-        session_path = Path(session_dir)
-        csv_path = session_path / "face_detections.csv"
-        if csv_path.exists():
-            try:
-                df = pd.read_csv(csv_path)
-                total_faces = len(df)
-                limit = max(1, int(total_faces * 0.05))
-                reporter.log(f"DEBUG MODE: Processing only first {limit} faces (5% of {total_faces} total)")
-            except Exception as e:
-                reporter.log(f"Warning: Could not calculate face limit for debug mode: {e}")
-
     processing_python = Path(sys.executable)
     cmd = [
         str(processing_python),
@@ -287,8 +301,10 @@ def _run_stage2_via_subprocess(session_dir: str, batch_size: int, reporter,
         session_dir,
         "--batch-size", str(batch_size),
     ]
-    if limit is not None:
-        cmd.extend(["--limit", str(limit)])
+    if input_csv:
+        cmd.extend(["--input-csv", str(input_csv)])
+    if video_path:
+        cmd.extend(["--video-path", str(video_path)])
 
     process = subprocess.Popen(
         cmd,

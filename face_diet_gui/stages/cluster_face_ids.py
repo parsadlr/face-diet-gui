@@ -84,17 +84,23 @@ def load_all_sessions(
     ann_base = Path(annotations_dir) if annotations_dir else None
     cons_base = Path(consensus_dir) if consensus_dir else None
 
-    # Find all session CSVs (skip hidden / reserved dirs)
+    # Find all session CSVs (skip hidden / reserved dirs).
+    # Supports both BIDS naming ({p}_{s}_face-detections.csv) and legacy (face_detections.csv).
+    participant_name = participant_path.name
     session_csvs = []
     for session_dir in sorted(participant_path.iterdir()):
         if not session_dir.is_dir():
             continue
         if session_dir.name.startswith('.') or session_dir.name.startswith('_'):
             continue
-        face_csv = session_dir / "face_detections.csv"
-        if face_csv.exists():
+        session_name = session_dir.name
+        # Try BIDS name first, fall back to legacy
+        bids_csv = session_dir / f"{participant_name}_{session_name}_face-detections.csv"
+        legacy_csv = session_dir / "face_detections.csv"
+        face_csv = bids_csv if bids_csv.exists() else (legacy_csv if legacy_csv.exists() else None)
+        if face_csv is not None:
             session_csvs.append({
-                'session_name': session_dir.name,
+                'session_name': session_name,
                 'session_dir': session_dir,
                 'csv_path': face_csv,
             })
@@ -124,7 +130,10 @@ def load_all_sessions(
         # Priority 1: consensus annotation for this session
         annotation_applied = False
         if cons_base is not None:
-            cons_file = cons_base / session['session_name'] / "consensus_is_face.csv"
+            # Try BIDS name first, then legacy name
+            bids_cons = cons_base / session['session_name'] / f"{participant_name}_{session['session_name']}_consensus-is-face.csv"
+            legacy_cons = cons_base / session['session_name'] / "consensus_is_face.csv"
+            cons_file = bids_cons if bids_cons.exists() else legacy_cons
             if cons_file.exists():
                 try:
                     ann_df = pd.read_csv(cons_file)
@@ -143,7 +152,10 @@ def load_all_sessions(
 
         # Priority 2: reviewer face/non-face annotations (only if no consensus for this session)
         if not annotation_applied and ann_base is not None:
-            annotation_file = ann_base / session['session_name'] / "is_face.csv"
+            # Try BIDS name first, then legacy name
+            bids_ann = ann_base / session['session_name'] / f"{participant_name}_{session['session_name']}_is-face.csv"
+            legacy_ann = ann_base / session['session_name'] / "is_face.csv"
+            annotation_file = bids_ann if bids_ann.exists() else legacy_ann
             if annotation_file.exists():
                 try:
                     ann_df = pd.read_csv(annotation_file)
@@ -642,14 +654,15 @@ def cluster_face_ids(
     print("STEP 6: SAVING RESULTS")
     print("=" * 80)
 
-    face_ids_file = out_path / "face_ids.csv"
+    participant_name_out = participant_path.name
+    face_ids_file = out_path / f"{participant_name_out}_face-ids.csv"
     overlay_df = combined_df[['session_name', 'instance_index', 'face_id']].copy()
     overlay_df.to_csv(face_ids_file, index=False)
     print(f"  [OK] Face ID overlay saved: {face_ids_file}")
     print(f"       {len(overlay_df):,} rows, {final_num_unique_ids} unique IDs")
 
     # Write stats
-    stats_file = out_path / "clustering_stats.txt"
+    stats_file = out_path / f"{participant_name_out}_clustering-stats.txt"
     with open(stats_file, 'w') as f:
         f.write("Stage 3 — Global Face ID Assignment Statistics\n")
         f.write("=" * 80 + "\n\n")

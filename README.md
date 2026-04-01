@@ -122,10 +122,11 @@ python -m face_diet_gui
 
 On launch a setup dialog appears asking for:
 
-- **Project directory** — the root folder containing participant subfolders.
-- **Reviewer ID** — select an existing reviewer or type a new name to create one. The reviewer list is stored in `{project_dir}/_annotations/reviewers.json` and is shared across all users of the same project directory.
+- **Data directory** — root of your raw BIDS-style layout (`sub-XX/ses-YY/…` with `scenevideo.*` per session). Used to read videos and optional `eye_tracking.tsv`.
+- **Derivatives directory** — root where pipeline outputs and all annotations are written. The shared reviewer registry lives at `{derivatives}/annotations/reviewers.json`.
+- **Reviewer ID** — select an existing reviewer or type a new name to create one.
 
-The last-used values are remembered across sessions (`~/.face_diet_config.json`).
+The last-used directories and reviewer are remembered across sessions (`~/.face_diet_config.json`).
 
 ---
 
@@ -137,12 +138,13 @@ Runs face detection and optionally attribute extraction via subprocess, one sess
 
 | Setting | Description |
 |---|---|
-| Sampling rate | Process every N frames (e.g. 30 = 1 fps for 30 fps video) |
+| Downsampling | When enabled, run detection on every *N*th frame (`factor`); when off, every frame is considered. |
+| Interval sampling | Optional alternative to scanning the whole video: randomly pick up to *N* non-overlapping windows of *L* seconds that pass a quick face-density pre-check (`min face fraction`). |
 | Min confidence | Filter out low-confidence detections (0.0–1.0) |
 | GPU | Use ONNX GPU runtime for faster detection |
-| Start / end time | Restrict processing to a time window |
+| Batch size | Stage 2 (DeepFace) batch size |
 
-**Output per session:** `face_detections.csv` — bounding boxes, 512-dim face embeddings, yaw/pitch/roll pose angles, and an `attended` flag (derived from eye-tracking data if `eye_tracking.tsv` is present). Attribute extraction (age, gender, race, emotion) updates this same file in-place.
+**Output per session (under derivatives):** `{participant}_{session}_face-detections.csv` — bounding boxes, 512-dim embeddings, pose, `attended` (if `eye_tracking.tsv` is present). Attribute extraction updates this file in-place. Videos are read from the **data** directory; CSVs are written under **derivatives** with BIDS-style filenames.
 
 > Re-running face detection for a session automatically invalidates and removes that session's existing reviewer annotations (face/non-face labels and manual merges) to keep data consistent.
 
@@ -154,7 +156,7 @@ Manual review of every detected face crop in a session. The reviewer marks each 
 
 Labels are saved as a per-reviewer overlay and never modify the base detection CSV, so multiple reviewers can label the same session independently.
 
-**Output:** `_annotations/{reviewer_id}/{participant}/{session}/is_face.csv`
+**Output:** `{derivatives}/annotations/{reviewer_id}/{participant}/{session}/{participant}_{session}_is-face.csv`
 
 ---
 
@@ -162,7 +164,7 @@ Labels are saved as a per-reviewer overlay and never modify the base detection C
 
 When two or more reviewers have labeled the same session, this tab highlights detections where they disagree. The current reviewer can inspect each mismatch and cast a deciding vote, producing a shared consensus label used downstream by clustering.
 
-**Output:** `_annotations/consensus/{participant}/{session}/consensus_is_face.csv` — stored in a shared `consensus/` directory (not per-reviewer).
+**Output:** `{derivatives}/annotations/consensus/{participant}/{session}/{participant}_{session}_consensus-is-face.csv` (shared, not per-reviewer).
 
 ---
 
@@ -177,7 +179,7 @@ Runs graph-based community detection for a selected participant. Loads all sessi
 | Algorithm | Leiden (default, higher quality) or Louvain |
 | Enable refinement | Re-assign small clusters via k-NN voting |
 
-**Output:** `{participant}/face_ids.csv` and `{participant}/clustering_stats.txt` — written directly to the participant folder and shared across reviewers.
+**Output:** `{derivatives}/{participant}/{participant}_face-ids.csv` and `{derivatives}/{participant}/{participant}_clustering-stats.txt` — shared across reviewers.
 
 ---
 
@@ -185,67 +187,87 @@ Runs graph-based community detection for a selected participant. Loads all sessi
 
 Manual review and correction of the clustering output. The reviewer can browse face IDs, view sample crops, and merge two IDs that the algorithm split incorrectly.
 
-**Output:** `_annotations/{reviewer_id}/{participant}/merges.csv` — merge decisions and media flags.
+**Output:** `{derivatives}/annotations/{reviewer_id}/{participant}/merges.csv` — merge decisions and media flags.
 
 ---
 
-## 🗂️ Data Directory Structure
+## 🗂️ Data layout (two roots)
+
+**Data directory (raw):** participant / session folders with media only — e.g. `sub-01/ses-01/scenevideo.mp4` and optional `eye_tracking.tsv`. Nothing under `annotations/`.
+
+**Derivatives directory (outputs):** everything the app writes — BIDS-style CSV names, plus `annotations/` for reviewers and consensus.
 
 ```
-project_root/
-├── _annotations/
-│   ├── reviewers.json                        ← shared reviewer registry
-│   ├── alice/                                ← per-reviewer overlays
-│   │   └── participant_01/
-│   │       ├── session_a/
-│   │       │   ├── is_face.csv               ← Tab 2: face/non-face labels
-│   │       │   └── review_status.json        ← Tab 2: reviewed flag
-│   │       └── merges.csv                    ← Tab 5: ID merge decisions
-│   ├── bob/
-│   │   └── ...
-│   └── consensus/                            ← shared across reviewers (Tab 3)
-│       └── participant_01/
-│           └── session_a/
-│               ├── consensus_is_face.csv     ← Tab 3: resolved consensus labels
-│               └── mismatches_resolved.json  ← Tab 3: resolution flag
-├── participant_01/
-│   ├── face_ids.csv                          ← Tab 4 clustering output (shared)
-│   ├── clustering_stats.txt                  ← Tab 4 clustering stats (shared)
-│   ├── session_a/
-│   │   ├── scenevideo.mp4                    ← required: source video
-│   │   ├── eye_tracking.tsv                  ← optional: gaze data
-│   │   └── face_detections.csv               ← Tab 1 output (shared base data)
-│   └── session_b/
-│       └── ...
-└── participant_02/
-    └── ...
+data_dir/
+└── sub-01/
+    └── ses-01/
+        ├── scenevideo.mp4
+        └── eye_tracking.tsv              ← optional
+
+derivatives_dir/
+├── annotations/
+│   ├── reviewers.json
+│   ├── alice/                          ← per-reviewer overlays
+│   │   └── sub-01/
+│   │       ├── ses-01/
+│   │       │   ├── sub-01_ses-01_is-face.csv
+│   │       │   └── sub-01_ses-01_review-status.json
+│   │       └── merges.csv              ← Tab 5
+│   └── consensus/                      ← Tab 3 (shared)
+│       └── sub-01/
+│           └── ses-01/
+│               ├── sub-01_ses-01_consensus-is-face.csv
+│               └── sub-01_ses-01_mismatches-resolved.json
+└── sub-01/
+    ├── sub-01_face-ids.csv             ← Tab 4 (shared)
+    ├── sub-01_clustering-stats.txt
+    └── ses-01/
+        └── sub-01_ses-01_face-detections.csv   ← Tab 1 (shared base)
 ```
 
-The GUI skips `_annotations/` when scanning for participants.
+The session tree in Tab 1 is built from the **data** directory; detection status and downstream tabs use paths under **derivatives**.
+
+### Eye tracking export (Tobii Pro Lab)
+
+Face detection reads gaze from **`eye_tracking.tsv`** in each session folder (next to `scenevideo.*`). To export from **Tobii Pro Lab**:
+
+1. Add your recordings to a Tobii Pro Lab project.
+2. Open **Data export** (top right).
+3. Under **Data fields**, enable the **Eye tracking data** group.
+4. Set **Format** to standard files (`.tsv`) — either one file per recording or a single combined file, depending on your workflow; one TSV per session is easiest to place per folder.
+5. Leave **Export units** disabled (unchecked) so gaze columns stay **`Gaze point X`** / **`Gaze point Y`** without `[MCS px]` suffixes.
+6. Set **Timestamp precision** to **milliseconds** (the timestamp column may appear as **`Recording timestamp`** or **`Recording timestamp [ms]`** depending on Pro Lab version — both are accepted).
+7. Set **Gaze filter** to **Tobii I-VT (Attention)**.
+8. Enable **Recording gaze data**.
+9. Run the export. You get a separate `.tsv` per recording; copy or rename each into the correct **`data_dir/{participant}/{session}/`** folder as **`eye_tracking.tsv`** so the GUI and detection stage can find it (rename if Tobii’s default filename differs).
+
+The pipeline requires these header names (exact match after trimming): **`Sensor`**, **`Gaze point X`**, **`Gaze point Y`**, and a recording timestamp column **`Recording timestamp`** or **`Recording timestamp [ms]`**. Rows with **`Sensor`** = **`Eye Tracker`** are used for gaze.
 
 ---
 
 ## 📋 Output Files Reference
 
+Paths are relative to **derivatives**. `{p}` = participant ID, `{s}` = session ID.
+
 | File | Location | Written by | Contents |
 |---|---|---|---|
-| `face_detections.csv` | `{participant}/{session}/` | Tab 1 | Bounding boxes, embeddings, pose, attended flag; demographic attributes added in-place by attribute extraction |
-| `is_face.csv` | `_annotations/{reviewer}/{participant}/{session}/` | Tab 2 | Per-detection face/non-face label |
-| `review_status.json` | `_annotations/{reviewer}/{participant}/{session}/` | Tab 2 | `{"reviewed": true/false}` flag |
-| `consensus_is_face.csv` | `_annotations/consensus/{participant}/{session}/` | Tab 3 | Consensus label after mismatch resolution (shared) |
-| `mismatches_resolved.json` | `_annotations/consensus/{participant}/{session}/` | Tab 3 | Flag marking when all mismatches are resolved (shared) |
-| `face_ids.csv` | `{participant}/` | Tab 4 | Global face ID per detection (shared across reviewers) |
-| `clustering_stats.txt` | `{participant}/` | Tab 4 | Clustering statistics (shared across reviewers) |
-| `merges.csv` | `_annotations/{reviewer}/{participant}/` | Tab 5 | Manual ID merge decisions and media flags |
+| `{p}_{s}_face-detections.csv` | `{p}/{s}/` | Tab 1 | Bounding boxes, embeddings, pose, attended; attributes updated in-place in stage 2 |
+| `{p}_{s}_is-face.csv` | `annotations/{reviewer}/{p}/{s}/` | Tab 2 | Per-detection face/non-face label |
+| `{p}_{s}_review-status.json` | `annotations/{reviewer}/{p}/{s}/` | Tab 2 | `{"reviewed": true/false}` |
+| `{p}_{s}_consensus-is-face.csv` | `annotations/consensus/{p}/{s}/` | Tab 3 | Consensus after mismatch resolution (shared) |
+| `{p}_{s}_mismatches-resolved.json` | `annotations/consensus/{p}/{s}/` | Tab 3 | Resolution flag (shared) |
+| `{p}_face-ids.csv` | `{p}/` | Tab 4 | Global face ID per detection (shared) |
+| `{p}_clustering-stats.txt` | `{p}/` | Tab 4 | Clustering statistics (shared) |
+| `merges.csv` | `annotations/{reviewer}/{p}/` | Tab 5 | ID merges and media flags |
 
-`face_detections.csv` is the shared base data — written by face detection, updated in-place by attribute extraction, and never modified by the review workflow. `face_ids.csv` and `clustering_stats.txt` are also shared (written to the participant folder directly). All reviewer-specific decisions live under `_annotations/{reviewer_id}/`.
+Face-detections CSV is the shared base for review tabs. Reviewer-specific files live under `annotations/{reviewer}/`. Stage scripts still accept legacy names (`face_detections.csv`, etc.) where noted in their CLI help.
 
 ---
 
 ## 👥 Multi-Reviewer Workflow
 
-1. All reviewers point the app at the **same project directory** on a shared drive (or each work on a local copy and merge later).
-2. Face detection and attribute extraction are run once — their outputs are shared base data.
+1. All reviewers use the **same derivatives directory** (and typically the same data directory) on a shared drive, or merge those trees later.
+2. Face detection and attribute extraction write shared base CSVs under derivatives — run once per session unless you intentionally re-run.
 3. Each reviewer completes Tab 2 independently, writing to their own subdirectory under `_annotations/`.
 4. Tab 3 computes pairwise mismatches and lets each reviewer resolve disagreements.
 5. Tab 4 clustering respects each reviewer's consensus annotations when filtering detections.

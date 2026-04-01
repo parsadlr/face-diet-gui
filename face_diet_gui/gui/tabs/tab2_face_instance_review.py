@@ -37,16 +37,19 @@ class FaceInstanceReviewTab(ctk.CTkFrame):
     """Tab 2: Face Instance Review - Manual review of detected faces before clustering."""
 
     def __init__(self, master, settings_manager: SettingsManager,
-                 project_dir: Path, reviewer_id: str):
+                 data_dir: Path, derivatives_dir: Path, reviewer_id: str):
         super().__init__(master)
         self.settings = settings_manager
-        self.project_dir: Path = project_dir
+        self.data_dir: Path = Path(data_dir)
+        self.derivatives_dir: Path = Path(derivatives_dir)
         self.reviewer_id: str = reviewer_id
 
         # Selected participant / session
         self.selected_participant: Optional[str] = None
         self.selected_session: Optional[str] = None
+        # session_dir in data_dir (for video); detections_csv in derivatives_dir
         self.session_dir: Optional[Path] = None
+        self.detections_csv: Optional[Path] = None
 
         # Data storage
         self.df: Optional[pd.DataFrame] = None
@@ -216,17 +219,21 @@ class FaceInstanceReviewTab(ctk.CTkFrame):
         self.pagination_frame.pack(fill="x", pady=(0, 6))
         row = ctk.CTkFrame(self.pagination_frame, fg_color="transparent")
         row.pack(fill="x", padx=0, pady=4)
-        # Page info (left); go-to-page entry; page numbers (right)
+
+        left = ctk.CTkFrame(row, fg_color="transparent")
+        left.pack(side="left", fill="x", expand=True)
+        # Page info, go-to-page, page nav — left; sort mode — right of row
         self.page_info_label = ctk.CTkLabel(
-            row,
+            left,
             text="Load a session to see instances and pages",
-            font=ctk.CTkFont(size=11),
+            font=ctk.CTkFont(size=13),
             text_color="gray"
         )
         self.page_info_label.pack(side="left", padx=(0, 15))
-        ctk.CTkLabel(row, text="Go to page:", font=ctk.CTkFont(size=11), text_color="gray").pack(side="left", padx=(10, 4))
-        self.page_go_entry = ctk.CTkEntry(row, width=50, font=ctk.CTkFont(size=11), state="disabled")
+        ctk.CTkLabel(left, text="Go to page:", font=ctk.CTkFont(size=13), text_color="gray").pack(side="left", padx=(10, 4))
+        self.page_go_entry = ctk.CTkEntry(left, width=50, font=ctk.CTkFont(size=13), state="disabled")
         self.page_go_entry.pack(side="left", padx=(0, 4))
+
         def _on_page_go_tab2():
             try:
                 n = int(self.page_go_entry.get().strip())
@@ -234,12 +241,67 @@ class FaceInstanceReviewTab(ctk.CTkFrame):
                     self._go_to_page(n - 1)
             except (ValueError, tkinter.TclError):
                 pass
-        self.page_go_btn = ctk.CTkButton(row, text="Go", width=40, height=24, font=ctk.CTkFont(size=11), command=_on_page_go_tab2, state="disabled")
+
+        self.page_go_btn = ctk.CTkButton(left, text="Go", width=40, height=24, font=ctk.CTkFont(size=13), command=_on_page_go_tab2, state="disabled")
         self.page_go_btn.pack(side="left", padx=(0, 12))
         self.page_go_entry.bind("<Return>", lambda e: _on_page_go_tab2())
-        self.page_numbers_frame = ctk.CTkFrame(row, fg_color="transparent")
+        self.page_numbers_frame = ctk.CTkFrame(left, fg_color="transparent")
         self.page_numbers_frame.pack(side="left", padx=0, pady=0)
-    
+
+        sort_row = ctk.CTkFrame(row, fg_color="transparent")
+        sort_row.pack(side="right", padx=(12, 0))
+        ctk.CTkLabel(
+            sort_row,
+            text="Sort by:",
+            font=ctk.CTkFont(size=13),
+            text_color="gray",
+        ).pack(side="left", padx=(0, 6))
+        self._sort_mode_choice_font = ctk.CTkFont(size=13)
+        self.sort_label_timestamp = ctk.CTkLabel(
+            sort_row,
+            text="timestamp",
+            font=self._sort_mode_choice_font,
+            text_color=("gray10", "gray90"),
+        )
+        self.sort_label_timestamp.pack(side="left", padx=(0, 4))
+        self.sort_by_conf_var = ctk.BooleanVar(value=False)  # False = timestamp, True = confidence
+        self.sort_by_conf_switch = ctk.CTkSwitch(
+            sort_row,
+            text="",
+            variable=self.sort_by_conf_var,
+            command=self._on_sort_mode_changed,
+            onvalue=True,
+            offvalue=False,
+            width=42,
+            state="disabled",
+        )
+        self.sort_by_conf_switch.pack(side="left", padx=2)
+        self.sort_label_confidence = ctk.CTkLabel(
+            sort_row,
+            text="confidence",
+            font=self._sort_mode_choice_font,
+            text_color="gray",
+        )
+        self.sort_label_confidence.pack(side="left", padx=(4, 0))
+        self._refresh_sort_mode_labels()
+
+    def _refresh_sort_mode_labels(self):
+        """Same font for both labels (no layout shift); active = theme text, other = gray."""
+        if not hasattr(self, "sort_label_timestamp"):
+            return
+        active_color = ("gray10", "gray90")
+        dim_color = "gray"
+        if self.sort_by_conf_switch.cget("state") == "disabled":
+            self.sort_label_timestamp.configure(text_color=dim_color)
+            self.sort_label_confidence.configure(text_color=dim_color)
+            return
+        if self.sort_by_conf_var.get():
+            self.sort_label_timestamp.configure(text_color=dim_color)
+            self.sort_label_confidence.configure(text_color=active_color)
+        else:
+            self.sort_label_timestamp.configure(text_color=active_color)
+            self.sort_label_confidence.configure(text_color=dim_color)
+
     def _create_action_buttons(self):
         """Create action buttons fixed at bottom of tab."""
         action_frame = ctk.CTkFrame(self)
@@ -261,11 +323,13 @@ class FaceInstanceReviewTab(ctk.CTkFrame):
         self.save_btn.configure(fg_color=BTN_DISABLED_FG)  # initial disabled look
         self.save_btn.pack(anchor="center", pady=5)
     
+    def _get_registry(self) -> "ReviewerRegistry":
+        return ReviewerRegistry(self.derivatives_dir)
+
     def _get_review_status_path(self, participant: str, session: str) -> Path:
-        """Path to review_status.json for this reviewer/participant/session."""
-        registry = ReviewerRegistry(self.project_dir)
-        ann_path = registry.get_is_face_annotation_path(self.reviewer_id, participant, session)
-        return ann_path.parent / "review_status.json"
+        """Path to review-status.json for this reviewer/participant/session."""
+        registry = self._get_registry()
+        return registry.get_review_status_path(self.reviewer_id, participant, session)
 
     def _load_review_status(self, participant: str, session: str) -> Dict:
         """Load {reviewed: bool, last_save: str|None} for this session."""
@@ -280,8 +344,8 @@ class FaceInstanceReviewTab(ctk.CTkFrame):
                 }
             except Exception:
                 pass
-        # If no status file, use tab2 CSV mtime as last_save for display
-        registry = ReviewerRegistry(self.project_dir)
+        # If no status file, use is-face CSV mtime as last_save for display
+        registry = self._get_registry()
         ann_path = registry.get_is_face_annotation_path(self.reviewer_id, participant, session)
         last_save = None
         if ann_path.exists():
@@ -315,19 +379,26 @@ class FaceInstanceReviewTab(ctk.CTkFrame):
         except Exception:
             return last_save_iso[:16] if last_save_iso else "not saved"
 
+    def _bids_detections_csv(self, participant: str, session: str) -> Path:
+        return self.derivatives_dir / participant / session / f"{participant}_{session}_face-detections.csv"
+
     def _refresh_session_dropdown(self):
         """Rebuild session list for current participant and keep current session selected."""
         if not self.selected_participant or not self.selected_session:
             return
         choice = self.selected_participant
-        p_path = self.project_dir / choice
-        sessions = sorted([
-            d.name for d in p_path.iterdir()
-            if d.is_dir()
-            and not d.name.startswith('_')
-            and not d.name.startswith('.')
-            and (d / "face_detections.csv").exists()
-        ])
+        # Scan derivatives_dir for sessions with BIDS face-detections CSV
+        p_path = self.derivatives_dir / choice
+        if not p_path.exists():
+            sessions = []
+        else:
+            sessions = sorted([
+                d.name for d in p_path.iterdir()
+                if d.is_dir()
+                and not d.name.startswith('_')
+                and not d.name.startswith('.')
+                and self._bids_detections_csv(choice, d.name).exists()
+            ])
         display_values = []
         for sname in sessions:
             status = self._load_review_status(choice, sname)
@@ -344,9 +415,10 @@ class FaceInstanceReviewTab(ctk.CTkFrame):
                 self.session_var.set(disp)
                 break
 
-    def update_project_and_reviewer(self, project_dir: Path, reviewer_id: str):
-        """Called when user changes project or reviewer via Back to setup."""
-        self.project_dir = project_dir
+    def update_dirs_and_reviewer(self, data_dir: Path, derivatives_dir: Path, reviewer_id: str):
+        """Called when user changes dirs or reviewer via Back to setup."""
+        self.data_dir = Path(data_dir)
+        self.derivatives_dir = Path(derivatives_dir)
         self.reviewer_id = reviewer_id
 
     def _on_reviewed_checkbox_changed(self):
@@ -370,8 +442,8 @@ class FaceInstanceReviewTab(ctk.CTkFrame):
             messagebox.showinfo("Session not reviewed", f"Marked as not fully reviewed:\n{session_label}")
 
     def _populate_participants_dropdown(self):
-        """Populate the participant dropdown from the project directory."""
-        if not self.project_dir or not self.project_dir.exists():
+        """Populate the participant dropdown from the derivatives directory (sub-XX with detections)."""
+        if not self.derivatives_dir or not self.derivatives_dir.exists():
             self.participant_dropdown.configure(values=["— select —"])
             self.participant_var.set("— select —")
             self.session_dropdown.configure(values=["— select —"])
@@ -379,8 +451,11 @@ class FaceInstanceReviewTab(ctk.CTkFrame):
             return
 
         participants = sorted([
-            d.name for d in self.project_dir.iterdir()
-            if d.is_dir() and not d.name.startswith('_') and not d.name.startswith('.')
+            d.name for d in self.derivatives_dir.iterdir()
+            if d.is_dir()
+            and not d.name.startswith('_')
+            and not d.name.startswith('.')
+            and d.name != "annotations"
         ])
         values = ["— select —"] + participants
         self.participant_dropdown.configure(values=values)
@@ -402,15 +477,18 @@ class FaceInstanceReviewTab(ctk.CTkFrame):
         self.check_all_page_btn.configure(state=state)
         self.uncheck_all_page_btn.configure(state=state)
         self.apply_btn.configure(state=state)
+        self.sort_by_conf_switch.configure(state=state)
         if not enabled:
             self.page_info_label.configure(text="Load a session to see instances and pages")
             for w in self.page_numbers_frame.winfo_children():
                 w.destroy()
             self.page_go_entry.configure(state="disabled")
             self.page_go_btn.configure(state="disabled")
+            self.sort_by_conf_var.set(False)
         else:
             self.page_go_entry.configure(state="normal")
             self.page_go_btn.configure(state="normal")
+        self._refresh_sort_mode_labels()
 
     def _on_participant_selected_dropdown(self, choice: str):
         """Called when participant dropdown selection changes."""
@@ -427,14 +505,17 @@ class FaceInstanceReviewTab(ctk.CTkFrame):
         self.load_btn.configure(state="disabled")
         self._set_session_loaded_controls(False)
 
-        p_path = self.project_dir / choice
-        sessions = sorted([
-            d.name for d in p_path.iterdir()
-            if d.is_dir()
-            and not d.name.startswith('_')
-            and not d.name.startswith('.')
-            and (d / "face_detections.csv").exists()
-        ])
+        p_path = self.derivatives_dir / choice
+        if not p_path.exists():
+            sessions = []
+        else:
+            sessions = sorted([
+                d.name for d in p_path.iterdir()
+                if d.is_dir()
+                and not d.name.startswith('_')
+                and not d.name.startswith('.')
+                and self._bids_detections_csv(choice, d.name).exists()
+            ])
         display_values = []
         for sname in sessions:
             status = self._load_review_status(choice, sname)
@@ -464,21 +545,23 @@ class FaceInstanceReviewTab(ctk.CTkFrame):
             messagebox.showerror("Error", "Please select a participant and session.")
             return
 
-        self.session_dir = self.project_dir / self.selected_participant / self.selected_session
+        # Video is in data_dir; CSV is in derivatives_dir
+        self.session_dir = self.data_dir / self.selected_participant / self.selected_session
+        self.detections_csv = self._bids_detections_csv(self.selected_participant, self.selected_session)
 
         # Load data in background thread
         thread = threading.Thread(target=self._load_data_thread, daemon=True)
         thread.start()
-    
+
     def _load_data_thread(self):
         """Load face detections in background thread."""
         try:
-            csv_path = self.session_dir / "face_detections.csv"
-            
+            csv_path = self.detections_csv
+
             if not csv_path.exists():
                 self.after(0, lambda: messagebox.showerror(
                     "Error",
-                    f"Could not find face_detections.csv in:\n{self.session_dir}"
+                    f"Could not find face-detections CSV at:\n{csv_path}"
                 ))
                 return
             
@@ -491,9 +574,11 @@ class FaceInstanceReviewTab(ctk.CTkFrame):
             # Load existing annotations if they exist (for this session only)
             self._load_existing_annotations()
             
-            # Sort by confidence (lowest first)
-            if 'confidence' in self.df.columns:
-                self.df = self.df.sort_values('confidence', ascending=True).reset_index(drop=True)
+            # Canonical in-memory order is chronological (time/frame), matching default UI sort.
+            if 'time_seconds' in self.df.columns:
+                self.df = self.df.sort_values('time_seconds', ascending=True).reset_index(drop=True)
+            elif 'frame_number' in self.df.columns:
+                self.df = self.df.sort_values('frame_number', ascending=True).reset_index(drop=True)
             
             # Initialize annotations for all instances (default: is_face=True)
             for idx in self.df.index:
@@ -521,7 +606,7 @@ class FaceInstanceReviewTab(ctk.CTkFrame):
     
     def _load_existing_annotations(self):
         """Load existing annotation file if it exists."""
-        registry = ReviewerRegistry(self.project_dir)
+        registry = self._get_registry()
         annotation_file = registry.get_is_face_annotation_path(
             self.reviewer_id, self.selected_participant, self.selected_session
         )
@@ -577,6 +662,32 @@ class FaceInstanceReviewTab(ctk.CTkFrame):
             return
         self.current_page = 0
         self._display_gallery()
+
+    def _on_sort_mode_changed(self):
+        """Re-render gallery when sort mode toggles between time/confidence."""
+        self._refresh_sort_mode_labels()
+        if self.df is None:
+            return
+        self.current_page = 0
+        self._display_gallery()
+
+    def _confidence_to_color(self, confidence: float) -> str:
+        """
+        Map confidence to a smooth color from orange (0.5) to green (1.0).
+        Values below 0.5 clamp to orange; above 1.0 clamp to green.
+        """
+        try:
+            c = float(confidence)
+        except (TypeError, ValueError):
+            c = 0.5
+        c = max(0.5, min(1.0, c))
+        t = (c - 0.5) / 0.5
+        orange = (255, 165, 0)
+        green = (144, 238, 144)
+        r = int(orange[0] + (green[0] - orange[0]) * t)
+        g = int(orange[1] + (green[1] - orange[1]) * t)
+        b = int(orange[2] + (green[2] - orange[2]) * t)
+        return f"#{r:02x}{g:02x}{b:02x}"
     
     def _display_gallery(self):
         """Display current page of face instances."""
@@ -589,6 +700,14 @@ class FaceInstanceReviewTab(ctk.CTkFrame):
             df_filtered = self.df[self.df['confidence'] >= min_conf].copy()
         else:
             df_filtered = self.df.copy()
+
+        # Display order toggle: default chronological, optional confidence-based.
+        if self.sort_by_conf_var.get() and 'confidence' in df_filtered.columns:
+            df_filtered = df_filtered.sort_values('confidence', ascending=True)
+        elif 'time_seconds' in df_filtered.columns:
+            df_filtered = df_filtered.sort_values('time_seconds', ascending=True)
+        elif 'frame_number' in df_filtered.columns:
+            df_filtered = df_filtered.sort_values('frame_number', ascending=True)
         
         # Calculate pagination
         total_items = len(df_filtered)
@@ -744,8 +863,8 @@ class FaceInstanceReviewTab(ctk.CTkFrame):
             conf_label = ctk.CTkLabel(
                 info_frame,
                 text=conf_text,
-                font=ctk.CTkFont(size=10),
-                text_color="#ffa500" if confidence < 0.9 else "#90ee90"
+                font=ctk.CTkFont(size=12),
+                text_color=self._confidence_to_color(confidence)
             )
             conf_label.pack(side="left")
             
@@ -753,7 +872,7 @@ class FaceInstanceReviewTab(ctk.CTkFrame):
             idx_label = ctk.CTkLabel(
                 info_frame,
                 text=f"#{instance_idx}",
-                font=ctk.CTkFont(size=9),
+                font=ctk.CTkFont(size=12),
                 text_color="gray"
             )
             idx_label.pack(side="right")
@@ -762,7 +881,7 @@ class FaceInstanceReviewTab(ctk.CTkFrame):
             nonface_label = ctk.CTkLabel(
                 img_container,
                 text="NON-FACE",
-                font=ctk.CTkFont(size=10, weight="bold"),
+                font=ctk.CTkFont(size=12, weight="bold"),
                 text_color="red",
                 fg_color="black"
             )
@@ -855,14 +974,14 @@ class FaceInstanceReviewTab(ctk.CTkFrame):
                 ctk.CTkLabel(
                     info_frame,
                     text=f"{confidence:.3f}",
-                    font=ctk.CTkFont(size=10),
-                    text_color="#ffa500" if confidence < 0.9 else "#90ee90"
+                    font=ctk.CTkFont(size=12),
+                    text_color=self._confidence_to_color(confidence)
                 ).pack(side="left")
                 
                 ctk.CTkLabel(
                     info_frame,
                     text=f"#{instance_idx}",
-                    font=ctk.CTkFont(size=9),
+                    font=ctk.CTkFont(size=12),
                     text_color="gray"
                 ).pack(side="right")
 
@@ -870,7 +989,7 @@ class FaceInstanceReviewTab(ctk.CTkFrame):
                 nonface_label = ctk.CTkLabel(
                     img_container,
                     text="NON-FACE",
-                    font=ctk.CTkFont(size=10, weight="bold"),
+                    font=ctk.CTkFont(size=12, weight="bold"),
                     text_color="red",
                     fg_color="black"
                 )
@@ -998,7 +1117,7 @@ class FaceInstanceReviewTab(ctk.CTkFrame):
             return
 
         try:
-            registry = ReviewerRegistry(self.project_dir)
+            registry = self._get_registry()
             annotation_file = registry.get_is_face_annotation_path(
                 self.reviewer_id, self.selected_participant, self.selected_session
             )
@@ -1007,11 +1126,19 @@ class FaceInstanceReviewTab(ctk.CTkFrame):
             annotation_records = []
             for idx in self.df.index:
                 ann = self.annotations.get(idx, {'is_face': True, 'reviewed_at': None})
-                annotation_records.append({
+                row = {
                     'instance_index': idx,
                     'is_face': ann['is_face'],
                     'reviewed_at': ann['reviewed_at'] if ann['reviewed_at'] else '',
-                })
+                }
+                # Enrich with bbox coordinates and frame_number for stable identification
+                for col in ('frame_number', 'x', 'y', 'w', 'h'):
+                    if col in self.df.columns:
+                        try:
+                            row[col] = int(self.df.at[idx, col])
+                        except (ValueError, KeyError):
+                            row[col] = None
+                annotation_records.append(row)
 
             ann_df = pd.DataFrame(annotation_records)
             ann_df.to_csv(annotation_file, index=False)
@@ -1066,7 +1193,7 @@ class FaceInstanceReviewTab(ctk.CTkFrame):
         first_label = ctk.CTkLabel(
             self.page_numbers_frame,
             text="<<",
-            font=ctk.CTkFont(size=12),
+            font=ctk.CTkFont(size=14),
             cursor="hand2"
         )
         first_label.pack(side="left", padx=3)
@@ -1080,7 +1207,7 @@ class FaceInstanceReviewTab(ctk.CTkFrame):
         prev_label = ctk.CTkLabel(
             self.page_numbers_frame,
             text="<",
-            font=ctk.CTkFont(size=12),
+            font=ctk.CTkFont(size=14),
             cursor="hand2"
         )
         prev_label.pack(side="left", padx=3)
@@ -1118,14 +1245,14 @@ class FaceInstanceReviewTab(ctk.CTkFrame):
                 ctk.CTkLabel(
                     self.page_numbers_frame,
                     text="...",
-                    font=ctk.CTkFont(size=12)
+                    font=ctk.CTkFont(size=14)
                 ).pack(side="left", padx=2)
             else:
                 is_current = (page_num == current_page)
                 page_label = ctk.CTkLabel(
                     self.page_numbers_frame,
                     text=str(page_num + 1),
-                    font=ctk.CTkFont(size=12, weight="bold" if is_current else "normal"),
+                    font=ctk.CTkFont(size=14, weight="bold" if is_current else "normal"),
                     cursor="hand2"
                 )
                 page_label.pack(side="left", padx=3)
@@ -1140,7 +1267,7 @@ class FaceInstanceReviewTab(ctk.CTkFrame):
         next_label = ctk.CTkLabel(
             self.page_numbers_frame,
             text=">",
-            font=ctk.CTkFont(size=12),
+            font=ctk.CTkFont(size=14),
             cursor="hand2"
         )
         next_label.pack(side="left", padx=3)
@@ -1154,7 +1281,7 @@ class FaceInstanceReviewTab(ctk.CTkFrame):
         last_label = ctk.CTkLabel(
             self.page_numbers_frame,
             text=">>",
-            font=ctk.CTkFont(size=12),
+            font=ctk.CTkFont(size=14),
             cursor="hand2"
         )
         last_label.pack(side="left", padx=3)

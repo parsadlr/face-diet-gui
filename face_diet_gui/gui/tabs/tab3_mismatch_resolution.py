@@ -36,15 +36,21 @@ from face_diet_gui.gui.common import BTN_DISABLED_FG, _show_full_frame_toplevel,
 class MismatchResolutionTab(ctk.CTkFrame):
     """Tab: Resolve face/non-face mismatches (consensus). Left = session list (click to select), right = gallery + Save."""
 
-    def __init__(self, master, settings_manager: SettingsManager, project_dir: Path, reviewer_id: str):
+    def __init__(self, master, settings_manager: SettingsManager,
+                 data_dir: Path, derivatives_dir: Path, reviewer_id: str):
         super().__init__(master)
         self.settings = settings_manager
-        self.project_dir = Path(project_dir) if project_dir else None
+        self.data_dir = Path(data_dir) if data_dir else None
+        self.derivatives_dir = Path(derivatives_dir) if derivatives_dir else None
+        # project_dir kept as alias for derivatives_dir for backward compat with internal methods
+        self.project_dir = self.derivatives_dir
         self.reviewer_id = reviewer_id or ""
-        self.registry = ReviewerRegistry(project_dir) if project_dir else None
+        self.registry = ReviewerRegistry(derivatives_dir) if derivatives_dir else None
         self.selected_participant: Optional[str] = None
         self.selected_session: Optional[str] = None
+        # session_dir points to data_dir/participant/session (for video)
         self.session_dir: Optional[Path] = None
+        self.detections_csv: Optional[Path] = None
         self.df: Optional[pd.DataFrame] = None
         self.mismatch_indices: List[int] = []
         self.reviewer_labels: Dict[int, Dict[str, bool]] = {}
@@ -79,7 +85,7 @@ class MismatchResolutionTab(ctk.CTkFrame):
         ctk.CTkLabel(
             left,
             text="Click a session (2+ reviewers) to resolve mismatches.",
-            font=ctk.CTkFont(size=11),
+            font=ctk.CTkFont(size=13),
             text_color="gray"
         ).pack(pady=(0, 5))
         self.session_list_frame = ctk.CTkScrollableFrame(left, height=450)
@@ -123,10 +129,10 @@ class MismatchResolutionTab(ctk.CTkFrame):
         pagination_row = ctk.CTkFrame(self.gallery_panel, fg_color="transparent")
         pagination_row.grid(row=3, column=0, sticky="ew", padx=10, pady=4)
         self.gallery_panel.grid_columnconfigure(0, weight=1)
-        self.page_info_label = ctk.CTkLabel(pagination_row, text="", font=ctk.CTkFont(size=11), text_color="gray")
+        self.page_info_label = ctk.CTkLabel(pagination_row, text="", font=ctk.CTkFont(size=13), text_color="gray")
         self.page_info_label.pack(side="left", padx=(0, 15))
-        ctk.CTkLabel(pagination_row, text="Go to page:", font=ctk.CTkFont(size=11), text_color="gray").pack(side="left", padx=(0, 4))
-        self.page_go_entry_tab3 = ctk.CTkEntry(pagination_row, width=50, font=ctk.CTkFont(size=11))
+        ctk.CTkLabel(pagination_row, text="Go to page:", font=ctk.CTkFont(size=13), text_color="gray").pack(side="left", padx=(0, 4))
+        self.page_go_entry_tab3 = ctk.CTkEntry(pagination_row, width=50, font=ctk.CTkFont(size=13))
         self.page_go_entry_tab3.pack(side="left", padx=(0, 4))
         def _on_page_go_tab3():
             try:
@@ -136,7 +142,7 @@ class MismatchResolutionTab(ctk.CTkFrame):
                     self._display_gallery()
             except (ValueError, tkinter.TclError):
                 pass
-        ctk.CTkButton(pagination_row, text="Go", width=40, height=24, font=ctk.CTkFont(size=11), command=_on_page_go_tab3).pack(side="left", padx=(0, 12))
+        ctk.CTkButton(pagination_row, text="Go", width=40, height=24, font=ctk.CTkFont(size=13), command=_on_page_go_tab3).pack(side="left", padx=(0, 12))
         self.page_go_entry_tab3.bind("<Return>", lambda e: _on_page_go_tab3())
         self.page_numbers_frame = ctk.CTkFrame(pagination_row, fg_color="transparent")
         self.page_numbers_frame.pack(side="left", padx=0, pady=0)
@@ -162,18 +168,18 @@ class MismatchResolutionTab(ctk.CTkFrame):
         for w in self.session_list_frame.winfo_children():
             w.destroy()
         self._session_rows.clear()
-        if not self.project_dir or not self.project_dir.exists():
+        if not self.derivatives_dir or not self.derivatives_dir.exists():
             return
         ctk.CTkLabel(
             self.session_list_frame,
-            text="Loading sessions…",
+            text="Loading sessions...",
             font=ctk.CTkFont(size=12),
             text_color="gray"
         ).pack(pady=20)
-        project_dir = self.project_dir
+        derivatives_dir = self.derivatives_dir
 
         def _fetch():
-            items = _get_sessions_with_review_status(project_dir)
+            items = _get_sessions_with_review_status(derivatives_dir)
             self.after(0, lambda: self._paint_session_list(items))
 
         threading.Thread(target=_fetch, daemon=True).start()
@@ -243,7 +249,12 @@ class MismatchResolutionTab(ctk.CTkFrame):
             return
         self.selected_participant = participant
         self.selected_session = session
-        self.session_dir = self.project_dir / participant / session
+        # session_dir is in data_dir (for video); detections_csv in derivatives_dir
+        self.session_dir = (self.data_dir / participant / session) if self.data_dir else None
+        p, s = participant, session
+        self.detections_csv = (
+            self.derivatives_dir / p / s / f"{p}_{s}_face-detections.csv"
+        ) if self.derivatives_dir else None
         for (row, p, s) in self._session_rows:
             if p == participant and s == session:
                 row.configure(fg_color=("gray75", "gray25"))
@@ -262,7 +273,11 @@ class MismatchResolutionTab(ctk.CTkFrame):
 
     def _load_mismatch_data_thread(self):
         try:
-            df = pd.read_csv(self.session_dir / "face_detections.csv")
+            csv_path = self.detections_csv or (self.session_dir / "face_detections.csv" if self.session_dir else None)
+            if csv_path is None or not csv_path.exists():
+                self.after(0, lambda: self.mismatch_stats_label.configure(text="Face detections CSV not found."))
+                return
+            df = pd.read_csv(csv_path)
             # Match Tab 2: instance_index in tab2 files is in sorted-by-confidence order (ascending)
             if "confidence" in df.columns:
                 df = df.sort_values("confidence", ascending=True).reset_index(drop=True)
@@ -440,9 +455,9 @@ class MismatchResolutionTab(ctk.CTkFrame):
                 checkbox_width=18, checkbox_height=18
             )
             cb.place(x=10, y=10)
-            ctk.CTkLabel(container, text=f"#{idx}", font=ctk.CTkFont(size=10), text_color="gray").place(x=5, y=128)
+            ctk.CTkLabel(container, text=f"#{idx}", font=ctk.CTkFont(size=12), text_color="gray").place(x=5, y=128)
             nonface_label = ctk.CTkLabel(
-                container, text="NON-FACE", font=ctk.CTkFont(size=9, weight="bold"),
+                container, text="NON-FACE", font=ctk.CTkFont(size=12, weight="bold"),
                 text_color="red", fg_color="black"
             )
             self._card_nonface_labels[idx] = nonface_label
@@ -512,14 +527,14 @@ class MismatchResolutionTab(ctk.CTkFrame):
             if 0 <= p < total_pages:
                 self.current_page = p
                 self._display_gallery()
-        first = ctk.CTkLabel(self.page_numbers_frame, text="<<", font=ctk.CTkFont(size=12), cursor="hand2")
+        first = ctk.CTkLabel(self.page_numbers_frame, text="<<", font=ctk.CTkFont(size=14), cursor="hand2")
         first.pack(side="left", padx=3)
         if cur > 0:
             first.bind("<Button-1>", lambda e: go(0))
             first.configure(text_color="#3b8ed0")
         else:
             first.configure(text_color="gray")
-        prev = ctk.CTkLabel(self.page_numbers_frame, text="<", font=ctk.CTkFont(size=12), cursor="hand2")
+        prev = ctk.CTkLabel(self.page_numbers_frame, text="<", font=ctk.CTkFont(size=14), cursor="hand2")
         prev.pack(side="left", padx=3)
         if cur > 0:
             prev.bind("<Button-1>", lambda e: go(cur - 1))
@@ -527,21 +542,21 @@ class MismatchResolutionTab(ctk.CTkFrame):
         else:
             prev.configure(text_color="gray")
         for p in range(total_pages):
-            lbl = ctk.CTkLabel(self.page_numbers_frame, text=str(p + 1), font=ctk.CTkFont(size=12, weight="bold" if p == cur else "normal"), cursor="hand2")
+            lbl = ctk.CTkLabel(self.page_numbers_frame, text=str(p + 1), font=ctk.CTkFont(size=14, weight="bold" if p == cur else "normal"), cursor="hand2")
             lbl.pack(side="left", padx=3)
             if p == cur:
                 lbl.configure(text_color="#3b8ed0")
             else:
                 lbl.bind("<Button-1>", lambda e, p=p: go(p))
                 lbl.configure(text_color="#3b8ed0")
-        nxt = ctk.CTkLabel(self.page_numbers_frame, text=">", font=ctk.CTkFont(size=12), cursor="hand2")
+        nxt = ctk.CTkLabel(self.page_numbers_frame, text=">", font=ctk.CTkFont(size=14), cursor="hand2")
         nxt.pack(side="left", padx=3)
         if cur < total_pages - 1:
             nxt.bind("<Button-1>", lambda e: go(cur + 1))
             nxt.configure(text_color="#3b8ed0")
         else:
             nxt.configure(text_color="gray")
-        last = ctk.CTkLabel(self.page_numbers_frame, text=">>", font=ctk.CTkFont(size=12), cursor="hand2")
+        last = ctk.CTkLabel(self.page_numbers_frame, text=">>", font=ctk.CTkFont(size=14), cursor="hand2")
         last.pack(side="left", padx=3)
         if cur < total_pages - 1:
             last.bind("<Button-1>", lambda e: go(total_pages - 1))
@@ -572,7 +587,15 @@ class MismatchResolutionTab(ctk.CTkFrame):
             records = []
             for idx in self.df.index:
                 is_face = self.annotations.get(idx, True)
-                records.append({"instance_index": idx, "is_face": is_face})
+                row = {"instance_index": idx, "is_face": is_face}
+                # Enrich with bbox and frame_number for stable identification
+                for col in ('frame_number', 'x', 'y', 'w', 'h'):
+                    if col in self.df.columns:
+                        try:
+                            row[col] = int(self.df.at[idx, col])
+                        except (ValueError, KeyError):
+                            row[col] = None
+                records.append(row)
             df_out = pd.DataFrame(records)
             with open(consensus_path, "w", newline="", encoding="utf-8") as f:
                 df_out.to_csv(f, index=False)
@@ -583,18 +606,14 @@ class MismatchResolutionTab(ctk.CTkFrame):
         except Exception as e:
             messagebox.showerror("Error", f"Failed to save:\n{str(e)}")
 
-    def set_project_dir(self, project_dir: Path):
-        self.project_dir = Path(project_dir) if project_dir else None
-        self.registry = ReviewerRegistry(project_dir) if project_dir else None
-        if self.project_dir and self.project_dir.exists():
-            self._load_session_list()
-
-    def update_project_and_reviewer(self, project_dir: Path, reviewer_id: str):
-        """Called when user changes project or reviewer via Back to setup."""
-        self.project_dir = Path(project_dir) if project_dir else None
+    def update_dirs_and_reviewer(self, data_dir: Path, derivatives_dir: Path, reviewer_id: str):
+        """Called when user changes dirs or reviewer via Back to setup."""
+        self.data_dir = Path(data_dir) if data_dir else None
+        self.derivatives_dir = Path(derivatives_dir) if derivatives_dir else None
+        self.project_dir = self.derivatives_dir
         self.reviewer_id = reviewer_id or ""
-        self.registry = ReviewerRegistry(project_dir) if project_dir else None
-        if self.project_dir and self.project_dir.exists():
+        self.registry = ReviewerRegistry(derivatives_dir) if derivatives_dir else None
+        if self.derivatives_dir and self.derivatives_dir.exists():
             self._load_session_list()
 
 

@@ -37,15 +37,21 @@ class ManualReviewTab(ctk.CTkFrame):
     """Tab 4: Manual Review & Merging (refactored from original GUI)."""
 
     def __init__(self, master, settings_manager: SettingsManager,
-                 project_dir: Path, reviewer_id: str):
+                 data_dir: Path, derivatives_dir: Path, reviewer_id: str):
         super().__init__(master)
         self.settings = settings_manager
-        self.project_dir: Path = project_dir
+        self.data_dir: Path = Path(data_dir) if data_dir else None
+        self.derivatives_dir: Path = Path(derivatives_dir) if derivatives_dir else None
+        # project_dir alias for derivatives_dir for internal backward compat
+        self.project_dir: Path = self.derivatives_dir
         self.reviewer_id: str = reviewer_id
 
         # Selected participant
         self.selected_participant: Optional[str] = None
+        # participant_dir → derivatives dir for the selected participant (CSVs)
         self.participant_dir: Optional[Path] = None
+        # data_participant_dir → data dir for video lookup
+        self.data_participant_dir: Optional[Path] = None
 
         # Data storage
         self.df: Optional[pd.DataFrame] = None
@@ -279,17 +285,18 @@ class ManualReviewTab(ctk.CTkFrame):
         self.save_btn.pack(side="left", padx=5)
     
     def _populate_participants_tab4(self):
-        """Populate the participant dropdown from the project directory."""
-        if not self.project_dir or not self.project_dir.exists():
+        """Populate the participant dropdown from the derivatives directory."""
+        scan_dir = self.derivatives_dir or self.project_dir
+        if not scan_dir or not scan_dir.exists():
             self.participant_dropdown_tab4.configure(values=["— select —"])
             return
 
-        registry = ReviewerRegistry(self.project_dir)
+        registry = ReviewerRegistry(scan_dir)
         participants = []
-        for d in sorted(self.project_dir.iterdir()):
-            if not d.is_dir() or d.name.startswith(("_", ".")):
+        for d in sorted(scan_dir.iterdir()):
+            if not d.is_dir() or d.name.startswith(("_", ".")) or d.name == "annotations":
                 continue
-            # Tab 4 output is one CSV in participant folder
+            # Tab 4 output is BIDS face-ids CSV in participant folder
             if registry.get_face_ids_path(d.name).exists():
                 participants.append(d.name)
 
@@ -306,7 +313,8 @@ class ManualReviewTab(ctk.CTkFrame):
             self.load_participant_btn.configure(state="disabled")
             return
         self.selected_participant = choice
-        self.participant_dir = self.project_dir / choice
+        self.participant_dir = (self.derivatives_dir or self.project_dir) / choice
+        self.data_participant_dir = (self.data_dir / choice) if self.data_dir else self.participant_dir
         self.load_participant_btn.configure(state="normal")
 
     def _load_participant_face_ids(self):
@@ -316,9 +324,11 @@ class ManualReviewTab(ctk.CTkFrame):
             return
         self._validate_and_load()
 
-    def update_project_and_reviewer(self, project_dir: Path, reviewer_id: str):
-        """Called when user changes project or reviewer via Back to setup."""
-        self.project_dir = project_dir
+    def update_dirs_and_reviewer(self, data_dir: Path, derivatives_dir: Path, reviewer_id: str):
+        """Called when user changes dirs or reviewer via Back to setup."""
+        self.data_dir = Path(data_dir) if data_dir else None
+        self.derivatives_dir = Path(derivatives_dir) if derivatives_dir else None
+        self.project_dir = self.derivatives_dir
         self.reviewer_id = reviewer_id
         self._populate_participants_tab4()
 
@@ -401,7 +411,7 @@ class ManualReviewTab(ctk.CTkFrame):
 
     def _validate_and_load(self):
         """Validate that clustering has been run for this participant, then load."""
-        registry = ReviewerRegistry(self.project_dir)
+        registry = ReviewerRegistry(self.derivatives_dir or self.project_dir)
         face_ids_path = registry.get_face_ids_path(self.selected_participant)
         if not face_ids_path.exists():
             messagebox.showerror(
@@ -419,21 +429,25 @@ class ManualReviewTab(ctk.CTkFrame):
     def _load_data_thread(self):
         """Load and process data in background thread."""
         try:
-            registry = ReviewerRegistry(self.project_dir)
+            registry = ReviewerRegistry(self.derivatives_dir or self.project_dir)
             participant = self.selected_participant
-            participant_path = self.project_dir / participant
+            participant_path = self.participant_dir  # points to derivatives_dir/participant
 
             # Load face_ids overlay from participant folder (Tab 4 output, one CSV per participant, shared)
             face_ids_path = registry.get_face_ids_path(participant)
             face_ids_df = pd.read_csv(face_ids_path)
 
-            # Load all per-session face_detections.csv
+            # Load all per-session face-detections CSV (BIDS naming)
             session_dfs = []
             for session_dir in sorted(participant_path.iterdir()):
                 if not session_dir.is_dir() or session_dir.name.startswith(("_", ".")):
                     continue
-                csv_path = session_dir / "face_detections.csv"
-                if not csv_path.exists():
+                session_name = session_dir.name
+                # Try BIDS name first, fall back to legacy
+                bids_csv = session_dir / f"{participant}_{session_name}_face-detections.csv"
+                legacy_csv = session_dir / "face_detections.csv"
+                csv_path = bids_csv if bids_csv.exists() else (legacy_csv if legacy_csv.exists() else None)
+                if csv_path is None:
                     continue
                 sdf = pd.read_csv(csv_path)
                 sdf['session_name'] = session_dir.name
@@ -600,7 +614,7 @@ class ManualReviewTab(ctk.CTkFrame):
                 self.session_checkboxes_frame,
                 text=session_name,
                 variable=var,
-                font=ctk.CTkFont(size=11),
+                font=ctk.CTkFont(size=13),
                 checkbox_width=16,
                 checkbox_height=16
             )
@@ -644,7 +658,9 @@ class ManualReviewTab(ctk.CTkFrame):
                       f"x={x} y={y} w={w} h={h}. Check face_detections.csv coordinate scale.")
                 return self._create_placeholder_image()
 
-            session_dir = self.participant_dir / session_name
+            # Use data_participant_dir for video lookup; fall back to participant_dir
+            video_base = self.data_participant_dir if self.data_participant_dir else self.participant_dir
+            session_dir = video_base / session_name
             if not session_dir.exists():
                 return self._create_placeholder_image()
 
@@ -1044,13 +1060,13 @@ class ManualReviewTab(ctk.CTkFrame):
         ctk.CTkLabel(
             batch_size_frame,
             text="Instances per page:",
-            font=ctk.CTkFont(size=11)
+            font=ctk.CTkFont(size=13)
         ).pack(side="left", padx=5)
         
         batch_size_entry = ctk.CTkEntry(
             batch_size_frame,
             width=80,
-            font=ctk.CTkFont(size=11)
+            font=ctk.CTkFont(size=13)
         )
         batch_size_entry.insert(0, str(batch_size))
         batch_size_entry.pack(side="left", padx=5)
@@ -1068,8 +1084,8 @@ class ManualReviewTab(ctk.CTkFrame):
         load_btn.pack(side="left", padx=5)
         
         # Go to page
-        ctk.CTkLabel(pagination_controls_frame, text="Go to page:", font=ctk.CTkFont(size=11)).pack(side="left", padx=(15, 4))
-        popup.page_go_entry = ctk.CTkEntry(pagination_controls_frame, width=50, font=ctk.CTkFont(size=11))
+        ctk.CTkLabel(pagination_controls_frame, text="Go to page:", font=ctk.CTkFont(size=13)).pack(side="left", padx=(15, 4))
+        popup.page_go_entry = ctk.CTkEntry(pagination_controls_frame, width=50, font=ctk.CTkFont(size=13))
         popup.page_go_entry.pack(side="left", padx=(0, 4))
         def _on_popup_page_go():
             try:
@@ -1078,7 +1094,7 @@ class ManualReviewTab(ctk.CTkFrame):
                     self._gallery_go_to_page(popup, n - 1, gallery_frame, loading_label, batch_size_entry, load_btn, page_numbers_frame)
             except (ValueError, tkinter.TclError):
                 pass
-        popup.page_go_btn = ctk.CTkButton(pagination_controls_frame, text="Go", width=40, height=26, font=ctk.CTkFont(size=11), command=_on_popup_page_go)
+        popup.page_go_btn = ctk.CTkButton(pagination_controls_frame, text="Go", width=40, height=26, font=ctk.CTkFont(size=13), command=_on_popup_page_go)
         popup.page_go_btn.pack(side="left", padx=(0, 10))
         popup.page_go_entry.bind("<Return>", lambda e: _on_popup_page_go())
         
@@ -1257,7 +1273,8 @@ class ManualReviewTab(ctk.CTkFrame):
                 
                 img_label.bind("<Button-1>", toggle_on_click)
                 row_data = page_instances.iloc[idx].to_dict()
-                session_dir = self.participant_dir / row_data.get("session_name", "")
+                _video_base = self.data_participant_dir if self.data_participant_dir else self.participant_dir
+                session_dir = _video_base / row_data.get("session_name", "")
                 def on_double(event, rd=row_data, sd=session_dir):
                     if sd.exists():
                         _show_full_frame_toplevel(self, sd, rd)
@@ -1381,7 +1398,7 @@ class ManualReviewTab(ctk.CTkFrame):
         first_label = ctk.CTkLabel(
             page_numbers_frame,
             text="<<",
-            font=ctk.CTkFont(size=12),
+            font=ctk.CTkFont(size=14),
             cursor="hand2"
         )
         first_label.pack(side="left", padx=3)
@@ -1398,7 +1415,7 @@ class ManualReviewTab(ctk.CTkFrame):
         prev_label = ctk.CTkLabel(
             page_numbers_frame,
             text="<",
-            font=ctk.CTkFont(size=12),
+            font=ctk.CTkFont(size=14),
             cursor="hand2"
         )
         prev_label.pack(side="left", padx=3)
@@ -1446,7 +1463,7 @@ class ManualReviewTab(ctk.CTkFrame):
                 ctk.CTkLabel(
                     page_numbers_frame,
                     text="...",
-                    font=ctk.CTkFont(size=12)
+                    font=ctk.CTkFont(size=14)
                 ).pack(side="left", padx=2)
             else:
                 # Page number label (clickable)
@@ -1454,7 +1471,7 @@ class ManualReviewTab(ctk.CTkFrame):
                 page_label = ctk.CTkLabel(
                     page_numbers_frame,
                     text=str(page_num + 1),
-                    font=ctk.CTkFont(size=12, weight="bold" if is_current else "normal"),
+                    font=ctk.CTkFont(size=14, weight="bold" if is_current else "normal"),
                     cursor="hand2"
                 )
                 page_label.pack(side="left", padx=3)
@@ -1472,7 +1489,7 @@ class ManualReviewTab(ctk.CTkFrame):
         next_label = ctk.CTkLabel(
             page_numbers_frame,
             text=">",
-            font=ctk.CTkFont(size=12),
+            font=ctk.CTkFont(size=14),
             cursor="hand2"
         )
         next_label.pack(side="left", padx=3)
@@ -1489,7 +1506,7 @@ class ManualReviewTab(ctk.CTkFrame):
         last_label = ctk.CTkLabel(
             page_numbers_frame,
             text=">>",
-            font=ctk.CTkFont(size=12),
+            font=ctk.CTkFont(size=14),
             cursor="hand2"
         )
         last_label.pack(side="left", padx=3)
@@ -1737,7 +1754,7 @@ class ManualReviewTab(ctk.CTkFrame):
             return
 
         try:
-            registry = ReviewerRegistry(self.project_dir)
+            registry = ReviewerRegistry(self.derivatives_dir or self.project_dir)
             annotation_file = registry.get_merges_path(
                 self.reviewer_id, self.selected_participant
             )

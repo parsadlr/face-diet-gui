@@ -37,10 +37,13 @@ class FaceIDAssignmentTab(ctk.CTkFrame):
     """Tab 4: Face ID Assignment (Stage 3) — select participants for clustering."""
 
     def __init__(self, master, settings_manager: SettingsManager,
-                 project_dir: Path, reviewer_id: str):
+                 data_dir: Path, derivatives_dir: Path, reviewer_id: str):
         super().__init__(master)
         self.settings = settings_manager
-        self.project_dir: Path = project_dir
+        self.data_dir: Path = Path(data_dir) if data_dir else None
+        self.derivatives_dir: Path = Path(derivatives_dir) if derivatives_dir else None
+        # project_dir kept as alias for derivatives_dir for internal method compatibility
+        self.project_dir: Path = self.derivatives_dir
         self.reviewer_id: str = reviewer_id
         self.participant_widgets: Dict = {}
         self.processing_thread: Optional[threading.Thread] = None
@@ -99,7 +102,7 @@ class FaceIDAssignmentTab(ctk.CTkFrame):
         ctk.CTkLabel(
             col_list,
             text="Check participants to include in clustering.",
-            font=ctk.CTkFont(size=11),
+            font=ctk.CTkFont(size=13),
             text_color="gray"
         ).pack(pady=(0, 5))
         
@@ -268,7 +271,7 @@ class FaceIDAssignmentTab(ctk.CTkFrame):
         self.current_step_label = ctk.CTkLabel(
             progress_frame,
             text="Ready to process",
-            font=ctk.CTkFont(size=11),
+            font=ctk.CTkFont(size=13),
             text_color="gray"
         )
         self.current_step_label.pack(pady=(10, 8))
@@ -285,7 +288,7 @@ class FaceIDAssignmentTab(ctk.CTkFrame):
         self.progress_percentage_label = ctk.CTkLabel(
             progress_container,
             text="0%",
-            font=ctk.CTkFont(size=11),
+            font=ctk.CTkFont(size=13),
             width=50
         )
         self.progress_percentage_label.pack(side="left", padx=(5, 0))
@@ -294,7 +297,7 @@ class FaceIDAssignmentTab(ctk.CTkFrame):
         self.time_estimate_label = ctk.CTkLabel(
             progress_frame,
             text="",
-            font=ctk.CTkFont(size=10),
+            font=ctk.CTkFont(size=12),
             text_color="gray"
         )
         self.time_estimate_label.pack(pady=(2, 5))
@@ -317,7 +320,7 @@ class FaceIDAssignmentTab(ctk.CTkFrame):
             text="Show detailed log",
             variable=self.show_log_var,
             command=self._toggle_detailed_log,
-            font=ctk.CTkFont(size=10),
+            font=ctk.CTkFont(size=12),
             checkbox_width=16,
             checkbox_height=16
         )
@@ -336,14 +339,11 @@ class FaceIDAssignmentTab(ctk.CTkFrame):
         else:
             self.log_textbox.pack_forget()
     
-    def set_project_dir(self, project_dir: Path):
-        """Called by app when project directory changes."""
-        self.project_dir = project_dir
-        self._load_participants_and_sessions()
-
-    def update_project_and_reviewer(self, project_dir: Path, reviewer_id: str):
-        """Called when user changes project or reviewer via Back to setup."""
-        self.project_dir = project_dir
+    def update_dirs_and_reviewer(self, data_dir: Path, derivatives_dir: Path, reviewer_id: str):
+        """Called when user changes dirs or reviewer via Back to setup."""
+        self.data_dir = Path(data_dir) if data_dir else None
+        self.derivatives_dir = Path(derivatives_dir) if derivatives_dir else None
+        self.project_dir = self.derivatives_dir
         self.reviewer_id = reviewer_id
         self._load_participants_and_sessions()
 
@@ -392,7 +392,7 @@ class FaceIDAssignmentTab(ctk.CTkFrame):
             by_participant[item["participant"]].append(item)
         for participant_name in sorted(by_participant.keys()):
             session_items = by_participant[participant_name]
-            participant_dir = self.project_dir / participant_name
+            participant_dir = (self.derivatives_dir or self.project_dir) / participant_name
             part_frame = ctk.CTkFrame(self.participant_list_frame)
             part_frame.pack(fill="x", padx=5, pady=(8, 2))
             var = ctk.BooleanVar(value=True)
@@ -584,14 +584,16 @@ class FaceIDAssignmentTab(ctk.CTkFrame):
                 self.after(0, lambda: reporter.update_time_estimate("0s", None))  # Reset time
                 
                 try:
-                    registry = ReviewerRegistry(self.project_dir)
+                    registry = ReviewerRegistry(self.derivatives_dir or self.project_dir)
                     annotations_dir = str(
                         registry.get_reviewer_dir(self.reviewer_id) / participant_name
                     )
-                    # Face ID clustering output goes in participant folder (shared): participant_path/face_ids.csv
+                    # Face ID clustering output goes in derivatives participant folder: {derivatives}/sub-XX/
                     output_dir = str(participant_path)
-                    # Consensus dir: {project}/_annotations/consensus/{participant}/
-                    consensus_dir = str(self.project_dir / "_annotations" / "consensus" / participant_name)
+                    # Consensus dir: {derivatives}/annotations/consensus/{participant}/
+                    consensus_dir = str(
+                        (self.derivatives_dir or self.project_dir) / "annotations" / "consensus" / participant_name
+                    )
 
                     _run_stage3_via_subprocess(
                         participant_dir=str(participant_path),

@@ -26,10 +26,11 @@ class VideoProcessingTab(ctk.CTkFrame):
     """Tab 1: Video Processing (Stages 1 & 2)."""
 
     def __init__(self, master, settings_manager: SettingsManager,
-                 project_dir: Path, reviewer_id: str):
+                 data_dir: Path, derivatives_dir: Path, reviewer_id: str):
         super().__init__(master)
         self.settings = settings_manager
-        self.project_dir: Path = project_dir
+        self.data_dir: Path = Path(data_dir)
+        self.derivatives_dir: Path = Path(derivatives_dir)
         self.reviewer_id: str = reviewer_id
         self.processing_thread: Optional[threading.Thread] = None
         self.is_processing = False
@@ -41,18 +42,16 @@ class VideoProcessingTab(ctk.CTkFrame):
 
     def _setup_ui(self):
         """Setup UI components."""
-        # Title
         ctk.CTkLabel(
             self,
             text="Video Processing: Face Detection & Attributes",
             font=ctk.CTkFont(size=20, weight="bold")
         ).pack(pady=(10, 15))
 
-        # Main content area: three equal columns — Participants & Sessions | Settings | Progress
         content_frame = ctk.CTkFrame(self)
         content_frame.pack(fill="both", expand=True, padx=20, pady=10)
 
-        # Column 1: Participants & sessions (directory tree)
+        # Column 1: Participants & sessions
         col_tree = ctk.CTkFrame(content_frame)
         col_tree.pack(side="left", fill="both", expand=True, padx=(0, 6))
         ctk.CTkLabel(
@@ -63,7 +62,7 @@ class VideoProcessingTab(ctk.CTkFrame):
         self.tree_widget = DirectoryTreeWidget(col_tree)
         self.tree_widget.pack(fill="both", expand=True, pady=5)
 
-        # Column 2: Settings (same expand so it doesn't look squeezed)
+        # Column 2: Settings
         col_settings = ctk.CTkFrame(content_frame)
         col_settings.pack(side="left", fill="both", expand=True, padx=6)
         self._create_settings_panel(col_settings)
@@ -73,7 +72,7 @@ class VideoProcessingTab(ctk.CTkFrame):
         col_progress.pack(side="left", fill="both", expand=True, padx=(6, 0))
         self._create_progress_panel(col_progress)
 
-        # Process buttons at bottom
+        # Buttons at bottom
         btn_frame = ctk.CTkFrame(self, fg_color="transparent")
         btn_frame.pack(pady=20)
         self.process_btn = ctk.CTkButton(
@@ -102,11 +101,11 @@ class VideoProcessingTab(ctk.CTkFrame):
             text_color_disabled="white",
             state="disabled"
         )
-        self.stop_btn.configure(fg_color=BTN_DISABLED_FG)  # initial disabled look
+        self.stop_btn.configure(fg_color=BTN_DISABLED_FG)
         self.stop_btn.pack(side="left")
 
     def _create_settings_panel(self, parent):
-        """Create settings panel."""
+        """Create unified settings panel."""
         settings_frame = ctk.CTkFrame(parent)
         settings_frame.pack(fill="both", expand=True, padx=10, pady=10)
 
@@ -114,93 +113,115 @@ class VideoProcessingTab(ctk.CTkFrame):
             settings_frame,
             text="Processing Settings",
             font=ctk.CTkFont(size=14, weight="bold")
-        ).pack(pady=(10, 15))
+        ).pack(pady=(10, 10))
 
-        # Stage 1 settings
-        stage1_frame = ctk.CTkFrame(settings_frame)
-        stage1_frame.pack(fill="x", padx=10, pady=5)
+        inner = ctk.CTkFrame(settings_frame)
+        inner.pack(fill="x", padx=10, pady=5)
 
-        ctk.CTkLabel(
-            stage1_frame,
-            text="Stage 1: Face Detection",
-            font=ctk.CTkFont(size=12, weight="bold")
-        ).pack(anchor="w", padx=5, pady=5)
-
-        # Sampling rate
-        self.use_original_fps_var = ctk.BooleanVar(value=True)
-        self.original_fps_checkbox = ctk.CTkCheckBox(
-            stage1_frame,
-            text="Use original frame rate",
-            variable=self.use_original_fps_var,
-            command=self._on_original_fps_toggle,
+        # --- Downsampling ---
+        self.downsampling_var = ctk.BooleanVar(value=False)
+        ctk.CTkCheckBox(
+            inner,
+            text="Downsampling",
+            variable=self.downsampling_var,
+            command=self._on_downsampling_toggle,
             checkbox_width=18,
             checkbox_height=18
+        ).pack(anchor="w", padx=5, pady=(8, 2))
+
+        self._ds_detail_frame = ctk.CTkFrame(inner, fg_color="transparent")
+        self._ds_detail_frame.pack(fill="x", padx=20, pady=(0, 4))
+        ctk.CTkLabel(self._ds_detail_frame, text="Factor:", width=100, anchor="w").pack(side="left")
+        self.downsampling_factor_var = ctk.IntVar(value=3)
+        self.downsampling_factor_entry = ctk.CTkEntry(
+            self._ds_detail_frame, textvariable=self.downsampling_factor_var, width=70
         )
-        self.original_fps_checkbox.pack(anchor="w", padx=5, pady=2)
+        self.downsampling_factor_entry.pack(side="left", padx=5)
+        ctk.CTkLabel(self._ds_detail_frame, text="frames", text_color="gray").pack(side="left")
 
-        sr_frame = ctk.CTkFrame(stage1_frame)
-        sr_frame.pack(fill="x", padx=5, pady=2)
-        ctk.CTkLabel(sr_frame, text="Sampling Rate:", width=120, anchor="w").pack(side="left")
-        self.sampling_rate_var = ctk.IntVar(value=30)
-        self.sampling_rate_entry = ctk.CTkEntry(sr_frame, textvariable=self.sampling_rate_var, width=80, state="disabled")
-        self.sampling_rate_entry.pack(side="left", padx=5)
-        ctk.CTkLabel(sr_frame, text="frames", text_color="gray").pack(side="left")
+        # --- Interval Sampling ---
+        self.interval_sampling_var = ctk.BooleanVar(value=False)
+        ctk.CTkCheckBox(
+            inner,
+            text="Interval Sampling",
+            variable=self.interval_sampling_var,
+            command=self._on_interval_sampling_toggle,
+            checkbox_width=18,
+            checkbox_height=18
+        ).pack(anchor="w", padx=5, pady=(6, 2))
 
-        # Min confidence threshold
-        conf_frame = ctk.CTkFrame(stage1_frame)
-        conf_frame.pack(fill="x", padx=5, pady=2)
-        ctk.CTkLabel(conf_frame, text="Min Confidence:", width=120, anchor="w").pack(side="left")
+        self._is_detail_frame = ctk.CTkFrame(inner, fg_color="transparent")
+        self._is_detail_frame.pack(fill="x", padx=20, pady=(0, 4))
+
+        row1 = ctk.CTkFrame(self._is_detail_frame, fg_color="transparent")
+        row1.pack(fill="x", pady=1)
+        ctk.CTkLabel(row1, text="Interval length:", width=130, anchor="w").pack(side="left")
+        self.interval_length_var = ctk.DoubleVar(value=30.0)
+        self.interval_length_entry = ctk.CTkEntry(
+            row1, textvariable=self.interval_length_var, width=70
+        )
+        self.interval_length_entry.pack(side="left", padx=5)
+        ctk.CTkLabel(row1, text="s", text_color="gray").pack(side="left")
+
+        row2 = ctk.CTkFrame(self._is_detail_frame, fg_color="transparent")
+        row2.pack(fill="x", pady=1)
+        ctk.CTkLabel(row2, text="Num. of intervals:", width=130, anchor="w").pack(side="left")
+        self.num_intervals_var = ctk.IntVar(value=5)
+        self.num_intervals_entry = ctk.CTkEntry(
+            row2, textvariable=self.num_intervals_var, width=70
+        )
+        self.num_intervals_entry.pack(side="left", padx=5)
+
+        row3 = ctk.CTkFrame(self._is_detail_frame, fg_color="transparent")
+        row3.pack(fill="x", pady=1)
+        ctk.CTkLabel(row3, text="Min face fraction:", width=130, anchor="w").pack(side="left")
+        self.min_face_fraction_var = ctk.DoubleVar(value=0.1)
+        self.min_face_fraction_entry = ctk.CTkEntry(
+            row3, textvariable=self.min_face_fraction_var, width=70
+        )
+        self.min_face_fraction_entry.pack(side="left", padx=5)
+        ctk.CTkLabel(row3, text="(0.0-1.0)", text_color="gray", font=ctk.CTkFont(size=13)).pack(side="left")
+
+        # --- Min Confidence ---
+        conf_frame = ctk.CTkFrame(inner, fg_color="transparent")
+        conf_frame.pack(fill="x", padx=5, pady=(8, 2))
+        ctk.CTkLabel(conf_frame, text="Min Confidence:", width=130, anchor="w").pack(side="left")
         self.min_confidence_stage1_var = ctk.DoubleVar(value=0.0)
-        ctk.CTkEntry(conf_frame, textvariable=self.min_confidence_stage1_var, width=80).pack(side="left", padx=5)
-        ctk.CTkLabel(conf_frame, text="(0.0-1.0)", text_color="gray", font=ctk.CTkFont(size=12)).pack(side="left")
+        ctk.CTkEntry(conf_frame, textvariable=self.min_confidence_stage1_var, width=70).pack(side="left", padx=5)
+        ctk.CTkLabel(conf_frame, text="(0.0-1.0)", text_color="gray", font=ctk.CTkFont(size=13)).pack(side="left")
 
-        # GPU checkbox
+        # --- GPU ---
         self.use_gpu_var = ctk.BooleanVar(value=False)
         ctk.CTkCheckBox(
-            stage1_frame,
+            inner,
             text="Use GPU (if available)",
             variable=self.use_gpu_var,
             checkbox_width=18,
             checkbox_height=18
-        ).pack(anchor="w", padx=5, pady=2)
+        ).pack(anchor="w", padx=5, pady=(6, 2))
 
-        # Debug mode: Process only 5% of video (TEMPORARY - for debugging)
-        self.debug_mode_var = ctk.BooleanVar(value=False)
-        ctk.CTkCheckBox(
-            stage1_frame,
-            text="DEBUG: Process only 5% of video",
-            variable=self.debug_mode_var,
-            checkbox_width=18,
-            checkbox_height=18,
-            text_color="orange"
-        ).pack(anchor="w", padx=5, pady=5)
-
-        # Stage 2 settings
-        stage2_frame = ctk.CTkFrame(settings_frame)
-        stage2_frame.pack(fill="x", padx=10, pady=5)
-
-        ctk.CTkLabel(
-            stage2_frame,
-            text="Stage 2: Attribute Extraction",
-            font=ctk.CTkFont(size=12, weight="bold")
-        ).pack(anchor="w", padx=5, pady=5)
-
-        # Batch size
-        bs_frame = ctk.CTkFrame(stage2_frame)
-        bs_frame.pack(fill="x", padx=5, pady=2)
-        ctk.CTkLabel(bs_frame, text="Batch Size:", width=120, anchor="w").pack(side="left")
+        # --- Batch Size ---
+        bs_frame = ctk.CTkFrame(inner, fg_color="transparent")
+        bs_frame.pack(fill="x", padx=5, pady=(8, 6))
+        ctk.CTkLabel(bs_frame, text="Batch Size:", width=130, anchor="w").pack(side="left")
         self.batch_size_var = ctk.IntVar(value=32)
-        ctk.CTkEntry(bs_frame, textvariable=self.batch_size_var, width=80).pack(side="left", padx=5)
+        ctk.CTkEntry(bs_frame, textvariable=self.batch_size_var, width=70).pack(side="left", padx=5)
 
-    def _on_original_fps_toggle(self):
-        """Handle original FPS checkbox toggle."""
-        if self.use_original_fps_var.get():
-            self.sampling_rate_entry.configure(state="disabled")
-        else:
-            self.sampling_rate_entry.configure(state="normal")
+        # Apply initial enabled/disabled state
+        self._on_downsampling_toggle()
+        self._on_interval_sampling_toggle()
+
+    def _on_downsampling_toggle(self):
+        state = "normal" if self.downsampling_var.get() else "disabled"
+        self.downsampling_factor_entry.configure(state=state)
+
+    def _on_interval_sampling_toggle(self):
+        state = "normal" if self.interval_sampling_var.get() else "disabled"
+        self.interval_length_entry.configure(state=state)
+        self.num_intervals_entry.configure(state=state)
+        self.min_face_fraction_entry.configure(state=state)
 
     def _toggle_detailed_log(self):
-        """Toggle detailed log visibility."""
         if self.show_log_var.get():
             self.log_textbox.pack(fill="both", expand=True, padx=10, pady=(5, 10))
         else:
@@ -214,7 +235,7 @@ class VideoProcessingTab(ctk.CTkFrame):
         self.current_step_label = ctk.CTkLabel(
             progress_frame,
             text="Ready to process",
-            font=ctk.CTkFont(size=11),
+            font=ctk.CTkFont(size=13),
             text_color="gray"
         )
         self.current_step_label.pack(pady=(10, 8))
@@ -230,7 +251,7 @@ class VideoProcessingTab(ctk.CTkFrame):
         self.progress_percentage_label = ctk.CTkLabel(
             progress_container,
             text="0%",
-            font=ctk.CTkFont(size=11),
+            font=ctk.CTkFont(size=13),
             width=50
         )
         self.progress_percentage_label.pack(side="left", padx=(5, 0))
@@ -238,7 +259,7 @@ class VideoProcessingTab(ctk.CTkFrame):
         self.time_estimate_label = ctk.CTkLabel(
             progress_frame,
             text="",
-            font=ctk.CTkFont(size=10),
+            font=ctk.CTkFont(size=12),
             text_color="gray"
         )
         self.time_estimate_label.pack(pady=(2, 5))
@@ -258,7 +279,7 @@ class VideoProcessingTab(ctk.CTkFrame):
             text="Show detailed log",
             variable=self.show_log_var,
             command=self._toggle_detailed_log,
-            font=ctk.CTkFont(size=10)
+            font=ctk.CTkFont(size=12)
         )
         self.log_toggle_btn.pack(anchor="w", padx=10, pady=(2, 0))
 
@@ -266,49 +287,38 @@ class VideoProcessingTab(ctk.CTkFrame):
 
         self.status_label = self.current_step_label
 
-    def _browse_directory(self):
-        """Browse for project directory."""
-        folder = filedialog.askdirectory(title="Select Project Root Directory")
-        if not folder:
-            return
-
-        self.project_dir = Path(folder)
-        self.dir_entry.configure(state="normal")
-        self.dir_entry.delete(0, "end")
-        self.dir_entry.insert(0, str(self.project_dir))
-        self.dir_entry.configure(state="readonly")
-
-        self.tree_widget.build_tree(str(self.project_dir))
-
-        self.settings.set("last_project_dir", str(self.project_dir))
-        self.settings.save_settings()
-
     def _load_settings(self):
         """Load settings into UI."""
-        if self.project_dir and self.project_dir.exists():
-            self.tree_widget.build_tree(str(self.project_dir))
+        if self.data_dir and self.data_dir.exists():
+            self.tree_widget.build_tree(
+                str(self.data_dir),
+                derivatives_dir=str(self.derivatives_dir) if self.derivatives_dir else None
+            )
 
-        self.use_original_fps_var.set(self.settings.get("stage1.use_original_fps", True))
-        self.sampling_rate_var.set(self.settings.get("stage1.sampling_rate", 30))
+        self.downsampling_var.set(self.settings.get("downsampling.enabled", False))
+        self.downsampling_factor_var.set(self.settings.get("downsampling.factor", 3))
+        self.interval_sampling_var.set(self.settings.get("interval_sampling.enabled", False))
+        self.interval_length_var.set(self.settings.get("interval_sampling.interval_length", 30.0))
+        self.num_intervals_var.set(self.settings.get("interval_sampling.num_intervals", 5))
+        self.min_face_fraction_var.set(self.settings.get("interval_sampling.min_face_fraction", 0.1))
         self.min_confidence_stage1_var.set(self.settings.get("stage1.min_confidence", 0.0))
         self.use_gpu_var.set(self.settings.get("stage1.use_gpu", False))
         self.batch_size_var.set(self.settings.get("stage2.batch_size", 32))
 
-        self._on_original_fps_toggle()
+        self._on_downsampling_toggle()
+        self._on_interval_sampling_toggle()
 
-    def set_project_dir(self, project_dir: Path):
-        """Called by app when project directory changes."""
-        self.project_dir = project_dir
-        self.tree_widget.build_tree(str(project_dir))
-
-    def update_project_and_reviewer(self, project_dir: Path, reviewer_id: str):
-        """Called when user changes project or reviewer via Back to setup."""
-        self.project_dir = project_dir
+    def update_dirs_and_reviewer(self, data_dir: Path, derivatives_dir: Path, reviewer_id: str):
+        """Called when user changes dirs or reviewer via Back to setup."""
+        self.data_dir = Path(data_dir)
+        self.derivatives_dir = Path(derivatives_dir)
         self.reviewer_id = reviewer_id
-        self.tree_widget.build_tree(str(project_dir))
+        self.tree_widget.build_tree(
+            str(self.data_dir),
+            derivatives_dir=str(self.derivatives_dir)
+        )
 
     def _get_min_confidence(self):
-        """Get min confidence value with validation."""
         try:
             val = self.min_confidence_stage1_var.get()
             if val is None or val == "":
@@ -318,7 +328,6 @@ class VideoProcessingTab(ctk.CTkFrame):
             return 0.0
 
     def _get_batch_size(self):
-        """Get batch size value with validation."""
         try:
             val = self.batch_size_var.get()
             if val is None or val == "":
@@ -327,17 +336,50 @@ class VideoProcessingTab(ctk.CTkFrame):
         except (ValueError, tkinter.TclError):
             return 32
 
+    def _get_downsampling_factor(self):
+        try:
+            val = self.downsampling_factor_var.get()
+            if val is None or val == "":
+                return 3
+            v = int(val)
+            return max(1, v)
+        except (ValueError, tkinter.TclError):
+            return 3
+
+    def _get_interval_length(self):
+        try:
+            val = self.interval_length_var.get()
+            return float(val) if val else 30.0
+        except (ValueError, tkinter.TclError):
+            return 30.0
+
+    def _get_num_intervals(self):
+        try:
+            val = self.num_intervals_var.get()
+            return max(1, int(val)) if val else 5
+        except (ValueError, tkinter.TclError):
+            return 5
+
+    def _get_min_face_fraction(self):
+        try:
+            val = self.min_face_fraction_var.get()
+            return float(val) if val else 0.1
+        except (ValueError, tkinter.TclError):
+            return 0.1
+
     def _save_settings(self):
-        """Save current settings."""
-        self.settings.set("stage1.use_original_fps", self.use_original_fps_var.get())
-        self.settings.set("stage1.sampling_rate", self.sampling_rate_var.get())
+        self.settings.set("downsampling.enabled", self.downsampling_var.get())
+        self.settings.set("downsampling.factor", self._get_downsampling_factor())
+        self.settings.set("interval_sampling.enabled", self.interval_sampling_var.get())
+        self.settings.set("interval_sampling.interval_length", self._get_interval_length())
+        self.settings.set("interval_sampling.num_intervals", self._get_num_intervals())
+        self.settings.set("interval_sampling.min_face_fraction", self._get_min_face_fraction())
         self.settings.set("stage1.min_confidence", self._get_min_confidence())
         self.settings.set("stage1.use_gpu", self.use_gpu_var.get())
         self.settings.set("stage2.batch_size", self._get_batch_size())
         self.settings.save_settings()
 
     def _stop_processing(self):
-        """Request stop and terminate the current subprocess."""
         self._stop_requested = True
         proc = self._current_process_holder[0] if self._current_process_holder else None
         if proc is not None and proc.poll() is None:
@@ -346,14 +388,17 @@ class VideoProcessingTab(ctk.CTkFrame):
             except Exception:
                 pass
 
+    def _bids_output_csv(self, participant: str, session: str) -> Path:
+        """Return the BIDS-compliant face-detections CSV path in derivatives_dir."""
+        return self.derivatives_dir / participant / session / f"{participant}_{session}_face-detections.csv"
+
     def _start_processing(self):
-        """Start processing in background thread."""
         if self.is_processing:
             messagebox.showwarning("Processing", "Processing is already running!")
             return
 
-        if not self.project_dir:
-            messagebox.showerror("Error", "Please select a project directory first!")
+        if not self.data_dir:
+            messagebox.showerror("Error", "Please select a data directory first!")
             return
 
         selected_sessions = self.tree_widget.get_selected_sessions()
@@ -364,20 +409,20 @@ class VideoProcessingTab(ctk.CTkFrame):
 
         sessions_already_done = [
             (p, s, path) for (p, s, path) in selected_sessions
-            if (path / "face_detections.csv").exists()
+            if self._bids_output_csv(p, s).exists()
         ]
         if sessions_already_done:
             n = len(sessions_already_done)
-            session_list = "\n".join(f"  • {p} / {s}" for (p, s, _) in sessions_already_done[:10])
+            session_list = "\n".join(f"  - {p} / {s}" for (p, s, _) in sessions_already_done[:10])
             if n > 10:
                 session_list += f"\n  ... and {n - 10} more"
             ok = messagebox.askyesno(
-                "Overwrite face detection — annotations will be lost",
+                "Overwrite face detection - annotations will be lost",
                 "The following session(s) already have face detection results:\n\n"
                 + session_list
                 + "\n\nRe-running will:\n"
-                "  • Overwrite face_detections.csv for these sessions\n"
-                "  • Permanently delete is_face and merges annotations that depend on these sessions\n\n"
+                "  - Overwrite face-detections CSV for these sessions\n"
+                "  - Permanently delete is_face and merges annotations that depend on these sessions\n\n"
                 "This cannot be undone. Are you sure you want to continue?",
                 icon=messagebox.WARNING,
                 default="no"
@@ -429,17 +474,26 @@ class VideoProcessingTab(ctk.CTkFrame):
 
             time.sleep(0.2)
 
-            for idx, (participant_name, session_name, session_path) in enumerate(selected_sessions, 1):
-                # Determine sampling rate
-                if self.use_original_fps_var.get():
-                    sampling_rate = 1
-                else:
-                    try:
-                        sampling_rate = self.sampling_rate_var.get()
-                        if not sampling_rate or sampling_rate <= 0:
-                            sampling_rate = 30
-                    except (ValueError, tkinter.TclError):
-                        sampling_rate = 30
+            # Resolve sampling rate from downsampling checkbox
+            if self.downsampling_var.get():
+                sampling_rate = self._get_downsampling_factor()
+            else:
+                sampling_rate = 1
+
+            use_interval_sampling = self.interval_sampling_var.get()
+            interval_length = self._get_interval_length()
+            num_intervals = self._get_num_intervals()
+            min_face_fraction = self._get_min_face_fraction()
+
+            for idx, (participant_name, session_name, data_session_path) in enumerate(selected_sessions, 1):
+                # data_session_path is in data_dir (for the video)
+                # output CSV goes to derivatives_dir with BIDS naming
+                output_csv = self._bids_output_csv(participant_name, session_name)
+                output_csv.parent.mkdir(parents=True, exist_ok=True)
+
+                # Find video path in data_dir for stage 2
+                video_files = list(data_session_path.glob("scenevideo.*"))
+                video_path_str = str(video_files[0]) if video_files else None
 
                 step_id_s1 = f"session_{idx}_stage1"
                 self.after(0, lambda p=participant_name, s=session_name:
@@ -451,19 +505,23 @@ class VideoProcessingTab(ctk.CTkFrame):
 
                 try:
                     _run_stage1_via_subprocess(
-                        session_dir=str(session_path),
+                        session_dir=str(data_session_path),
                         sampling_rate=sampling_rate,
                         use_gpu=self.use_gpu_var.get(),
                         min_confidence=self._get_min_confidence(),
                         reporter=reporter,
-                        debug_mode=self.debug_mode_var.get(),
+                        output_csv=str(output_csv),
+                        use_interval_sampling=use_interval_sampling,
+                        interval_length=interval_length,
+                        num_intervals=num_intervals,
+                        min_face_fraction=min_face_fraction,
                         settings=self.settings,
                         process_holder=self._current_process_holder,
                         stop_check=lambda: self._stop_requested,
                     )
                     self.after(0, lambda sid=step_id_s1: reporter.update_step_status(sid, "completed"))
                     _discard_annotations_for_session(
-                        self.project_dir, participant_name, session_name
+                        self.derivatives_dir, participant_name, session_name
                     )
                     self.after(0, lambda p=participant_name, s=session_name: reporter.log(
                         f"Discarded previous annotations for {p}/{s} (is_face, merges)."
@@ -485,10 +543,11 @@ class VideoProcessingTab(ctk.CTkFrame):
 
                 try:
                     _run_stage2_via_subprocess(
-                        session_dir=str(session_path),
+                        session_dir=str(data_session_path),
                         batch_size=self._get_batch_size(),
                         reporter=reporter,
-                        debug_mode=self.debug_mode_var.get(),
+                        input_csv=str(output_csv),
+                        video_path=video_path_str,
                         settings=self.settings,
                         process_holder=self._current_process_holder,
                         stop_check=lambda: self._stop_requested,
