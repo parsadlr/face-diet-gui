@@ -20,6 +20,7 @@ class DirectoryTreeWidget(ctk.CTkFrame):
         super().__init__(master, **kwargs)
         
         self.project_dir: Optional[Path] = None
+        self._derivatives_dir: Optional[Path] = None
         self.tree_data: Dict = {}  # {path_str: node_data}
         self.participant_frames: Dict = {}  # {participant_name: frame}
         self.session_widgets: Dict = {}  # {(participant, session): widgets}
@@ -68,12 +69,15 @@ class DirectoryTreeWidget(ctk.CTkFrame):
         self.tree_frame = ctk.CTkScrollableFrame(self, height=400)
         self.tree_frame.pack(fill="both", expand=True, padx=5, pady=5)
     
-    def build_tree(self, project_dir: str):
+    def build_tree(self, project_dir: str, derivatives_dir: Optional[str] = None):
         """
-        Build directory tree from project directory.
-        
+        Build directory tree from the data directory.
+
+        When *derivatives_dir* is provided, each session node also shows a
+        ``checkmark / cross`` indicator for the BIDS face-detections CSV.
+
         Expected structure:
-        project_dir/
+        project_dir/  (data_dir)
             participant1/
                 session1/
                     scenevideo.*
@@ -84,6 +88,7 @@ class DirectoryTreeWidget(ctk.CTkFrame):
                 ...
         """
         self.project_dir = Path(project_dir)
+        self._derivatives_dir = Path(derivatives_dir) if derivatives_dir else None
         
         # Clear existing tree
         for widget in self.tree_frame.winfo_children():
@@ -179,23 +184,36 @@ class DirectoryTreeWidget(ctk.CTkFrame):
         
         # Create session nodes
         for session_dir in sessions:
-            self._create_session_node(participant_name, session_dir, sessions_container)
+            self._create_session_node(participant_name, session_dir, sessions_container,
+                                       self._derivatives_dir)
     
-    def _create_session_node(self, participant_name: str, session_dir: Path, container):
+    def _create_session_node(self, participant_name: str, session_dir: Path, container,
+                              derivatives_dir: Optional[Path] = None):
         """Create a session node."""
         session_name = session_dir.name
-        
-        # Check for required files
+
+        # Check for required files in data_dir
         video_files = list(session_dir.glob("scenevideo.*"))
         eye_tracking_file = session_dir / "eye_tracking.tsv"
-        
+
         has_video = len(video_files) > 0
         has_eye_tracking = eye_tracking_file.exists()
-        
+
+        # Check for BIDS face-detections CSV in derivatives_dir
+        has_detections = False
+        if derivatives_dir is not None:
+            bids_csv = (
+                derivatives_dir
+                / participant_name
+                / session_name
+                / f"{participant_name}_{session_name}_face-detections.csv"
+            )
+            has_detections = bids_csv.exists()
+
         # Session frame
         session_frame = ctk.CTkFrame(container)
         session_frame.pack(fill="x", pady=1, padx=2)
-        
+
         # Session checkbox
         session_var = ctk.BooleanVar(value=True)
         session_cb = ctk.CTkCheckBox(
@@ -207,26 +225,36 @@ class DirectoryTreeWidget(ctk.CTkFrame):
             checkbox_height=18
         )
         session_cb.pack(side="left", padx=5, pady=2)
-        
-        # File status indicators
-        status_text = []
-        if has_video:
-            status_text.append("✓ video")
-        else:
-            status_text.append("✗ video")
-        
-        if has_eye_tracking:
-            status_text.append("✓ eye tracking")
-        else:
-            status_text.append("✗ eye tracking")
-        
-        status_label = ctk.CTkLabel(
-            session_frame,
-            text=" | ".join(status_text),
-            font=ctk.CTkFont(size=12),
-            text_color="gray"
-        )
-        status_label.pack(side="left", padx=10)
+
+        # File status indicators — each rendered as a symbol + label pair
+        indicators = [
+            (has_video, "video"),
+            (has_eye_tracking, "eye tracking"),
+        ]
+        if derivatives_dir is not None:
+            indicators.append((has_detections, "detections"))
+
+        SYMBOL_FONT = ctk.CTkFont(family="Segoe UI Symbol", size=14, weight="bold")
+        TEXT_FONT = ctk.CTkFont(family="Segoe UI", size=12)
+
+        for i, (present, label_text) in enumerate(indicators):
+            symbol = "✓" if present else "✗"
+            color = "#4caf50" if present else "#e57373"   # green / soft red
+
+            ctk.CTkLabel(
+                session_frame,
+                text=symbol,
+                font=SYMBOL_FONT,
+                text_color=color,
+                width=16
+            ).pack(side="left", padx=(8 if i == 0 else 4, 0))
+
+            ctk.CTkLabel(
+                session_frame,
+                text=label_text,
+                font=TEXT_FONT,
+                text_color="gray"
+            ).pack(side="left", padx=(2, 0))
         
         # Store session data
         self.session_widgets[(participant_name, session_name)] = {

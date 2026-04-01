@@ -51,7 +51,7 @@ def _show_full_frame_toplevel(parent, session_dir: Path, face_info: dict):
         lbl = ctk.CTkLabel(tw, image=img_tk, text="")
         lbl.image = img_tk
         lbl.pack(padx=5, pady=5)
-        ctk.CTkLabel(tw, text="(Face region outlined in green. Close to return.)", font=ctk.CTkFont(size=11), text_color="gray").pack(pady=(0, 5))
+        ctk.CTkLabel(tw, text="(Face region outlined in green. Close to return.)", font=ctk.CTkFont(size=13), text_color="gray").pack(pady=(0, 5))
     except Exception as e:
         messagebox.showerror("Error", f"Could not show full frame:\n{e}", parent=parent)
 
@@ -122,7 +122,7 @@ class ProgressReporter:
             height=30
         )
         icon_label.pack(expand=True, fill="both")
-        text_label = ctk.CTkLabel(step_frame, text=step_name, font=ctk.CTkFont(size=11), anchor="w")
+        text_label = ctk.CTkLabel(step_frame, text=step_name, font=ctk.CTkFont(size=13), anchor="w")
         text_label.pack(side="left", fill="x", expand=True, padx=5)
         self.steps[step_id] = {
             'frame': step_frame,

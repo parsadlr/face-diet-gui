@@ -24,21 +24,22 @@ from face_diet_gui.gui.tabs import (
 
 class StartupDialog(ctk.CTkToplevel):
     """
-    Modal dialog shown at startup to select / create a reviewer and project directory.
+    Modal dialog shown at startup to select data dir, derivatives dir, and reviewer.
     Blocks the main window until confirmed.
     """
 
     def __init__(self, master, settings: SettingsManager):
         super().__init__(master)
         self.settings = settings
-        self.result_project_dir: Optional[Path] = None
+        self.result_data_dir: Optional[Path] = None
+        self.result_derivatives_dir: Optional[Path] = None
         self.result_reviewer_id: Optional[str] = None
 
         self.title("Face-Diet — Setup")
-        self.geometry("720x580")
-        self.minsize(620, 520)
+        self.geometry("760x620")
+        self.minsize(680, 560)
         self.resizable(True, True)
-        self.grab_set()   # make modal
+        self.grab_set()
         self.focus_force()
 
         self._setup_ui()
@@ -53,28 +54,52 @@ class StartupDialog(ctk.CTkToplevel):
 
         ctk.CTkLabel(
             self,
-            text="Select your project directory and reviewer identity to begin.",
+            text="Configure your data directory, derivatives directory, and reviewer identity.",
             font=ctk.CTkFont(size=12),
             text_color="gray"
-        ).pack(pady=(0, 20))
+        ).pack(pady=(0, 16))
 
-        proj_frame = ctk.CTkFrame(self)
-        proj_frame.pack(fill="x", padx=30, pady=6)
+        # --- Data directory ---
+        data_frame = ctk.CTkFrame(self)
+        data_frame.pack(fill="x", padx=30, pady=6)
 
         ctk.CTkLabel(
-            proj_frame, text="Project directory:", font=ctk.CTkFont(size=13, weight="bold")
+            data_frame, text="Data directory (videos & eye tracking):",
+            font=ctk.CTkFont(size=13, weight="bold")
         ).pack(anchor="w", padx=6, pady=(6, 2))
 
-        dir_row = ctk.CTkFrame(proj_frame, fg_color="transparent")
-        dir_row.pack(fill="x", padx=6, pady=(0, 6))
+        data_row = ctk.CTkFrame(data_frame, fg_color="transparent")
+        data_row.pack(fill="x", padx=6, pady=(0, 6))
 
-        self.dir_entry = ctk.CTkEntry(dir_row, placeholder_text="Path to project root…", width=380)
-        self.dir_entry.pack(side="left", fill="x", expand=True)
-
+        self.data_dir_entry = ctk.CTkEntry(
+            data_row, placeholder_text="Path to data root (sub-XX/ses-XX/scenevideo…)", width=400
+        )
+        self.data_dir_entry.pack(side="left", fill="x", expand=True)
         ctk.CTkButton(
-            dir_row, text="Browse", width=80, command=self._browse_dir
+            data_row, text="Browse", width=80, command=self._browse_data_dir
         ).pack(side="left", padx=(6, 0))
 
+        # --- Derivatives directory ---
+        deriv_frame = ctk.CTkFrame(self)
+        deriv_frame.pack(fill="x", padx=30, pady=6)
+
+        ctk.CTkLabel(
+            deriv_frame, text="Derivatives directory (detections & annotations):",
+            font=ctk.CTkFont(size=13, weight="bold")
+        ).pack(anchor="w", padx=6, pady=(6, 2))
+
+        deriv_row = ctk.CTkFrame(deriv_frame, fg_color="transparent")
+        deriv_row.pack(fill="x", padx=6, pady=(0, 6))
+
+        self.deriv_dir_entry = ctk.CTkEntry(
+            deriv_row, placeholder_text="Path to derivatives root (sub-XX/ses-XX/…outputs)", width=400
+        )
+        self.deriv_dir_entry.pack(side="left", fill="x", expand=True)
+        ctk.CTkButton(
+            deriv_row, text="Browse", width=80, command=self._browse_deriv_dir
+        ).pack(side="left", padx=(6, 0))
+
+        # --- Reviewer ---
         rev_frame = ctk.CTkFrame(self)
         rev_frame.pack(fill="x", padx=30, pady=6)
 
@@ -82,19 +107,22 @@ class StartupDialog(ctk.CTkToplevel):
             rev_frame, text="Reviewer:", font=ctk.CTkFont(size=13, weight="bold")
         ).pack(anchor="w", padx=6, pady=(6, 2))
 
+        rev_row = ctk.CTkFrame(rev_frame, fg_color="transparent")
+        rev_row.pack(fill="x", padx=6, pady=(0, 6))
+
         self.reviewer_var = ctk.StringVar(value="")
         self.reviewer_option = ctk.CTkOptionMenu(
-            rev_frame,
+            rev_row,
             variable=self.reviewer_var,
             values=["— select —"],
             width=280,
             command=self._on_reviewer_selected
         )
-        self.reviewer_option.pack(side="left", padx=6, pady=(0, 6))
+        self.reviewer_option.pack(side="left")
 
         ctk.CTkButton(
-            rev_frame, text="+ New", width=80, command=self._show_new_reviewer_panel
-        ).pack(side="left", padx=(6, 0))
+            rev_row, text="+ New", width=80, command=self._show_new_reviewer_panel
+        ).pack(side="left", padx=(10, 0))
 
         self.new_rev_frame = ctk.CTkFrame(self)
         ctk.CTkLabel(
@@ -109,31 +137,40 @@ class StartupDialog(ctk.CTkToplevel):
             command=self._create_reviewer
         ).pack(side="left", padx=(10, 12), pady=10)
 
-        self.status_label = ctk.CTkLabel(self, text="", font=ctk.CTkFont(size=11),
+        self.status_label = ctk.CTkLabel(self, text="", font=ctk.CTkFont(size=13),
                                           text_color="orange")
         self.status_label.pack(pady=4)
 
         ctk.CTkButton(
             self,
-            text="Continue →",
+            text="Continue",
             width=180,
             height=42,
             font=ctk.CTkFont(size=15, weight="bold"),
             command=self._confirm
         ).pack(pady=16)
 
-    def _browse_dir(self):
-        folder = filedialog.askdirectory(title="Select Project Root Directory")
+    # ------------------------------------------------------------------ #
+
+    def _browse_data_dir(self):
+        folder = filedialog.askdirectory(title="Select Data Root Directory")
         if not folder:
             return
-        self.dir_entry.delete(0, "end")
-        self.dir_entry.insert(0, folder)
+        self.data_dir_entry.delete(0, "end")
+        self.data_dir_entry.insert(0, folder)
+
+    def _browse_deriv_dir(self):
+        folder = filedialog.askdirectory(title="Select Derivatives Root Directory")
+        if not folder:
+            return
+        self.deriv_dir_entry.delete(0, "end")
+        self.deriv_dir_entry.insert(0, folder)
         self._refresh_reviewer_list(Path(folder))
 
-    def _refresh_reviewer_list(self, project_dir: Path):
-        """Reload the reviewer dropdown from the project's registry."""
+    def _refresh_reviewer_list(self, derivatives_dir: Path):
+        """Reload the reviewer dropdown from the derivatives registry."""
         try:
-            registry = ReviewerRegistry(project_dir)
+            registry = ReviewerRegistry(derivatives_dir)
             ids = registry.get_reviewer_ids()
         except Exception:
             ids = []
@@ -154,10 +191,13 @@ class StartupDialog(ctk.CTkToplevel):
         self.new_id_entry.focus()
 
     def _create_reviewer(self):
-        project_dir_str = self.dir_entry.get().strip()
-        if not project_dir_str or not Path(project_dir_str).exists():
-            self.status_label.configure(text="Please select a valid project directory first.")
+        deriv_dir_str = self.deriv_dir_entry.get().strip()
+        if not deriv_dir_str:
+            self.status_label.configure(text="Please select a derivatives directory first.")
             return
+
+        deriv_dir = Path(deriv_dir_str)
+        deriv_dir.mkdir(parents=True, exist_ok=True)
 
         raw_id = self.new_id_entry.get().strip()
         if not raw_id:
@@ -165,8 +205,7 @@ class StartupDialog(ctk.CTkToplevel):
             return
 
         reviewer_id = ReviewerRegistry.sanitize_id(raw_id)
-
-        registry = ReviewerRegistry(Path(project_dir_str))
+        registry = ReviewerRegistry(deriv_dir)
         if registry.reviewer_exists(reviewer_id):
             self.status_label.configure(text=f"Reviewer '{reviewer_id}' already exists.")
             return
@@ -175,29 +214,41 @@ class StartupDialog(ctk.CTkToplevel):
         self.status_label.configure(
             text=f"Reviewer '{reviewer_id}' created.", text_color="#28a745"
         )
-        self._refresh_reviewer_list(Path(project_dir_str))
+        self._refresh_reviewer_list(deriv_dir)
         self.reviewer_var.set(reviewer_id)
         self.new_rev_frame.pack_forget()
 
     def _load_last_values(self):
         """Pre-fill fields from last session."""
-        last_dir = self.settings.get("last_project_dir", "")
-        if last_dir and Path(last_dir).exists():
-            self.dir_entry.insert(0, last_dir)
-            self._refresh_reviewer_list(Path(last_dir))
+        last_data = self.settings.get("last_data_dir", "")
+        if last_data and Path(last_data).exists():
+            self.data_dir_entry.insert(0, last_data)
+
+        last_deriv = self.settings.get("last_derivatives_dir", "")
+        if last_deriv:
+            self.deriv_dir_entry.insert(0, last_deriv)
+            deriv_path = Path(last_deriv)
+            if deriv_path.exists():
+                self._refresh_reviewer_list(deriv_path)
 
         last_reviewer = self.settings.get("reviewer_id", "")
         if last_reviewer:
-            ids = [self.reviewer_option.cget("values")[i]
-                   for i in range(len(self.reviewer_option.cget("values")))]
+            ids = list(self.reviewer_option.cget("values"))
             if last_reviewer in ids:
                 self.reviewer_var.set(last_reviewer)
 
     def _confirm(self):
-        project_dir_str = self.dir_entry.get().strip()
-        if not project_dir_str or not Path(project_dir_str).exists():
+        data_dir_str = self.data_dir_entry.get().strip()
+        if not data_dir_str or not Path(data_dir_str).exists():
             self.status_label.configure(
-                text="Please select a valid project directory.", text_color="orange"
+                text="Please select a valid data directory.", text_color="orange"
+            )
+            return
+
+        deriv_dir_str = self.deriv_dir_entry.get().strip()
+        if not deriv_dir_str:
+            self.status_label.configure(
+                text="Please select a derivatives directory.", text_color="orange"
             )
             return
 
@@ -208,10 +259,15 @@ class StartupDialog(ctk.CTkToplevel):
             )
             return
 
-        self.result_project_dir = Path(project_dir_str)
+        deriv_dir = Path(deriv_dir_str)
+        deriv_dir.mkdir(parents=True, exist_ok=True)
+
+        self.result_data_dir = Path(data_dir_str)
+        self.result_derivatives_dir = deriv_dir
         self.result_reviewer_id = reviewer_id
 
-        self.settings.set("last_project_dir", str(self.result_project_dir))
+        self.settings.set("last_data_dir", str(self.result_data_dir))
+        self.settings.set("last_derivatives_dir", str(self.result_derivatives_dir))
         self.settings.set("reviewer_id", self.result_reviewer_id)
         self.settings.save_settings()
 
@@ -222,7 +278,10 @@ class StartupDialog(ctk.CTkToplevel):
 class FaceDietApp(ctk.CTk):
     """Main application with tabbed interface."""
 
-    def __init__(self, project_dir: Optional[Path] = None, reviewer_id: Optional[str] = None,
+    def __init__(self,
+                 data_dir: Optional[Path] = None,
+                 derivatives_dir: Optional[Path] = None,
+                 reviewer_id: Optional[str] = None,
                  settings: Optional[SettingsManager] = None):
         super().__init__()
 
@@ -232,23 +291,26 @@ class FaceDietApp(ctk.CTk):
         self.settings = settings or SettingsManager()
         self.restart_to_setup = False
 
-        if project_dir is not None and reviewer_id is not None:
-            self.project_dir = Path(project_dir)
+        if data_dir is not None and derivatives_dir is not None and reviewer_id is not None:
+            self.data_dir = Path(data_dir)
+            self.derivatives_dir = Path(derivatives_dir)
             self.reviewer_id = str(reviewer_id)
         else:
             self.withdraw()
             dialog = StartupDialog(self, self.settings)
             self.wait_window(dialog)
 
-            result_project_dir = getattr(dialog, "result_project_dir", None)
+            result_data_dir = getattr(dialog, "result_data_dir", None)
+            result_derivatives_dir = getattr(dialog, "result_derivatives_dir", None)
             result_reviewer_id = getattr(dialog, "result_reviewer_id", None)
 
-            if result_project_dir is None:
+            if result_data_dir is None:
                 self.quit()
                 self.destroy()
                 return
 
-            self.project_dir = Path(result_project_dir)
+            self.data_dir = Path(result_data_dir)
+            self.derivatives_dir = Path(result_derivatives_dir)
             self.reviewer_id = str(result_reviewer_id or "")
 
             self.deiconify()
@@ -256,25 +318,38 @@ class FaceDietApp(ctk.CTk):
             self.lift()
             self.focus_force()
 
+        # Top bar
         self.top_bar = ctk.CTkFrame(self, fg_color=("gray90", "gray17"))
         self.top_bar.pack(fill="x", padx=10, pady=(10, 0))
+
         ctk.CTkLabel(
-            self.top_bar,
-            text="Project:",
+            self.top_bar, text="Data:",
             font=ctk.CTkFont(size=13, weight="bold")
         ).pack(side="left", padx=(12, 4), pady=8)
-        self.top_bar_dir_label = ctk.CTkLabel(
+        self.top_bar_data_label = ctk.CTkLabel(
             self.top_bar,
-            text=str(self.project_dir) if self.project_dir else "—",
+            text=str(self.data_dir),
             font=ctk.CTkFont(size=12),
             text_color="gray"
         )
-        self.top_bar_dir_label.pack(side="left", padx=(0, 20), pady=8)
+        self.top_bar_data_label.pack(side="left", padx=(0, 16), pady=8)
+
         ctk.CTkLabel(
-            self.top_bar,
-            text="Reviewer:",
+            self.top_bar, text="Derivatives:",
             font=ctk.CTkFont(size=13, weight="bold")
-        ).pack(side="left", padx=(10, 4), pady=8)
+        ).pack(side="left", padx=(4, 4), pady=8)
+        self.top_bar_deriv_label = ctk.CTkLabel(
+            self.top_bar,
+            text=str(self.derivatives_dir),
+            font=ctk.CTkFont(size=12),
+            text_color="gray"
+        )
+        self.top_bar_deriv_label.pack(side="left", padx=(0, 16), pady=8)
+
+        ctk.CTkLabel(
+            self.top_bar, text="Reviewer:",
+            font=ctk.CTkFont(size=13, weight="bold")
+        ).pack(side="left", padx=(4, 4), pady=8)
         self.top_bar_reviewer_label = ctk.CTkLabel(
             self.top_bar,
             text=self.reviewer_id or "—",
@@ -282,6 +357,7 @@ class FaceDietApp(ctk.CTk):
             text_color="#3b8ed0"
         )
         self.top_bar_reviewer_label.pack(side="left", padx=(0, 20), pady=8)
+
         ctk.CTkButton(
             self.top_bar,
             text="Back to setup",
@@ -291,6 +367,7 @@ class FaceDietApp(ctk.CTk):
             font=ctk.CTkFont(size=12)
         ).pack(side="right", padx=10, pady=6)
 
+        # Tabs
         self.tabview = ctk.CTkTabview(self, width=1580, height=980)
         self.tabview.pack(fill="both", expand=True, padx=10, pady=10)
 
@@ -302,31 +379,31 @@ class FaceDietApp(ctk.CTk):
 
         self.tab1 = VideoProcessingTab(
             self.tabview.tab("Face Detection"),
-            self.settings, self.project_dir, self.reviewer_id
+            self.settings, self.data_dir, self.derivatives_dir, self.reviewer_id
         )
         self.tab1.pack(fill="both", expand=True)
 
         self.tab2 = FaceInstanceReviewTab(
             self.tabview.tab("Face Instance Review"),
-            self.settings, self.project_dir, self.reviewer_id
+            self.settings, self.data_dir, self.derivatives_dir, self.reviewer_id
         )
         self.tab2.pack(fill="both", expand=True)
 
         self.tab_mismatch = MismatchResolutionTab(
             self.tabview.tab("Resolve Mismatches"),
-            self.settings, self.project_dir, self.reviewer_id
+            self.settings, self.data_dir, self.derivatives_dir, self.reviewer_id
         )
         self.tab_mismatch.pack(fill="both", expand=True)
 
         self.tab3 = FaceIDAssignmentTab(
             self.tabview.tab("Face ID Clustering"),
-            self.settings, self.project_dir, self.reviewer_id
+            self.settings, self.data_dir, self.derivatives_dir, self.reviewer_id
         )
         self.tab3.pack(fill="both", expand=True)
 
         self.tab4 = ManualReviewTab(
             self.tabview.tab("Face ID Review"),
-            self.settings, self.project_dir, self.reviewer_id
+            self.settings, self.data_dir, self.derivatives_dir, self.reviewer_id
         )
         self.tab4.pack(fill="both", expand=True)
 
@@ -363,7 +440,8 @@ def main():
         dialog = StartupDialog(dialog_root, settings)
         dialog_root.wait_window(dialog)
 
-        result_project_dir = getattr(dialog, "result_project_dir", None)
+        result_data_dir = getattr(dialog, "result_data_dir", None)
+        result_derivatives_dir = getattr(dialog, "result_derivatives_dir", None)
         result_reviewer_id = getattr(dialog, "result_reviewer_id", None)
 
         try:
@@ -377,11 +455,16 @@ def main():
             pass
         dialog_root.destroy()
 
-        if result_project_dir is None:
+        if result_data_dir is None:
             return
 
         try:
-            app = FaceDietApp(project_dir=result_project_dir, reviewer_id=result_reviewer_id, settings=settings)
+            app = FaceDietApp(
+                data_dir=result_data_dir,
+                derivatives_dir=result_derivatives_dir,
+                reviewer_id=result_reviewer_id,
+                settings=settings,
+            )
         except Exception:
             import traceback
             print("Face-Diet failed to start:", file=sys.stderr)

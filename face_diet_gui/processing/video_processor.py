@@ -37,6 +37,20 @@ from face_diet_gui.profiler import get_profiler
 from face_diet_gui.utils import append_csv_row, frame_to_time, write_csv_header
 
 
+class EyeTrackingTSVError(ValueError):
+    """Raised when ``eye_tracking.tsv`` exists but required columns or format are wrong."""
+
+    pass
+
+
+# Tobii Pro Lab: leave **Export units** disabled — no [MCS px] on gaze columns.
+# Timestamp: accept plain name or "[ms]" suffix (millisecond precision often still labels the column).
+EYE_TRACKING_TIMESTAMP_ALIASES = ("Recording timestamp", "Recording timestamp [ms]")
+EYE_TRACKING_SENSOR = "Sensor"
+EYE_TRACKING_GAZE_X = "Gaze point X"
+EYE_TRACKING_GAZE_Y = "Gaze point Y"
+
+
 def process_video_stage1(
     video_path: str,
     output_csv: str,
@@ -671,55 +685,90 @@ def compute_face_sharpness(face_crop: np.ndarray) -> float:
     return sharpness
 
 
+def _normalize_eye_tracking_header_cell(cell: str) -> str:
+    return cell.strip().lstrip("\ufeff")
+
+
 def load_gaze_data_for_video(eye_tracking_path: str) -> Dict[float, tuple]:
     """
     Load gaze data from eye tracking TSV file.
-    
-    Parameters
-    ----------
-    eye_tracking_path : str
-        Path to eye_tracking.tsv file
-    
-    Returns
-    -------
-    Dict[float, tuple]
-        Mapping from timestamp_ms to (gaze_x, gaze_y)
+
+    Expects Tobii Pro Lab export with **Export units** disabled: ``Gaze point X`` /
+    ``Gaze point Y`` (no ``[MCS px]``). Timestamp may be ``Recording timestamp`` or
+    ``Recording timestamp [ms]`` when millisecond precision is used.
+
+    Raises :class:`EyeTrackingTSVError` if required header names are missing.
     """
     import csv
     from pathlib import Path
-    
-    if not Path(eye_tracking_path).exists():
-        return {}
-    
-    gaze_data = {}
-    
-    try:
-        with open(eye_tracking_path, 'r', encoding='utf-8') as f:
-            reader = csv.reader(f, delimiter='\t')
-            header = next(reader)
-            
-            # Find column indices
-            timestamp_idx = header.index('Recording timestamp [ms]')
-            sensor_idx = header.index('Sensor')
-            gaze_x_idx = header.index('Gaze point X [MCS px]')
-            gaze_y_idx = header.index('Gaze point Y [MCS px]')
-            
-            for row in reader:
-                if len(row) <= max(timestamp_idx, sensor_idx):
-                    continue
-                
-                try:
-                    if row[sensor_idx] == 'Eye Tracker':
-                        ts_ms = float(row[timestamp_idx])
-                        gaze_x = float(row[gaze_x_idx])
-                        gaze_y = float(row[gaze_y_idx])
-                        gaze_data[ts_ms] = (gaze_x, gaze_y)
-                except (ValueError, IndexError):
-                    continue
-    except Exception as e:
-        print(f"Warning: Could not load eye tracking data: {e}")
-        return {}
-    
+
+    path = Path(eye_tracking_path)
+    if not path.exists():
+        raise FileNotFoundError(f"Eye tracking file not found: {eye_tracking_path}")
+
+    gaze_data: Dict[float, tuple] = {}
+
+    with open(path, "r", encoding="utf-8") as f:
+        reader = csv.reader(f, delimiter="\t")
+        try:
+            raw_header = next(reader)
+        except StopIteration as e:
+            raise EyeTrackingTSVError(
+                f"Eye tracking file is empty (no header row): {eye_tracking_path}"
+            ) from e
+
+        header = [_normalize_eye_tracking_header_cell(h) for h in raw_header]
+
+        timestamp_idx = None
+        for cand in EYE_TRACKING_TIMESTAMP_ALIASES:
+            if cand in header:
+                timestamp_idx = header.index(cand)
+                break
+
+        missing: List[str] = []
+        if timestamp_idx is None:
+            missing.append(
+                f"timestamp column: one of {list(EYE_TRACKING_TIMESTAMP_ALIASES)}"
+            )
+        if EYE_TRACKING_SENSOR not in header:
+            missing.append(EYE_TRACKING_SENSOR)
+        if EYE_TRACKING_GAZE_X not in header:
+            missing.append(EYE_TRACKING_GAZE_X)
+        if EYE_TRACKING_GAZE_Y not in header:
+            missing.append(EYE_TRACKING_GAZE_Y)
+
+        if missing:
+            preview = ", ".join(repr(h)[:72] for h in header[:15])
+            if len(header) > 15:
+                preview += ", ..."
+            expected = (
+                f"{list(EYE_TRACKING_TIMESTAMP_ALIASES)} (either), "
+                f"{EYE_TRACKING_SENSOR}, {EYE_TRACKING_GAZE_X}, {EYE_TRACKING_GAZE_Y}"
+            )
+            raise EyeTrackingTSVError(
+                f"eye_tracking.tsv is missing required column(s): {missing}. "
+                f"Expected: {expected}. "
+                f"Tobii Pro Lab: leave Export units disabled (no unit suffixes on gaze columns). "
+                f"File: {eye_tracking_path}. Found {len(header)} columns; first headers: {preview}"
+            )
+
+        sensor_idx = header.index(EYE_TRACKING_SENSOR)
+        gaze_x_idx = header.index(EYE_TRACKING_GAZE_X)
+        gaze_y_idx = header.index(EYE_TRACKING_GAZE_Y)
+        min_len = max(timestamp_idx, sensor_idx, gaze_x_idx, gaze_y_idx) + 1
+
+        for row in reader:
+            if len(row) < min_len:
+                continue
+            try:
+                if row[sensor_idx] == "Eye Tracker":
+                    ts_ms = float(row[timestamp_idx])
+                    gaze_x = float(row[gaze_x_idx])
+                    gaze_y = float(row[gaze_y_idx])
+                    gaze_data[ts_ms] = (gaze_x, gaze_y)
+            except (ValueError, IndexError):
+                continue
+
     return gaze_data
 
 
@@ -783,6 +832,8 @@ def collect_detections_insightface_only(
     end_time: Optional[float] = None,
     progress_callback: Optional[callable] = None,
     eye_tracking_path: Optional[str] = None,
+    global_offset: int = 0,
+    global_total: Optional[int] = None,
 ) -> List[Dict]:
     """
     Stage 1: Collect face detections using InsightFace only (no DeepFace).
@@ -806,7 +857,12 @@ def collect_detections_insightface_only(
         Progress callback function
     eye_tracking_path : str, optional
         Path to eye_tracking.tsv file (for attended flag)
-    
+    global_offset : int, optional
+        Number of frames already processed before this call (for global progress display).
+    global_total : int, optional
+        Total frames across all calls (for global progress display). When set, progress
+        percentages are reported relative to this total rather than the local interval.
+
     Returns
     -------
     List[Dict]
@@ -921,14 +977,16 @@ def collect_detections_insightface_only(
         
         # Progress update - show every 100 frames
         if processed_count % 100 == 0:
-            percent = int(100 * processed_count / max(1, frames_to_process))
+            display_processed = processed_count + global_offset
+            display_total = global_total if global_total is not None else frames_to_process
+            percent = int(100 * display_processed / max(1, display_total))
             time_sec = frame_number / fps
             det_stats = profiler.get_stats("insightface_detection")
             if progress_callback:
                 progress_callback(f"Detecting faces: frame {frame_number}...", 5 + int(55 * processed_count / max(1, frames_to_process)))
             print(
                 f"  [{percent:3d}%] Frame {frame_number} ({time_sec:.1f}s) - "
-                f"{processed_count}/{frames_to_process} frames, {len(all_detections)} faces | "
+                f"{display_processed}/{display_total} frames, {len(all_detections)} faces | "
                 f"Detection: {det_stats['mean']:.3f}s/frame"
             )
         
