@@ -195,6 +195,8 @@ def _run_stage1_via_subprocess(session_dir: str, sampling_rate: int, use_gpu: bo
                                interval_length: float = 30.0,
                                num_intervals: int = 5,
                                min_face_fraction: float = 0.1,
+                               trim_start: Optional[float] = None,
+                               trim_end: Optional[float] = None,
                                settings=None,
                                process_holder: Optional[List] = None,
                                stop_check: Optional[Callable[[], bool]] = None):
@@ -221,6 +223,10 @@ def _run_stage1_via_subprocess(session_dir: str, sampling_rate: int, use_gpu: bo
             "--num-intervals", str(num_intervals),
             "--min-face-fraction", str(min_face_fraction),
         ])
+    if trim_start is not None:
+        cmd.extend(["--trim-start", str(trim_start)])
+    if trim_end is not None:
+        cmd.extend(["--trim-end", str(trim_end)])
 
     process = subprocess.Popen(
         cmd,
