@@ -138,11 +138,14 @@ Runs face detection and optionally attribute extraction via subprocess, one sess
 
 | Setting | Description |
 |---|---|
+| Exclude edges | Skip the first *N* and/or last *M* seconds of every video before processing. Useful to exclude the experimenter's setup phase where their face typically appears. Both fields are optional — leave either blank to skip only one side. Applies to both normal mode and interval sampling (the random search window is confined to the trimmed range). |
 | Downsampling | When enabled, run detection on every *N*th frame (`factor`); when off, every frame is considered. |
-| Interval sampling | Optional alternative to scanning the whole video: randomly pick up to *N* non-overlapping windows of *L* seconds that pass a quick face-density pre-check (`min face fraction`). |
+| Interval sampling | Optional alternative to scanning the whole video: randomly pick up to *N* non-overlapping windows of *L* seconds that pass a quick face-density pre-check (`min face fraction`). After each accepted interval, up to 50 additional candidate windows are tried before raising an error. |
 | Min confidence | Filter out low-confidence detections (0.0–1.0) |
 | GPU | Use ONNX GPU runtime for faster detection |
 | Batch size | Stage 2 (DeepFace) batch size |
+
+All numeric fields are empty by default; leave any field blank to use the built-in fallback (factor: 3, interval length: 30 s, num. intervals: 5, min face fraction: 0.1, min confidence: 0.0, batch size: 32).
 
 **Output per session (under derivatives):** `{participant}_{session}_face-detections.csv` — bounding boxes, 512-dim embeddings, pose, `attended` (if `eye_tracking.tsv` is present). Attribute extraction updates this file in-place. Videos are read from the **data** directory; CSVs are written under **derivatives** with BIDS-style filenames.
 

@@ -45,7 +45,7 @@ def _intervals_overlap(a_start: float, a_end: float, accepted: List[Tuple[float,
 
 # After each accepted interval (and before the first), stop if this many attempts in a row
 # fail to yield another qualifying interval (overlap skip or low face fraction).
-MAX_INTERVAL_SEARCH_ATTEMPTS_PER_SUCCESS = 50
+MAX_INTERVAL_SEARCH_ATTEMPTS_PER_SUCCESS = 200
 
 
 def _count_processed_frames(start_time: float, end_time: float, fps: float, sampling_rate: int) -> int:
@@ -74,6 +74,8 @@ def detect_faces_with_intervals(
     interval_length: float,
     num_intervals: int,
     min_face_fraction: float,
+    trim_start: Optional[float] = None,
+    trim_end: Optional[float] = None,
 ) -> List[Dict]:
     """
     Collect face detections from randomly sampled, non-overlapping video intervals.
@@ -107,11 +109,21 @@ def detect_faces_with_intervals(
     """
     fps, total_frames, duration = _video_info(video_path)
 
+    # Apply edge trimming to constrain the search window
+    search_start = float(trim_start) if trim_start is not None else 0.0
+    search_end = duration - float(trim_end) if trim_end is not None else duration
+    if search_start < 0:
+        search_start = 0.0
+    if search_end > duration:
+        search_end = duration
+    search_duration = search_end - search_start
+
     if interval_length <= 0:
         raise ValueError("interval_length must be positive")
-    if interval_length > duration:
+    if interval_length > search_duration:
         raise ValueError(
-            f"Interval length {interval_length:.1f}s exceeds video duration {duration:.1f}s"
+            f"Interval length {interval_length:.1f}s exceeds searchable video window "
+            f"{search_start:.1f}s–{search_end:.1f}s ({search_duration:.1f}s)"
         )
 
     # Sampling rate for the quick face-check pre-scan (~1 fps)
@@ -121,10 +133,14 @@ def detect_faces_with_intervals(
     attempt = 0
     attempts_since_success = 0
 
+    trim_note = ""
+    if trim_start is not None or trim_end is not None:
+        trim_note = f" | search window: {search_start:.1f}s–{search_end:.1f}s"
     print(
         f"[INTERVAL MODE] Searching for {num_intervals} intervals x {interval_length:.1f}s, "
         f"min {min_face_fraction * 100:.0f}% face frames "
         f"(max {MAX_INTERVAL_SEARCH_ATTEMPTS_PER_SUCCESS} attempts per interval without success)"
+        f"{trim_note}"
     )
     print(f"  Video duration: {duration:.1f}s | pre-scan rate: every {pre_scan_rate} frames (~1 fps)")
 
@@ -142,12 +158,12 @@ def detect_faces_with_intervals(
 
         attempt += 1
 
-        # Random non-overlapping candidate
-        max_start = duration - interval_length
-        if max_start <= 0:
-            candidate_start = 0.0
+        # Random non-overlapping candidate within the trimmed search window
+        max_start = search_end - interval_length
+        if max_start <= search_start:
+            candidate_start = search_start
         else:
-            candidate_start = random.uniform(0.0, max_start)
+            candidate_start = random.uniform(search_start, max_start)
         candidate_end = candidate_start + interval_length
 
         if _intervals_overlap(candidate_start, candidate_end, accepted):
@@ -265,6 +281,8 @@ def detect_faces(
     interval_length: float = 30.0,
     num_intervals: int = 5,
     min_face_fraction: float = 0.1,
+    trim_start: Optional[float] = None,
+    trim_end: Optional[float] = None,
     output_csv_path: Optional[str] = None,
 ):
     """
@@ -345,6 +363,8 @@ def detect_faces(
     print(f"Eye tracking: {eye_tracking_path if eye_tracking_path else 'Not found'}")
     print(f"Output: {output_csv}")
     print(f"Sampling rate: Every {sampling_rate} frame(s)")
+    if trim_start is not None or trim_end is not None:
+        print(f"Edge trim: skip {trim_start or 0:.1f}s from start, {trim_end or 0:.1f}s from end")
     if use_interval_sampling:
         print(f"Mode: Interval sampling ({num_intervals} x {interval_length:.1f}s, "
               f"min face fraction {min_face_fraction * 100:.0f}%)")
@@ -370,15 +390,33 @@ def detect_faces(
             interval_length=interval_length,
             num_intervals=num_intervals,
             min_face_fraction=min_face_fraction,
+            trim_start=trim_start,
+            trim_end=trim_end,
         )
     else:
+        # In normal mode, apply trim by adjusting the start/end window
+        import cv2 as _cv2
+        cap = _cv2.VideoCapture(video_path)
+        _dur = (int(cap.get(_cv2.CAP_PROP_FRAME_COUNT)) / cap.get(_cv2.CAP_PROP_FPS)
+                if cap.isOpened() else 0.0)
+        cap.release()
+        effective_start = max(trim_start or 0.0, start_time or 0.0)
+        effective_end = min(
+            (_dur - (trim_end or 0.0)) if trim_end is not None else (_dur if end_time is None else end_time),
+            end_time if end_time is not None else _dur,
+        )
+        if effective_start >= effective_end:
+            raise ValueError(
+                f"Nothing to process after applying edge trim "
+                f"({effective_start:.1f}s–{effective_end:.1f}s)"
+            )
         print("\nDetecting faces with InsightFace...")
         detections = collect_detections_insightface_only(
             video_path=video_path,
             detector=detector,
             sampling_rate=sampling_rate,
-            start_time=start_time,
-            end_time=end_time,
+            start_time=effective_start if (effective_start > 0 or trim_start) else start_time,
+            end_time=effective_end if (trim_end is not None or end_time is not None) else None,
             progress_callback=None,
             eye_tracking_path=eye_tracking_path,
         )
@@ -490,6 +528,18 @@ if __name__ == "__main__":
         default=None,
         help="Full path for the output face-detections CSV (overrides default <session_dir>/face_detections.csv)"
     )
+    parser.add_argument(
+        "--trim-start",
+        type=float,
+        default=None,
+        help="Exclude this many seconds from the beginning of the video (experimenter exclusion zone)"
+    )
+    parser.add_argument(
+        "--trim-end",
+        type=float,
+        default=None,
+        help="Exclude this many seconds from the end of the video (experimenter exclusion zone)"
+    )
 
     args = parser.parse_args()
 
@@ -510,6 +560,8 @@ if __name__ == "__main__":
             interval_length=args.interval_length,
             num_intervals=args.num_intervals,
             min_face_fraction=args.min_face_fraction,
+            trim_start=args.trim_start,
+            trim_end=args.trim_end,
             output_csv_path=args.output_csv,
         )
     except Exception as e:

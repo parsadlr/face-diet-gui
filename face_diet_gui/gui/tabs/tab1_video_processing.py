@@ -118,6 +118,42 @@ class VideoProcessingTab(ctk.CTkFrame):
         inner = ctk.CTkFrame(settings_frame)
         inner.pack(fill="x", padx=10, pady=5)
 
+        # --- Exclude edges ---
+        self.trim_edges_var = ctk.BooleanVar(value=False)
+        ctk.CTkCheckBox(
+            inner,
+            text="Exclude edges",
+            variable=self.trim_edges_var,
+            command=self._on_trim_toggle,
+            checkbox_width=18,
+            checkbox_height=18
+        ).pack(anchor="w", padx=5, pady=(8, 2))
+
+        self._trim_detail_frame = ctk.CTkFrame(inner, fg_color="transparent")
+        self._trim_detail_frame.pack(fill="x", padx=20, pady=(0, 4))
+
+        trim_row1 = ctk.CTkFrame(self._trim_detail_frame, fg_color="transparent")
+        trim_row1.pack(fill="x", pady=1)
+        ctk.CTkLabel(trim_row1, text="Skip from start:", width=130, anchor="w").pack(side="left")
+        self.trim_start_var = ctk.StringVar(value="")
+        self.trim_start_entry = ctk.CTkEntry(
+            trim_row1, textvariable=self.trim_start_var, width=70, state="disabled",
+            placeholder_text="e.g. 30"
+        )
+        self.trim_start_entry.pack(side="left", padx=5)
+        ctk.CTkLabel(trim_row1, text="s", text_color="gray").pack(side="left")
+
+        trim_row2 = ctk.CTkFrame(self._trim_detail_frame, fg_color="transparent")
+        trim_row2.pack(fill="x", pady=1)
+        ctk.CTkLabel(trim_row2, text="Skip from end:", width=130, anchor="w").pack(side="left")
+        self.trim_end_var = ctk.StringVar(value="")
+        self.trim_end_entry = ctk.CTkEntry(
+            trim_row2, textvariable=self.trim_end_var, width=70, state="disabled",
+            placeholder_text="e.g. 30"
+        )
+        self.trim_end_entry.pack(side="left", padx=5)
+        ctk.CTkLabel(trim_row2, text="s", text_color="gray").pack(side="left")
+
         # --- Downsampling ---
         self.downsampling_var = ctk.BooleanVar(value=False)
         ctk.CTkCheckBox(
@@ -127,14 +163,15 @@ class VideoProcessingTab(ctk.CTkFrame):
             command=self._on_downsampling_toggle,
             checkbox_width=18,
             checkbox_height=18
-        ).pack(anchor="w", padx=5, pady=(8, 2))
+        ).pack(anchor="w", padx=5, pady=(6, 2))
 
         self._ds_detail_frame = ctk.CTkFrame(inner, fg_color="transparent")
         self._ds_detail_frame.pack(fill="x", padx=20, pady=(0, 4))
         ctk.CTkLabel(self._ds_detail_frame, text="Factor:", width=100, anchor="w").pack(side="left")
-        self.downsampling_factor_var = ctk.IntVar(value=3)
+        self.downsampling_factor_var = ctk.StringVar(value="")
         self.downsampling_factor_entry = ctk.CTkEntry(
-            self._ds_detail_frame, textvariable=self.downsampling_factor_var, width=70
+            self._ds_detail_frame, textvariable=self.downsampling_factor_var, width=70,
+            state="disabled", placeholder_text="e.g. 3"
         )
         self.downsampling_factor_entry.pack(side="left", padx=5)
         ctk.CTkLabel(self._ds_detail_frame, text="frames", text_color="gray").pack(side="left")
@@ -156,9 +193,10 @@ class VideoProcessingTab(ctk.CTkFrame):
         row1 = ctk.CTkFrame(self._is_detail_frame, fg_color="transparent")
         row1.pack(fill="x", pady=1)
         ctk.CTkLabel(row1, text="Interval length:", width=130, anchor="w").pack(side="left")
-        self.interval_length_var = ctk.DoubleVar(value=30.0)
+        self.interval_length_var = ctk.StringVar(value="")
         self.interval_length_entry = ctk.CTkEntry(
-            row1, textvariable=self.interval_length_var, width=70
+            row1, textvariable=self.interval_length_var, width=70, state="disabled",
+            placeholder_text="e.g. 30"
         )
         self.interval_length_entry.pack(side="left", padx=5)
         ctk.CTkLabel(row1, text="s", text_color="gray").pack(side="left")
@@ -166,18 +204,20 @@ class VideoProcessingTab(ctk.CTkFrame):
         row2 = ctk.CTkFrame(self._is_detail_frame, fg_color="transparent")
         row2.pack(fill="x", pady=1)
         ctk.CTkLabel(row2, text="Num. of intervals:", width=130, anchor="w").pack(side="left")
-        self.num_intervals_var = ctk.IntVar(value=5)
+        self.num_intervals_var = ctk.StringVar(value="")
         self.num_intervals_entry = ctk.CTkEntry(
-            row2, textvariable=self.num_intervals_var, width=70
+            row2, textvariable=self.num_intervals_var, width=70, state="disabled",
+            placeholder_text="e.g. 5"
         )
         self.num_intervals_entry.pack(side="left", padx=5)
 
         row3 = ctk.CTkFrame(self._is_detail_frame, fg_color="transparent")
         row3.pack(fill="x", pady=1)
         ctk.CTkLabel(row3, text="Min face fraction:", width=130, anchor="w").pack(side="left")
-        self.min_face_fraction_var = ctk.DoubleVar(value=0.1)
+        self.min_face_fraction_var = ctk.StringVar(value="")
         self.min_face_fraction_entry = ctk.CTkEntry(
-            row3, textvariable=self.min_face_fraction_var, width=70
+            row3, textvariable=self.min_face_fraction_var, width=70, state="disabled",
+            placeholder_text="e.g. 0.1"
         )
         self.min_face_fraction_entry.pack(side="left", padx=5)
         ctk.CTkLabel(row3, text="(0.0-1.0)", text_color="gray", font=ctk.CTkFont(size=13)).pack(side="left")
@@ -186,8 +226,11 @@ class VideoProcessingTab(ctk.CTkFrame):
         conf_frame = ctk.CTkFrame(inner, fg_color="transparent")
         conf_frame.pack(fill="x", padx=5, pady=(8, 2))
         ctk.CTkLabel(conf_frame, text="Min Confidence:", width=130, anchor="w").pack(side="left")
-        self.min_confidence_stage1_var = ctk.DoubleVar(value=0.0)
-        ctk.CTkEntry(conf_frame, textvariable=self.min_confidence_stage1_var, width=70).pack(side="left", padx=5)
+        self.min_confidence_stage1_var = ctk.StringVar(value="")
+        ctk.CTkEntry(
+            conf_frame, textvariable=self.min_confidence_stage1_var, width=70,
+            placeholder_text="e.g. 0.5"
+        ).pack(side="left", padx=5)
         ctk.CTkLabel(conf_frame, text="(0.0-1.0)", text_color="gray", font=ctk.CTkFont(size=13)).pack(side="left")
 
         # --- GPU ---
@@ -204,12 +247,16 @@ class VideoProcessingTab(ctk.CTkFrame):
         bs_frame = ctk.CTkFrame(inner, fg_color="transparent")
         bs_frame.pack(fill="x", padx=5, pady=(8, 6))
         ctk.CTkLabel(bs_frame, text="Batch Size:", width=130, anchor="w").pack(side="left")
-        self.batch_size_var = ctk.IntVar(value=32)
-        ctk.CTkEntry(bs_frame, textvariable=self.batch_size_var, width=70).pack(side="left", padx=5)
+        self.batch_size_var = ctk.StringVar(value="")
+        ctk.CTkEntry(
+            bs_frame, textvariable=self.batch_size_var, width=70,
+            placeholder_text="e.g. 32"
+        ).pack(side="left", padx=5)
 
-        # Apply initial enabled/disabled state
-        self._on_downsampling_toggle()
-        self._on_interval_sampling_toggle()
+    def _on_trim_toggle(self):
+        state = "normal" if self.trim_edges_var.get() else "disabled"
+        self.trim_start_entry.configure(state=state)
+        self.trim_end_entry.configure(state=state)
 
     def _on_downsampling_toggle(self):
         state = "normal" if self.downsampling_var.get() else "disabled"
@@ -295,16 +342,20 @@ class VideoProcessingTab(ctk.CTkFrame):
                 derivatives_dir=str(self.derivatives_dir) if self.derivatives_dir else None
             )
 
+        self.trim_edges_var.set(self.settings.get("trim_edges.enabled", False))
+        self.trim_start_var.set(self.settings.get("trim_edges.trim_start", ""))
+        self.trim_end_var.set(self.settings.get("trim_edges.trim_end", ""))
         self.downsampling_var.set(self.settings.get("downsampling.enabled", False))
-        self.downsampling_factor_var.set(self.settings.get("downsampling.factor", 3))
+        self.downsampling_factor_var.set(self.settings.get("downsampling.factor", ""))
         self.interval_sampling_var.set(self.settings.get("interval_sampling.enabled", False))
-        self.interval_length_var.set(self.settings.get("interval_sampling.interval_length", 30.0))
-        self.num_intervals_var.set(self.settings.get("interval_sampling.num_intervals", 5))
-        self.min_face_fraction_var.set(self.settings.get("interval_sampling.min_face_fraction", 0.1))
-        self.min_confidence_stage1_var.set(self.settings.get("stage1.min_confidence", 0.0))
+        self.interval_length_var.set(self.settings.get("interval_sampling.interval_length", ""))
+        self.num_intervals_var.set(self.settings.get("interval_sampling.num_intervals", ""))
+        self.min_face_fraction_var.set(self.settings.get("interval_sampling.min_face_fraction", ""))
+        self.min_confidence_stage1_var.set(self.settings.get("stage1.min_confidence", ""))
         self.use_gpu_var.set(self.settings.get("stage1.use_gpu", False))
-        self.batch_size_var.set(self.settings.get("stage2.batch_size", 32))
+        self.batch_size_var.set(self.settings.get("stage2.batch_size", ""))
 
+        self._on_trim_toggle()
         self._on_downsampling_toggle()
         self._on_interval_sampling_toggle()
 
@@ -320,63 +371,79 @@ class VideoProcessingTab(ctk.CTkFrame):
 
     def _get_min_confidence(self):
         try:
-            val = self.min_confidence_stage1_var.get()
-            if val is None or val == "":
-                return 0.0
-            return float(val)
+            val = self.min_confidence_stage1_var.get().strip()
+            return float(val) if val else 0.0
         except (ValueError, tkinter.TclError):
             return 0.0
 
     def _get_batch_size(self):
         try:
-            val = self.batch_size_var.get()
-            if val is None or val == "":
-                return 32
-            return int(val)
+            val = self.batch_size_var.get().strip()
+            return max(1, int(val)) if val else 32
         except (ValueError, tkinter.TclError):
             return 32
 
     def _get_downsampling_factor(self):
         try:
-            val = self.downsampling_factor_var.get()
-            if val is None or val == "":
-                return 3
-            v = int(val)
-            return max(1, v)
+            val = self.downsampling_factor_var.get().strip()
+            return max(1, int(val)) if val else 3
         except (ValueError, tkinter.TclError):
             return 3
 
     def _get_interval_length(self):
         try:
-            val = self.interval_length_var.get()
+            val = self.interval_length_var.get().strip()
             return float(val) if val else 30.0
         except (ValueError, tkinter.TclError):
             return 30.0
 
     def _get_num_intervals(self):
         try:
-            val = self.num_intervals_var.get()
+            val = self.num_intervals_var.get().strip()
             return max(1, int(val)) if val else 5
         except (ValueError, tkinter.TclError):
             return 5
 
     def _get_min_face_fraction(self):
         try:
-            val = self.min_face_fraction_var.get()
+            val = self.min_face_fraction_var.get().strip()
             return float(val) if val else 0.1
         except (ValueError, tkinter.TclError):
             return 0.1
 
+    def _get_trim_start(self):
+        """Return trim-from-start in seconds, or None if not set/not enabled."""
+        if not self.trim_edges_var.get():
+            return None
+        try:
+            val = self.trim_start_var.get().strip()
+            return float(val) if val else None
+        except (ValueError, tkinter.TclError):
+            return None
+
+    def _get_trim_end(self):
+        """Return trim-from-end in seconds, or None if not set/not enabled."""
+        if not self.trim_edges_var.get():
+            return None
+        try:
+            val = self.trim_end_var.get().strip()
+            return float(val) if val else None
+        except (ValueError, tkinter.TclError):
+            return None
+
     def _save_settings(self):
+        self.settings.set("trim_edges.enabled", self.trim_edges_var.get())
+        self.settings.set("trim_edges.trim_start", self.trim_start_var.get().strip())
+        self.settings.set("trim_edges.trim_end", self.trim_end_var.get().strip())
         self.settings.set("downsampling.enabled", self.downsampling_var.get())
-        self.settings.set("downsampling.factor", self._get_downsampling_factor())
+        self.settings.set("downsampling.factor", self.downsampling_factor_var.get().strip())
         self.settings.set("interval_sampling.enabled", self.interval_sampling_var.get())
-        self.settings.set("interval_sampling.interval_length", self._get_interval_length())
-        self.settings.set("interval_sampling.num_intervals", self._get_num_intervals())
-        self.settings.set("interval_sampling.min_face_fraction", self._get_min_face_fraction())
-        self.settings.set("stage1.min_confidence", self._get_min_confidence())
+        self.settings.set("interval_sampling.interval_length", self.interval_length_var.get().strip())
+        self.settings.set("interval_sampling.num_intervals", self.num_intervals_var.get().strip())
+        self.settings.set("interval_sampling.min_face_fraction", self.min_face_fraction_var.get().strip())
+        self.settings.set("stage1.min_confidence", self.min_confidence_stage1_var.get().strip())
         self.settings.set("stage1.use_gpu", self.use_gpu_var.get())
-        self.settings.set("stage2.batch_size", self._get_batch_size())
+        self.settings.set("stage2.batch_size", self.batch_size_var.get().strip())
         self.settings.save_settings()
 
     def _stop_processing(self):
@@ -484,6 +551,8 @@ class VideoProcessingTab(ctk.CTkFrame):
             interval_length = self._get_interval_length()
             num_intervals = self._get_num_intervals()
             min_face_fraction = self._get_min_face_fraction()
+            trim_start = self._get_trim_start()
+            trim_end = self._get_trim_end()
 
             for idx, (participant_name, session_name, data_session_path) in enumerate(selected_sessions, 1):
                 # data_session_path is in data_dir (for the video)
@@ -515,6 +584,8 @@ class VideoProcessingTab(ctk.CTkFrame):
                         interval_length=interval_length,
                         num_intervals=num_intervals,
                         min_face_fraction=min_face_fraction,
+                        trim_start=trim_start,
+                        trim_end=trim_end,
                         settings=self.settings,
                         process_holder=self._current_process_holder,
                         stop_check=lambda: self._stop_requested,
