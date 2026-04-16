@@ -701,13 +701,11 @@ class FaceInstanceReviewTab(ctk.CTkFrame):
         else:
             df_filtered = self.df.copy()
 
-        # Display order toggle: default chronological, optional confidence-based.
+        # Display order toggle: confidence-based or by instance ID (which is already time order).
         if self.sort_by_conf_var.get() and 'confidence' in df_filtered.columns:
             df_filtered = df_filtered.sort_values('confidence', ascending=True)
-        elif 'time_seconds' in df_filtered.columns:
-            df_filtered = df_filtered.sort_values('time_seconds', ascending=True)
-        elif 'frame_number' in df_filtered.columns:
-            df_filtered = df_filtered.sort_values('frame_number', ascending=True)
+        else:
+            df_filtered = df_filtered.sort_index()
         
         # Calculate pagination
         total_items = len(df_filtered)

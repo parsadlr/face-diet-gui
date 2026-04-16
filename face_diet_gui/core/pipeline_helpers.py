@@ -122,8 +122,6 @@ def _get_sessions_with_review_status(derivatives_dir: Path) -> List[Dict]:
             if len(reviewers_with_tab2) >= 2:
                 try:
                     df = pd.read_csv(bids_csv)
-                    if "confidence" in df.columns:
-                        df = df.sort_values("confidence", ascending=True).reset_index(drop=True)
                     indices = list(df.index)
                     per_reviewer = {}
                     for rid in reviewers_with_tab2:
