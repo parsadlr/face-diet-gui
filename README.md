@@ -237,9 +237,9 @@ Face detection reads gaze from **`eye_tracking.tsv`** in each session folder (ne
 1. Add your recordings to a Tobii Pro Lab project.
 2. Open **Data export** (top right).
 3. Under **Data fields**, enable the **Eye tracking data** group.
-4. Set **Format** to standard files (`.tsv`) — one file per recording.
+4. Set **Format** to **Multiple standard files (.tsv)**, which will export one file per recording session.
 5. Leave **Export units** disabled (unchecked) so gaze columns stay **`Gaze point X`** / **`Gaze point Y`** without `[MCS px]` suffixes.
-6. Set **Timestamp precision** to **milliseconds** (the timestamp column may appear as **`Recording timestamp`** or **`Recording timestamp [ms]`** depending on Pro Lab version — both are accepted).
+6. Set **Timestamp precision** to **microseconds**.
 7. Set **Gaze filter** to **Tobii I-VT (Attention)**.
 8. Enable **Recording gaze data**.
 9. Run the export. You get a separate `.tsv` per recording; copy or rename each into the correct **`data_dir/{participant}/{session}/`** folder as **`eye_tracking.tsv`** so the GUI and detection stage can find it (rename if Tobii’s default filename differs).
