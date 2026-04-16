@@ -278,9 +278,13 @@ class MismatchResolutionTab(ctk.CTkFrame):
                 self.after(0, lambda: self.mismatch_stats_label.configure(text="Face detections CSV not found."))
                 return
             df = pd.read_csv(csv_path)
-            # Match Tab 2: instance_index in tab2 files is in sorted-by-confidence order (ascending)
-            if "confidence" in df.columns:
-                df = df.sort_values("confidence", ascending=True).reset_index(drop=True)
+            # Match Tab 2: instance_index is assigned after sorting chronologically by time/frame.
+            if "time_seconds" in df.columns:
+                df = df.sort_values("time_seconds", ascending=True).reset_index(drop=True)
+            elif "frame_number" in df.columns:
+                df = df.sort_values("frame_number", ascending=True).reset_index(drop=True)
+            else:
+                df = df.reset_index(drop=True)
             reviewer_ids_all = self.registry.get_reviewer_ids()
             with_tab2 = [r for r in reviewer_ids_all if self.registry.get_is_face_annotation_path(r, self.selected_participant, self.selected_session).exists()]
             reviewers_with_tab2 = [r for r in with_tab2 if _load_review_status_for_session(self.registry, r, self.selected_participant, self.selected_session).get("reviewed", False)]
