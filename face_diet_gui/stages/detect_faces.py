@@ -436,6 +436,28 @@ def detect_faces(
     print(f"Writing to {output_csv}...")
     write_csv_stage1(output_csv, detections)
 
+    # Write settings JSON alongside the CSV
+    import json as _json
+    from datetime import datetime as _dt
+    settings_path = Path(output_csv).with_suffix("").parent / (Path(output_csv).stem + "-settings.json")
+    settings_record = {
+        "generated_at": _dt.now().isoformat(),
+        "video_file": Path(video_path).name,
+        "total_detections": len(detections),
+        "sampling_rate": sampling_rate,
+        "min_confidence": min_confidence,
+        "trim_start_seconds": trim_start,
+        "trim_end_seconds": trim_end,
+        "interval_sampling": use_interval_sampling,
+        "interval_length_seconds": interval_length if use_interval_sampling else None,
+        "num_intervals": num_intervals if use_interval_sampling else None,
+        "min_face_fraction": min_face_fraction if use_interval_sampling else None,
+        "eye_tracking": eye_tracking_path is not None,
+    }
+    with open(settings_path, "w", encoding="utf-8") as _f:
+        _json.dump(settings_record, _f, indent=2)
+    print(f"Settings saved to {settings_path}")
+
     print("\n" + "=" * 80)
     print("FACE DETECTION COMPLETE")
     print("=" * 80)
