@@ -1,6 +1,7 @@
 """Tab 3: Resolve Mismatches — consensus face/non-face across reviewers."""
 
 import json
+import os
 import re
 import threading
 import queue
@@ -56,6 +57,7 @@ class MismatchResolutionTab(ctk.CTkFrame):
         self.reviewer_labels: Dict[int, Dict[str, bool]] = {}
         self.reviewer_ids: List[str] = []
         self.annotations: Dict[int, bool] = {}
+        self.agreed_labels: Dict[int, bool] = {}
         self.image_cache: Dict[int, Image.Image] = {}
         self.items_per_page = 24
         self.current_page = 0
@@ -324,10 +326,19 @@ class MismatchResolutionTab(ctk.CTkFrame):
                     if len(set(vals)) > 1:
                         mismatch_indices.append(idx_int)
                         reviewer_labels[idx_int] = {r: per_reviewer[r].get(idx_int, True) for r in reviewers_with_tab2}
+            # Build agreed_labels: for all non-mismatch instances, record the unanimous reviewer label.
+            mismatch_set = set(mismatch_indices)
+            first_reviewer_map = next(iter(per_reviewer.values())) if per_reviewer else {}
+            agreed_labels = {
+                int(idx): first_reviewer_map.get(int(idx), True)
+                for idx in df.index
+                if int(idx) not in mismatch_set
+            }
             self.df = df
             self.mismatch_indices = mismatch_indices
             self.reviewer_labels = reviewer_labels
             self.reviewer_ids = reviewers_with_tab2
+            self.agreed_labels = agreed_labels
             # Tab 3 gallery default: all images checked (face). If consensus file exists for this session, use those labels instead.
             self.annotations = {idx: True for idx in mismatch_indices}
             # Load saved consensus from _annotations/consensus/ if it exists (overwrites defaults for this session)
@@ -588,9 +599,13 @@ class MismatchResolutionTab(ctk.CTkFrame):
             # Global consensus and resolved flag under _annotations/consensus/{participant}/{session}/
             consensus_path = self.registry.get_consensus_annotation_path(self.selected_participant, self.selected_session)
             consensus_path.parent.mkdir(parents=True, exist_ok=True)
+            mismatch_set = set(self.mismatch_indices)
             records = []
             for idx in self.df.index:
-                is_face = self.annotations.get(idx, True)
+                if idx in mismatch_set:
+                    is_face = self.annotations.get(idx, True)
+                else:
+                    is_face = self.agreed_labels.get(idx, True)
                 row = {"instance_index": idx, "is_face": is_face}
                 # Enrich with bbox and frame_number for stable identification
                 for col in ('frame_number', 'x', 'y', 'w', 'h'):
