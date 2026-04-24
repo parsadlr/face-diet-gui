@@ -1225,100 +1225,102 @@ class ManualReviewTab(ctk.CTkFrame):
             
             # Calculate images per row based on frame width
             images_per_row = self._calculate_images_per_row(gallery_frame)
-            
-            # Update UI with images
-            self.after(0, lambda: loading_label.pack_forget())
-            if load_btn:
-                self.after(0, lambda: load_btn.configure(text="Load", state="normal"))
-            
-            # Create grid with responsive layout
-            popup_window = gallery_frame.winfo_toplevel()
-            for idx, img in enumerate(images):
-                row_idx = idx // images_per_row
-                col_idx = idx % images_per_row
-                
-                # Get the actual dataframe index for this image
-                df_idx = page_instances.iloc[idx].name
-                
-                # Create container frame (same size as image)
-                img_container = ctk.CTkFrame(gallery_frame, width=130, height=130)
-                img_container.grid(row=row_idx, column=col_idx, padx=5, pady=5)
-                img_container.grid_propagate(False)
-                
-                # Add image as background
-                img_tk = ImageTk.PhotoImage(img)
-                img_label = ctk.CTkLabel(img_container, image=img_tk, text="")
-                img_label.image = img_tk  # Keep reference
-                img_label.place(x=0, y=0, relwidth=1, relheight=1)
-                
-                # Checkbox overlay (top-right corner)
-                checkbox_var = ctk.BooleanVar(value=df_idx in popup_window.selected_instances)
-                checkbox = ctk.CTkCheckBox(
-                    img_container,
-                    text="",
-                    variable=checkbox_var,
-                    width=20,
-                    command=lambda idx=df_idx, var=checkbox_var: self._gallery_toggle_selection(popup_window, idx, var),
-                    checkbox_width=18,
-                    checkbox_height=18,
-                    fg_color="#3b8ed0",
-                    hover_color="#2a6fa5"
-                )
-                checkbox.place(x=5, y=5)
-                
-                # Make entire image clickable to toggle selection
-                def toggle_on_click(event, idx=df_idx, var=checkbox_var, cb=checkbox):
-                    var.set(not var.get())
-                    self._gallery_toggle_selection(popup_window, idx, var)
-                
-                img_label.bind("<Button-1>", toggle_on_click)
-                row_data = page_instances.iloc[idx].to_dict()
-                _video_base = self.data_participant_dir if self.data_participant_dir else self.participant_dir
-                session_dir = _video_base / row_data.get("session_name", "")
-                def on_double(event, rd=row_data, sd=session_dir):
-                    if sd.exists():
-                        _show_full_frame_toplevel(self, sd, rd)
-                img_label.bind("<Double-Button-1>", on_double)
-                img_container.configure(cursor="hand2")
-                img_label.configure(cursor="hand2")
-            
-            # Store images_per_row and images in gallery_frame for resize handling
-            gallery_frame.images_per_row = images_per_row
-            gallery_frame.images = images  # Keep reference to images
-            gallery_frame.image_tk_objects = []  # Store PhotoImage objects to prevent garbage collection
-            
-            # Store PhotoImage references
-            for img in images:
-                img_tk = ImageTk.PhotoImage(img)
-                gallery_frame.image_tk_objects.append(img_tk)
-            
-            # Bind resize event to regenerate layout
-            def on_resize(event=None):
-                if not hasattr(gallery_frame, 'images') or not gallery_frame.images:
-                    return
-                
-                new_images_per_row = self._calculate_images_per_row(gallery_frame)
-                if new_images_per_row != gallery_frame.images_per_row:
-                    # Regenerate grid layout
-                    self._clear_gallery_frame(gallery_frame)
-                    for idx, img_tk in enumerate(gallery_frame.image_tk_objects):
-                        row_idx = idx // new_images_per_row
-                        col_idx = idx % new_images_per_row
-                        
-                        img_frame = ctk.CTkFrame(gallery_frame, width=130, height=130)
-                        img_frame.grid(row=row_idx, column=col_idx, padx=5, pady=5)
-                        
-                        img_label = ctk.CTkLabel(img_frame, image=img_tk, text="")
-                        img_label.image = img_tk  # Keep reference
-                        img_label.pack(padx=5, pady=5)
-                    
-                    gallery_frame.images_per_row = new_images_per_row
-            
-            # Bind resize event to popup window (only once)
-            popup_window = gallery_frame.winfo_toplevel()
-            if not hasattr(popup_window, '_gallery_resize_bound'):
-                popup_window.bind('<Configure>', on_resize)
-                popup_window._gallery_resize_bound = True
+
+            # All widget creation must happen on the main thread (Tkinter is not thread-safe).
+            def _build_gallery_ui(imgs=images, ipr=images_per_row, pi=page_instances):
+                try:
+                    if not gallery_frame.winfo_exists():
+                        return
+                    loading_label.pack_forget()
+                    if load_btn:
+                        load_btn.configure(text="Load", state="normal")
+
+                    popup_window = gallery_frame.winfo_toplevel()
+
+                    for idx, img in enumerate(imgs):
+                        row_idx = idx // ipr
+                        col_idx = idx % ipr
+
+                        df_idx = pi.iloc[idx].name
+
+                        img_container = ctk.CTkFrame(gallery_frame, width=130, height=130)
+                        img_container.grid(row=row_idx, column=col_idx, padx=5, pady=5)
+                        img_container.grid_propagate(False)
+
+                        img_tk = ImageTk.PhotoImage(img)
+                        img_label = ctk.CTkLabel(img_container, image=img_tk, text="")
+                        img_label.image = img_tk
+                        img_label.place(x=0, y=0, relwidth=1, relheight=1)
+
+                        checkbox_var = ctk.BooleanVar(value=df_idx in popup_window.selected_instances)
+                        checkbox = ctk.CTkCheckBox(
+                            img_container,
+                            text="",
+                            variable=checkbox_var,
+                            width=20,
+                            command=lambda idx=df_idx, var=checkbox_var: self._gallery_toggle_selection(popup_window, idx, var),
+                            checkbox_width=18,
+                            checkbox_height=18,
+                            fg_color="#3b8ed0",
+                            hover_color="#2a6fa5"
+                        )
+                        checkbox.place(x=5, y=5)
+
+                        def toggle_on_click(event, idx=df_idx, var=checkbox_var, cb=checkbox):
+                            var.set(not var.get())
+                            self._gallery_toggle_selection(popup_window, idx, var)
+
+                        img_label.bind("<Button-1>", toggle_on_click)
+                        row_data = pi.iloc[idx].to_dict()
+                        _video_base = self.data_participant_dir if self.data_participant_dir else self.participant_dir
+                        session_dir = _video_base / row_data.get("session_name", "")
+
+                        def on_double(event, rd=row_data, sd=session_dir, pw=popup_window):
+                            if sd.exists():
+                                _show_full_frame_toplevel(pw, sd, rd)
+
+                        img_label.bind("<Double-Button-1>", on_double)
+                        img_container.configure(cursor="hand2")
+                        img_label.configure(cursor="hand2")
+
+                    gallery_frame.images_per_row = ipr
+                    gallery_frame.images = imgs
+                    gallery_frame.image_tk_objects = []
+                    for img in imgs:
+                        img_tk = ImageTk.PhotoImage(img)
+                        gallery_frame.image_tk_objects.append(img_tk)
+
+                    def on_resize(event=None):
+                        if not hasattr(gallery_frame, 'images') or not gallery_frame.images:
+                            return
+                        new_images_per_row = self._calculate_images_per_row(gallery_frame)
+                        if new_images_per_row != gallery_frame.images_per_row:
+                            self._clear_gallery_frame(gallery_frame)
+                            for idx, img_tk in enumerate(gallery_frame.image_tk_objects):
+                                row_idx = idx // new_images_per_row
+                                col_idx = idx % new_images_per_row
+                                img_frame = ctk.CTkFrame(gallery_frame, width=130, height=130)
+                                img_frame.grid(row=row_idx, column=col_idx, padx=5, pady=5)
+                                img_label = ctk.CTkLabel(img_frame, image=img_tk, text="")
+                                img_label.image = img_tk
+                                img_label.pack(padx=5, pady=5)
+                            gallery_frame.images_per_row = new_images_per_row
+
+                    if not hasattr(popup_window, '_gallery_resize_bound'):
+                        popup_window.bind('<Configure>', on_resize)
+                        popup_window._gallery_resize_bound = True
+                except Exception as e:
+                    try:
+                        loading_label.configure(text=f"Error building gallery: {e}")
+                    except Exception:
+                        pass
+                    if load_btn:
+                        try:
+                            load_btn.configure(text="Load", state="normal")
+                        except Exception:
+                            pass
+
+            self.after(0, _build_gallery_ui)
         
         except Exception as e:
             self.after(0, lambda: loading_label.configure(text=f"Error loading images: {e}"))

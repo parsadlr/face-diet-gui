@@ -38,6 +38,7 @@ def _show_full_frame_toplevel(parent, session_dir: Path, face_info: dict):
         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         cv2.rectangle(frame_rgb, (x, y), (x + w, y + h), (0, 255, 0), 2)
         img = Image.fromarray(frame_rgb)
+        # Use the immediate toplevel ancestor as parent so this window sits above it
         root = parent.winfo_toplevel() if hasattr(parent, "winfo_toplevel") else parent
         tw = ctk.CTkToplevel(root)
         tw.title("Full frame")
@@ -52,6 +53,27 @@ def _show_full_frame_toplevel(parent, session_dir: Path, face_info: dict):
         lbl.image = img_tk
         lbl.pack(padx=5, pady=5)
         ctk.CTkLabel(tw, text="(Face region outlined in green. Close to return.)", font=ctk.CTkFont(size=13), text_color="gray").pack(pady=(0, 5))
+        # Bring on top and take the event grab from any parent popup
+        tw.lift()
+        tw.focus_force()
+        # Remember whether root had the grab before we take it (e.g. a modal gallery popup).
+        # Only restore it on close — don't grab the main window if it had none.
+        try:
+            root_had_grab = root.grab_status() != "none"
+        except Exception:
+            root_had_grab = False
+        def _on_close():
+            try:
+                tw.destroy()
+            except Exception:
+                pass
+            if root_had_grab:
+                try:
+                    root.grab_set()
+                except Exception:
+                    pass
+        tw.protocol("WM_DELETE_WINDOW", _on_close)
+        tw.grab_set()
     except Exception as e:
         messagebox.showerror("Error", f"Could not show full frame:\n{e}", parent=parent)
 
