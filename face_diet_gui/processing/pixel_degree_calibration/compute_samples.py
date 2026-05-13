@@ -1,23 +1,22 @@
 """
-Compute pixel-per-degree (PPD) samples from detected calibration ellipses.
+Compute pixel-per-degree (PPD) samples from calibration mask metadata.
 
-For each detected ellipse the known physical geometry (target diameter +
-viewing distance) gives the angular radius in degrees.  We then project the
-ellipse semi-axes onto the image x and y axes to get direction-specific PPD.
+The known physical geometry (target diameter + viewing distance) gives the
+angular radius in degrees.  For each detection:
 
-Semi-axis projection onto image axes
--------------------------------------
-OpenCV fitEllipse returns angle = rotation of the major axis from the x-axis
-(degrees, counterclockwise).  The image-aligned projections are:
+* **Preferred (GUI / new detections.json):** horizontal and vertical semi-extents
+  come from the mask axis-aligned bounding box — half of (right − left) and
+  half of (bottom − top) in pixels — and map to ``pixels_per_degree_x`` and
+  ``pixels_per_degree_y`` respectively.  Sample position uses the bbox centre.
+
+* **Legacy:** if ``mask_extent_x_px`` / ``mask_extent_y_px`` are absent, ellipse
+  semi-axes are projected onto image x and y:
 
     extent_x = sqrt((semi_major * cos a)² + (semi_minor * sin a)²)
     extent_y = sqrt((semi_major * sin a)² + (semi_minor * cos a)²)
 
-where a = radians(angle_deg).  These are the x- and y-half-widths of the
-tightest bounding rectangle around the ellipse.
-
 Three PPD values are stored per sample:
-    pixels_per_degree       – scalar, from area-equivalent radius
+    pixels_per_degree       – scalar, sqrt(extent_x * extent_y) / angular_radius
     pixels_per_degree_x     – horizontal direction
     pixels_per_degree_y     – vertical direction
 """
@@ -80,34 +79,64 @@ def compute_samples(
 
         cx = rec.get("center_x")
         cy = rec.get("center_y")
-        semi_major = rec.get("semi_major_px")
-        semi_minor = rec.get("semi_minor_px")
-        angle_deg = rec.get("angle_deg")
-        radius_eq = rec.get("radius_eq_px")
-
-        if any(v is None for v in (cx, cy, semi_major, semi_minor, angle_deg, radius_eq)):
+        if cx is None or cy is None:
             continue
 
         if image_width is None:
             image_width = rec.get("width")
             image_height = rec.get("height")
 
-        extent_x, extent_y = _ellipse_projected_extents(semi_major, semi_minor, angle_deg)
+        mask_ex = rec.get("mask_extent_x_px")
+        mask_ey = rec.get("mask_extent_y_px")
+        if mask_ex is not None and mask_ey is not None:
+            extent_x = float(mask_ex)
+            extent_y = float(mask_ey)
+            radius_eq = float(rec.get("radius_eq_px") or math.sqrt(extent_x * extent_y))
+            semi_major = float(rec.get("semi_major_px") or extent_x)
+            semi_minor = float(rec.get("semi_minor_px") or extent_y)
+            angle_deg = float(rec.get("angle_deg") or 0.0)
+        else:
+            semi_major = rec.get("semi_major_px")
+            semi_minor = rec.get("semi_minor_px")
+            angle_deg = rec.get("angle_deg")
+            radius_eq = rec.get("radius_eq_px")
+            if any(
+                v is None for v in (semi_major, semi_minor, angle_deg, radius_eq)
+            ):
+                continue
+            semi_major = float(semi_major)
+            semi_minor = float(semi_minor)
+            angle_deg = float(angle_deg)
+            radius_eq = float(radius_eq)
+            extent_x, extent_y = _ellipse_projected_extents(
+                semi_major, semi_minor, angle_deg
+            )
 
-        samples.append(
-            {
-                "image": rec.get("image"),
-                "center_x": float(cx),
-                "center_y": float(cy),
-                "semi_major_px": float(semi_major),
-                "semi_minor_px": float(semi_minor),
-                "angle_deg": float(angle_deg),
-                "radius_eq_px": float(radius_eq),
-                "pixels_per_degree": float(radius_eq / theta_deg),
-                "pixels_per_degree_x": float(extent_x / theta_deg),
-                "pixels_per_degree_y": float(extent_y / theta_deg),
-            }
-        )
+        entry = {
+            "image": rec.get("image"),
+            "center_x": float(cx),
+            "center_y": float(cy),
+            "semi_major_px": semi_major,
+            "semi_minor_px": semi_minor,
+            "angle_deg": angle_deg,
+            "radius_eq_px": radius_eq,
+            "pixels_per_degree": float(radius_eq / theta_deg),
+            "pixels_per_degree_x": float(extent_x / theta_deg),
+            "pixels_per_degree_y": float(extent_y / theta_deg),
+        }
+        for key in (
+            "mask_xmin_px",
+            "mask_xmax_px",
+            "mask_ymin_px",
+            "mask_ymax_px",
+            "mask_width_px",
+            "mask_height_px",
+            "mask_extent_x_px",
+            "mask_extent_y_px",
+        ):
+            if key in rec and rec[key] is not None:
+                entry[key] = rec[key]
+        samples.append(entry)
 
     if not samples:
         print("No valid detections to compute samples from.")
@@ -134,7 +163,7 @@ def compute_samples(
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Compute pixel-per-degree samples from detected calibration ellipses."
+        description="Compute pixel-per-degree samples from mask bbox or ellipse metadata."
     )
     p.add_argument("--masks-dir", required=True, help="Directory containing detections.json.")
     p.add_argument("--diameter-m", type=float, default=0.19, help="Target diameter in metres (default 0.19).")

@@ -23,7 +23,7 @@ CLI Workflow (alternative)
 2. (manual)                – copy ~20-30 frames covering the full FOV to a folder
 3. detect_target.py        – green-hue segmentation + ellipse fitting → masks +
                              detections.json
-4. compute_samples.py      – compute PPD samples from ellipse geometry
+4. compute_samples.py      – PPD samples from mask width/height (bbox) or legacy ellipse
 5. fit_mapping.py          – fit three 2D polynomial surfaces (scalar, x, y)
                              (also auto-saves heatmap PNGs)
 6. visualize_mapping.py    – re-save heatmap images of the fitted surfaces
@@ -34,4 +34,10 @@ Runtime API (mapping_utils.py)
     evaluate_ppd(mapping, x, y)            → scalar PPD
     evaluate_ppd_xy(mapping, x, y)         → (ppd_x, ppd_y)
     estimate_distance_from_face_size(...)  → distance in metres
+
+estimate_distance.py also writes ``rmse_*.png``, ``combined_rmse_*.png``,
+``mean_bias_*.png``, and ``combined_mean_bias_*.png`` into the same ``--output`` folder
+(disable with ``--no-error-plots``). To re-plot from CSV:
+
+    python -m face_diet_gui.processing.pixel_degree_calibration.visualize_estimate_errors --csv ...
 """

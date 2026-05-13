@@ -4,7 +4,7 @@ Tab 2 — Fit Mapping
 Layout:
   ┌─ Inputs ───────────────────────────────────────────────────────────────┐
   │  Masks dir:  [___________] Browse      Output dir: [___________] Browse │
-  │  Diameter(m): [0.19]  Distance(m): [1.0]  Poly order: [2]              │
+  │  Diameter(m): [0.19]  Distance(m): [1.0]  ☑ Symmetric (1+x²+y²)  Order [2] │
   └────────────────────────────────────────────────────────────────────────┘
   [  Compute Samples & Fit Mapping  ]
   ┌─ Results ──────────────────────────────────────────────────────────────┐
@@ -170,15 +170,27 @@ class FitTab(ctk.CTkFrame):
 
         self._diameter_var = tk.StringVar(value="0.19")
         self._distance_var = tk.StringVar(value="1.0")
-        self._order_var    = tk.StringVar(value="2")
+        self._order_var = tk.StringVar(value="2")
+        self._symmetric_var = tk.BooleanVar(value=True)
 
         for label, var, width in [
             ("Target diameter (m):", self._diameter_var, 70),
-            ("Distance (m):",        self._distance_var, 70),
-            ("Polynomial order:",    self._order_var,    50),
+            ("Distance (m):", self._distance_var, 70),
         ]:
             ctk.CTkLabel(row1, text=label).pack(side="left", padx=(0, 4))
             ctk.CTkEntry(row1, textvariable=var, width=width).pack(side="left", padx=(0, 16))
+
+        ctk.CTkCheckBox(
+            row1,
+            text="Symmetric PPD (1, x², y² only)",
+            variable=self._symmetric_var,
+            command=self._update_order_entry_state,
+        ).pack(side="left", padx=(0, 12))
+
+        ctk.CTkLabel(row1, text="Polynomial order:").pack(side="left", padx=(0, 4))
+        self._order_entry = ctk.CTkEntry(row1, textvariable=self._order_var, width=50)
+        self._order_entry.pack(side="left", padx=(0, 16))
+        self._update_order_entry_state()
 
         # ── Fit button ──
         self._fit_btn = ctk.CTkButton(
@@ -299,6 +311,13 @@ class FitTab(ctk.CTkFrame):
             self._output_var.set(d)
             self._output_dir = Path(d)
 
+    def _update_order_entry_state(self) -> None:
+        """Disable polynomial order when symmetric (1, x², y²) fit is selected."""
+        if self._symmetric_var.get():
+            self._order_entry.configure(state="disabled")
+        else:
+            self._order_entry.configure(state="normal")
+
     # ── fitting pipeline ──────────────────────────────────────────────────────
 
     def _run_fit(self) -> None:
@@ -315,10 +334,12 @@ class FitTab(ctk.CTkFrame):
         try:
             diameter = float(self._diameter_var.get())
             distance = float(self._distance_var.get())
-            order    = int(self._order_var.get())
+            order = int(self._order_var.get())
         except ValueError:
             self._log("ERROR: invalid numeric parameters.\n")
             return
+
+        symmetric = self._symmetric_var.get()
 
         masks_dir  = Path(masks_dir_str)
         output_dir = Path(output_dir_str)
@@ -353,6 +374,7 @@ class FitTab(ctk.CTkFrame):
                     samples_path=str(samples_path),
                     output_path=str(mapping_path),
                     order=order,
+                    symmetric_quadratic=symmetric,
                 )
                 self.after(0, self._on_fit_done, str(mapping_path))
             except Exception as exc:

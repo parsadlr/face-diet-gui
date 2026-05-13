@@ -11,6 +11,11 @@ and does not need its own fitted surface.
 
 Pixel coordinates are normalised to [-1, 1] using the image centre before
 fitting so the polynomial coefficients are numerically well-conditioned.
+
+When ``symmetric_quadratic`` is True, each surface uses only monomials
+``1``, ``x²``, ``y²`` in normalized coordinates (coefficients for ``x``,
+``y``, and ``xy`` are omitted). That is the least-squares optimum under that
+symmetric basis.
 """
 import argparse
 import json
@@ -18,6 +23,21 @@ from pathlib import Path
 from typing import Dict, List, Tuple
 
 import numpy as np
+
+# Normalized-coordinate exponents for symmetric quadratic PPD surfaces.
+SYMMETRIC_QUADRATIC_EXPONENTS: List[Tuple[int, int]] = [(0, 0), (2, 0), (0, 2)]
+
+
+def _design_matrix_symmetric_quadratic(
+    x_norm: np.ndarray, y_norm: np.ndarray
+) -> Tuple[np.ndarray, List[Tuple[int, int]]]:
+    """Design matrix columns: 1, x_norm², y_norm²."""
+    cols = [
+        np.ones_like(x_norm),
+        x_norm ** 2,
+        y_norm ** 2,
+    ]
+    return np.stack(cols, axis=1), list(SYMMETRIC_QUADRATIC_EXPONENTS)
 
 
 def _design_matrix(
@@ -50,9 +70,18 @@ def _fit_and_rmse(
     return coeffs, rmse
 
 
-def fit_mapping(samples_path: str, output_path: str, order: int = 2) -> None:
+def fit_mapping(
+    samples_path: str,
+    output_path: str,
+    order: int = 2,
+    *,
+    symmetric_quadratic: bool = False,
+) -> None:
     """
     Load PPD samples and fit two 2D polynomial surfaces (ppd_x, ppd_y).
+
+    If ``symmetric_quadratic`` is True, ``order`` is ignored and each surface
+    is fitted as ``c0 + c1*x_norm² + c2*y_norm²`` (least squares).
     """
     samples_file = Path(samples_path)
     if not samples_file.exists():
@@ -81,13 +110,22 @@ def fit_mapping(samples_path: str, output_path: str, order: int = 2) -> None:
     x_norm = (xs - cx) / cx
     y_norm = (ys - cy) / cy
 
-    X, exponents = _design_matrix(x_norm, y_norm, order=order)
+    if symmetric_quadratic:
+        X, exponents = _design_matrix_symmetric_quadratic(x_norm, y_norm)
+        poly_order_stored = 2
+        poly_basis = "symmetric_quadratic"
+        fit_desc = f"symmetric quadratic (1 + x² + y²), order ignored"
+    else:
+        X, exponents = _design_matrix(x_norm, y_norm, order=order)
+        poly_order_stored = int(order)
+        poly_basis = "full"
+        fit_desc = f"order={order}"
 
     coeffs_x, rmse_x = _fit_and_rmse(X, ppd_x)
     coeffs_y, rmse_y = _fit_and_rmse(X, ppd_y)
 
     print(
-        f"Fit (order={order}, n={len(samples)} samples):\n"
+        f"Fit ({fit_desc}, n={len(samples)} samples):\n"
         f"  x RMSE = {rmse_x:.4f} px/deg\n"
         f"  y RMSE = {rmse_y:.4f} px/deg"
     )
@@ -97,7 +135,8 @@ def fit_mapping(samples_path: str, output_path: str, order: int = 2) -> None:
         "image_height": int(height),
         "center_x": float(cx),
         "center_y": float(cy),
-        "poly_order": int(order),
+        "poly_order": poly_order_stored,
+        "poly_basis": poly_basis,
         "exponents": exponents,
         "coefficients_x": coeffs_x.tolist(),
         "coefficients_y": coeffs_y.tolist(),
@@ -134,13 +173,23 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--samples", required=True, help="PPD samples JSON (from compute_samples.py).")
     p.add_argument("--output", required=True, help="Output path for the mapping JSON.")
-    p.add_argument("--order", type=int, default=2, help="Polynomial order (default 2 = quadratic).")
+    p.add_argument("--order", type=int, default=2, help="Polynomial order (default 2 = quadratic). Ignored with --symmetric-quadratic.")
+    p.add_argument(
+        "--symmetric-quadratic",
+        action="store_true",
+        help="Fit each surface as c0 + c1*x² + c2*y² in normalized coords (no x, y, xy terms).",
+    )
     return p.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    fit_mapping(samples_path=args.samples, output_path=args.output, order=args.order)
+    fit_mapping(
+        samples_path=args.samples,
+        output_path=args.output,
+        order=args.order,
+        symmetric_quadratic=args.symmetric_quadratic,
+    )
 
 
 if __name__ == "__main__":

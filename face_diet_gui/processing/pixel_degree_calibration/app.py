@@ -7,6 +7,7 @@ Run with:
 Two tabs:
     Segment Targets  – click each calibration frame to segment the target
     Fit Mapping      – compute samples from masks and fit the PPD mapping
+                       (default: symmetric surfaces c₀ + c₁x² + c₂y² in normalized coords)
 """
 import customtkinter as ctk
 

@@ -81,31 +81,56 @@ def segment_at_click(
     return result
 
 
-def _ellipse_from_mask(mask: np.ndarray) -> Optional[dict]:
+def _detection_meta_from_mask(mask: np.ndarray) -> Optional[dict]:
     """
-    Fit an ellipse to the largest contour in mask and return a metadata dict
-    in the same schema as detect_target.py.
+    Build detections.json metadata from a binary mask.
+
+    ``center_x`` / ``center_y`` and PPD-related extents use the axis-aligned
+    bounding box of foreground pixels: horizontal span maps to ``mask_extent_x_px``
+    (half-width) and vertical span to ``mask_extent_y_px``. An ellipse is still
+    fitted when possible for auxiliary fields (``semi_major_px``, etc.).
     """
+    rows, cols = np.where(mask > 0)
+    if rows.size == 0:
+        return None
+
+    ymin, ymax = int(rows.min()), int(rows.max())
+    xmin, xmax = int(cols.min()), int(cols.max())
+    extent_x = (xmax - xmin) / 2.0
+    extent_y = (ymax - ymin) / 2.0
+    cx = (xmin + xmax) / 2.0
+    cy = (ymin + ymax) / 2.0
+    width_px = xmax - xmin + 1
+    height_px = ymax - ymin + 1
+    radius_eq = math.sqrt(extent_x * extent_y)
+
+    semi_major = extent_x
+    semi_minor = extent_y
+    angle_deg = 0.0
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
-        return None
-
-    cnt = max(contours, key=cv2.contourArea)
-    if len(cnt) < 5:
-        return None
-
-    (cx, cy), (ma, mi), angle = cv2.fitEllipse(cnt)
-    semi_major = ma / 2.0
-    semi_minor = mi / 2.0
-    radius_eq = math.sqrt(semi_major * semi_minor)
+    if contours:
+        cnt = max(contours, key=cv2.contourArea)
+        if len(cnt) >= 5:
+            (_ecx, _ecy), (ma, mi), angle = cv2.fitEllipse(cnt)
+            semi_major = ma / 2.0
+            semi_minor = mi / 2.0
+            angle_deg = float(angle)
 
     return {
         "found": True,
         "center_x": float(cx),
         "center_y": float(cy),
+        "mask_xmin_px": xmin,
+        "mask_xmax_px": xmax,
+        "mask_ymin_px": ymin,
+        "mask_ymax_px": ymax,
+        "mask_width_px": width_px,
+        "mask_height_px": height_px,
+        "mask_extent_x_px": float(extent_x),
+        "mask_extent_y_px": float(extent_y),
         "semi_major_px": float(semi_major),
         "semi_minor_px": float(semi_minor),
-        "angle_deg": float(angle),
+        "angle_deg": float(angle_deg),
         "radius_eq_px": float(radius_eq),
         "width": mask.shape[1],
         "height": mask.shape[0],
@@ -550,8 +575,8 @@ class SegmentTab(ctk.CTkFrame):
         mask_path = masks_dir / f"mask_{img_path.name}"
         cv2.imwrite(str(mask_path), mask)
 
-        # Compute ellipse metadata and update detections.json
-        meta = _ellipse_from_mask(mask)
+        # Compute mask bbox (+ optional ellipse) metadata and update detections.json
+        meta = _detection_meta_from_mask(mask)
         if meta:
             meta["image"] = img_path.name
             self._update_detections_json(masks_dir, img_path.name, meta)
