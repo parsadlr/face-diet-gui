@@ -68,6 +68,9 @@ class ManualReviewTab(ctk.CTkFrame):
         self.available_sessions: List[str] = []
         self.session_checkboxes: Dict[str, ctk.BooleanVar] = {}
 
+        # Participant dropdown display → raw name mapping (for status labels)
+        self._participant_display_to_raw: Dict[str, str] = {}
+
         # UI components
         self.row_widgets: Dict[str, Dict] = {}
         self.selected_ids: set = set()
@@ -122,6 +125,17 @@ class ManualReviewTab(ctk.CTkFrame):
             text_color="gray"
         )
         self.load_status_label.pack(side="left", padx=(5, 10), pady=8)
+
+        self.reviewed_var = ctk.BooleanVar(value=False)
+        self.reviewed_checkbox = ctk.CTkCheckBox(
+            self.sel_frame_tab4,
+            text="I have fully reviewed this participant",
+            variable=self.reviewed_var,
+            command=self._on_reviewed_checkbox_changed,
+            font=ctk.CTkFont(size=12),
+            state="disabled"
+        )
+        self.reviewed_checkbox.pack(side="left", padx=(15, 5), pady=0)
 
         self._populate_participants_tab4()
         
@@ -284,11 +298,99 @@ class ManualReviewTab(ctk.CTkFrame):
         self.save_btn.configure(fg_color=BTN_DISABLED_FG)  # initial disabled look
         self.save_btn.pack(side="left", padx=5)
     
+    def _get_registry(self) -> "ReviewerRegistry":
+        return ReviewerRegistry(self.derivatives_dir or self.project_dir)
+
+    def _get_face_id_review_status_path(self, participant: str) -> Path:
+        registry = self._get_registry()
+        return registry.get_face_id_review_status_path(self.reviewer_id, participant)
+
+    def _load_participant_review_status(self, participant: str) -> Dict:
+        """Load {reviewed: bool, last_save: str|None} for this participant's face ID review."""
+        path = self._get_face_id_review_status_path(participant)
+        if path.exists():
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                return {
+                    "reviewed": bool(data.get("reviewed", False)),
+                    "last_save": data.get("last_save"),
+                }
+            except Exception:
+                pass
+        # Fall back to merges.csv mtime if no status file
+        registry = self._get_registry()
+        merges_path = registry.get_merges_path(self.reviewer_id, participant)
+        last_save = None
+        if merges_path.exists():
+            try:
+                from datetime import datetime as _dt
+                mtime = merges_path.stat().st_mtime
+                last_save = _dt.fromtimestamp(mtime).isoformat()
+            except Exception:
+                pass
+        return {"reviewed": False, "last_save": last_save}
+
+    def _save_participant_review_status(self, participant: str, reviewed: bool,
+                                         last_save: Optional[str] = None):
+        """Persist participant-level face ID review status."""
+        path = self._get_face_id_review_status_path(participant)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        current = self._load_participant_review_status(participant)
+        if last_save is not None:
+            current["last_save"] = last_save
+        current["reviewed"] = reviewed
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(current, f, indent=2)
+
+    def _format_last_save(self, last_save_iso: Optional[str]) -> str:
+        """Format a last_save ISO string for display in the participant dropdown."""
+        if not last_save_iso:
+            return "not saved"
+        try:
+            from datetime import datetime as _dt
+            dt = _dt.fromisoformat(last_save_iso.replace("Z", "+00:00"))
+            return dt.strftime("%d %b %Y, %H:%M")
+        except Exception:
+            return last_save_iso[:16] if last_save_iso else "not saved"
+
+    def _on_reviewed_checkbox_changed(self):
+        """User toggled 'I have fully reviewed this participant'."""
+        if not self.selected_participant:
+            return
+        reviewed = self.reviewed_var.get()
+        self._save_participant_review_status(
+            self.selected_participant,
+            reviewed=reviewed,
+            last_save=None,
+        )
+        self._refresh_participant_dropdown()
+        label = self.selected_participant
+        if reviewed:
+            messagebox.showinfo("Participant reviewed",
+                                f"Marked as fully reviewed:\n{label}")
+        else:
+            messagebox.showinfo("Participant not reviewed",
+                                f"Marked as not fully reviewed:\n{label}")
+
+    def _refresh_participant_dropdown(self):
+        """Rebuild participant dropdown labels, keeping the current participant selected."""
+        if not self.selected_participant:
+            return
+        current_raw = self.selected_participant
+        self._populate_participants_tab4()
+        # Restore selection to updated label
+        for disp, raw in self._participant_display_to_raw.items():
+            if raw == current_raw:
+                self.participant_var_tab4.set(disp)
+                break
+
     def _populate_participants_tab4(self):
-        """Populate the participant dropdown from the derivatives directory."""
+        """Populate the participant dropdown, preserving any active selection."""
         scan_dir = self.derivatives_dir or self.project_dir
         if not scan_dir or not scan_dir.exists():
             self.participant_dropdown_tab4.configure(values=["— select —"])
+            self._participant_display_to_raw = {}
             return
 
         registry = ReviewerRegistry(scan_dir)
@@ -296,12 +398,31 @@ class ManualReviewTab(ctk.CTkFrame):
         for d in sorted(scan_dir.iterdir()):
             if not d.is_dir() or d.name.startswith(("_", ".")) or d.name == "annotations":
                 continue
-            # Tab 4 output is BIDS face-ids CSV in participant folder
             if registry.get_face_ids_path(d.name).exists():
                 participants.append(d.name)
 
-        values = ["— select —"] + participants
-        self.participant_dropdown_tab4.configure(values=values)
+        display_values = []
+        for p in participants:
+            status = self._load_participant_review_status(p)
+            last_save_str = self._format_last_save(status.get("last_save"))
+            label = f"{p} — last save: {last_save_str}"
+            if status.get("reviewed"):
+                label += " ✓ Reviewed"
+            display_values.append(label)
+
+        self._participant_display_to_raw = {
+            display_values[i]: participants[i] for i in range(len(participants))
+        }
+        self.participant_dropdown_tab4.configure(values=["— select —"] + display_values)
+
+        # Preserve current selection if the participant is still in the list
+        if self.selected_participant:
+            for disp, raw in self._participant_display_to_raw.items():
+                if raw == self.selected_participant:
+                    self.participant_var_tab4.set(disp)
+                    self.load_participant_btn.configure(state="normal")
+                    return
+        # No active selection — reset to placeholder
         if not participants:
             self.participant_var_tab4.set("— select —")
 
@@ -311,10 +432,13 @@ class ManualReviewTab(ctk.CTkFrame):
             self.selected_participant = None
             self.participant_dir = None
             self.load_participant_btn.configure(state="disabled")
+            self.reviewed_checkbox.configure(state="disabled")
+            self.reviewed_var.set(False)
             return
-        self.selected_participant = choice
-        self.participant_dir = (self.derivatives_dir or self.project_dir) / choice
-        self.data_participant_dir = (self.data_dir / choice) if self.data_dir else self.participant_dir
+        raw = self._participant_display_to_raw.get(choice, choice)
+        self.selected_participant = raw
+        self.participant_dir = (self.derivatives_dir or self.project_dir) / raw
+        self.data_participant_dir = (self.data_dir / raw) if self.data_dir else self.participant_dir
         self.load_participant_btn.configure(state="normal")
 
     def _load_participant_face_ids(self):
@@ -330,6 +454,9 @@ class ManualReviewTab(ctk.CTkFrame):
         self.derivatives_dir = Path(derivatives_dir) if derivatives_dir else None
         self.project_dir = self.derivatives_dir
         self.reviewer_id = reviewer_id
+        self.selected_participant = None
+        self.reviewed_checkbox.configure(state="disabled")
+        self.reviewed_var.set(False)
         self._populate_participants_tab4()
 
     def _select_all_sessions(self):
@@ -514,7 +641,9 @@ class ManualReviewTab(ctk.CTkFrame):
                     'max_y2': max_y2,
                 }
             
-            # Build face groups (all face IDs)
+            # Build face groups (all face IDs).
+            # Do NOT overwrite face_id_to_merged here — the loaded merge mappings
+            # were already applied above and must be preserved for _reconstruct_saved_merges.
             self.face_groups = {}
             for face_id in eligible_ids:
                 face_instances = df_for_build[df_for_build['face_id'] == face_id]
@@ -527,8 +656,7 @@ class ManualReviewTab(ctk.CTkFrame):
                     'thumbnail': thumbnail,
                     'original_ids': [face_id]
                 }
-                self.face_id_to_merged[face_id] = face_id
-            
+
             self.face_groups = dict(
                 sorted(self.face_groups.items(), key=lambda x: x[1]['count'], reverse=True)
             )
@@ -537,11 +665,16 @@ class ManualReviewTab(ctk.CTkFrame):
             # Restore previously saved merge state so Tab 5 reflects the reviewer's last save
             self._reconstruct_saved_merges()
 
+            # Load reviewed status for the checkbox
+            review_status = self._load_participant_review_status(participant)
+
             # Display results
             self.after(0, self._display_face_list)
             self.after(0, lambda: self.load_status_label.configure(text=""))
             self.after(0, lambda: self.save_btn.configure(state="normal", fg_color="#28a745"))
             self.after(0, lambda: self.load_participant_btn.configure(state="normal"))
+            self.after(0, lambda: self.reviewed_var.set(review_status.get("reviewed", False)))
+            self.after(0, lambda: self.reviewed_checkbox.configure(state="normal"))
             
         except Exception as e:
             import traceback
@@ -1775,6 +1908,16 @@ class ManualReviewTab(ctk.CTkFrame):
 
             ann_df = pd.DataFrame(annotation_records)
             ann_df.to_csv(annotation_file, index=False)
+
+            # Persist last_save timestamp (keep the user's current reviewed toggle)
+            self._save_participant_review_status(
+                self.selected_participant,
+                reviewed=self.reviewed_var.get(),
+                last_save=timestamp,
+            )
+
+            # Refresh participant dropdown to show updated last-save label
+            self._refresh_participant_dropdown()
 
             unique_original_ids = len(set(self.face_id_to_merged.keys()))
             unique_merged_ids = len(set(self.face_id_to_merged.values()))

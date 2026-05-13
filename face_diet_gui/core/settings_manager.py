@@ -138,6 +138,12 @@ class ReviewerRegistry:
         """
         return self.get_reviewer_dir(reviewer_id) / participant / "merges.csv"
 
+    def get_face_id_review_status_path(self, reviewer_id: str, participant: str) -> Path:
+        """
+        {derivatives_dir}/annotations/{reviewer_id}/{participant}/face-id-review-status.json
+        """
+        return self.get_reviewer_dir(reviewer_id) / participant / "face-id-review-status.json"
+
     def get_face_ids_path(self, participant: str) -> Path:
         """
         {derivatives_dir}/{participant}/{participant}_face-ids.csv
