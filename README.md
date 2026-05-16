@@ -188,9 +188,16 @@ Runs graph-based community detection for a selected participant. Loads all sessi
 
 ### Tab 5 — Face ID Review
 
-Manual review and correction of the clustering output. The reviewer can browse face IDs, view sample crops, and merge two IDs that the algorithm split incorrectly.
+Manual review and correction of the clustering output. The reviewer can browse face IDs, view sample crops, merge two IDs that the algorithm split incorrectly, create new IDs, or reassign individual instances to a different ID.
 
-**Output:** `{derivatives}/annotations/{reviewer_id}/{participant}/merges.csv` — merge decisions and media flags.
+**Outputs (per reviewer, under `annotations/{reviewer_id}/{participant}/`):**
+
+| File | Contents |
+|---|---|
+| `face-ids-corrected.csv` | Instance-level: `session_name`, `instance_index`, `face_id` (reviewer-corrected), `reviewed_at` |
+| `face-id-summary.csv` | ID-level: `face_id`, `n_instances`, `is_media`, `avg_age`, `gender`, `original_ids` |
+| `merges.csv` | Legacy group-level merge map (kept for backward compatibility) |
+| `face-id-review-status.json` | `{"reviewed": true/false}` — participant-level completion flag |
 
 ---
 
@@ -215,7 +222,10 @@ derivatives_dir/
 │   │       ├── ses-01/
 │   │       │   ├── sub-01_ses-01_is-face.csv
 │   │       │   └── sub-01_ses-01_review-status.json
-│   │       └── merges.csv              ← Tab 5
+│   │       ├── face-ids-corrected.csv  ← Tab 5 (instance-level)
+│   │       ├── face-id-summary.csv     ← Tab 5 (ID-level)
+│   │       ├── face-id-review-status.json ← Tab 5
+│   │       └── merges.csv              ← Tab 5 (legacy)
 │   └── consensus/                      ← Tab 3 (shared)
 │       └── sub-01/
 │           └── ses-01/
@@ -261,7 +271,10 @@ Paths are relative to **derivatives**. `{p}` = participant ID, `{s}` = session I
 | `{p}_{s}_mismatches-resolved.json` | `annotations/consensus/{p}/{s}/` | Tab 3 | Resolution flag (shared) |
 | `{p}_face-ids.csv` | `{p}/` | Tab 4 | Global face ID per detection (shared) |
 | `{p}_clustering-stats.txt` | `{p}/` | Tab 4 | Clustering statistics (shared) |
-| `merges.csv` | `annotations/{reviewer}/{p}/` | Tab 5 | ID merges and media flags |
+| `face-ids-corrected.csv` | `annotations/{reviewer}/{p}/` | Tab 5 | Reviewer-corrected face ID per instance |
+| `face-id-summary.csv` | `annotations/{reviewer}/{p}/` | Tab 5 | Per-ID summary: n_instances, is_media, avg_age, gender, original_ids |
+| `face-id-review-status.json` | `annotations/{reviewer}/{p}/` | Tab 5 | `{"reviewed": true/false}` — participant-level completion flag |
+| `merges.csv` | `annotations/{reviewer}/{p}/` | Tab 5 | Legacy group-level merge map (backward compatibility) |
 
 Face-detections CSV is the shared base for review tabs. Reviewer-specific files live under `annotations/{reviewer}/`. Stage scripts still accept legacy names (`face_detections.csv`, etc.) where noted in their CLI help.
 
@@ -311,6 +324,8 @@ face-diet/
 │   │   └── cluster_face_ids.py      ← graph-based face ID clustering
 │   ├── utils.py                     ← blur score, pose frontality, CSV helpers
 │   └── profiler.py                  ← optional performance profiling
+├── scripts/
+│   └── migrate_merges_to_corrected.py  ← one-shot migration: merges.csv → new Tab 5 format
 └── .cursor/
     └── plans/                       ← AI planning artifacts (not part of the app)
 ```
