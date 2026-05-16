@@ -500,28 +500,34 @@ class ManualReviewTab(ctk.CTkFrame):
         df_filtered = self.df.copy()
         face_counts = df_filtered['face_id'].value_counts()
         eligible_ids = face_counts[face_counts >= min_instances].index.tolist()
-        
+
         # Rebuild face_groups
         self.face_groups = {}
         for face_id in eligible_ids:
             face_instances = df_filtered[df_filtered['face_id'] == face_id]
             count = len(face_instances)
-            
+
             representative = self._find_representative_face(face_instances)
             thumbnail = self._extract_face_crop(representative) if representative else None
-            
-            # Check if this face_id is part of a merged group
-            original_ids = [face_id]
-            if face_id in self.face_groups_all:
+
+            # Derive original_ids from the original_face_id column when available;
+            # fall back to face_groups_all for the legacy load path.
+            if 'original_face_id' in face_instances.columns:
+                original_ids = sorted(
+                    face_instances['original_face_id'].astype(str).unique().tolist()
+                )
+            elif face_id in self.face_groups_all:
                 original_ids = self.face_groups_all[face_id].get('original_ids', [face_id])
-            
+            else:
+                original_ids = [face_id]
+
             self.face_groups[face_id] = {
                 'count': count,
                 'representative': representative,
                 'thumbnail': thumbnail,
-                'original_ids': original_ids
+                'original_ids': original_ids,
             }
-        
+
         # Sort by count
         self.face_groups = dict(
             sorted(self.face_groups.items(), key=lambda x: x[1]['count'], reverse=True)
@@ -560,17 +566,16 @@ class ManualReviewTab(ctk.CTkFrame):
             participant = self.selected_participant
             participant_path = self.participant_dir  # points to derivatives_dir/participant
 
-            # Load face_ids overlay from participant folder (Tab 4 output, one CSV per participant, shared)
+            # ── Step 1: load clustering face-ids ──────────────────────────────
             face_ids_path = registry.get_face_ids_path(participant)
             face_ids_df = pd.read_csv(face_ids_path)
 
-            # Load all per-session face-detections CSV (BIDS naming)
+            # ── Step 2: load per-session face-detections CSVs ─────────────────
             session_dfs = []
             for session_dir in sorted(participant_path.iterdir()):
                 if not session_dir.is_dir() or session_dir.name.startswith(("_", ".")):
                     continue
                 session_name = session_dir.name
-                # Try BIDS name first, fall back to legacy
                 bids_csv = session_dir / f"{participant}_{session_name}_face-detections.csv"
                 legacy_csv = session_dir / "face_detections.csv"
                 csv_path = bids_csv if bids_csv.exists() else (legacy_csv if legacy_csv.exists() else None)
@@ -591,26 +596,60 @@ class ManualReviewTab(ctk.CTkFrame):
 
             base_df = pd.concat(session_dfs, ignore_index=True)
 
-            # Merge face_ids onto base data
+            # ── Step 3: merge clustering face_ids; preserve original ───────────
             base_df = base_df.merge(
                 face_ids_df[['session_name', 'instance_index', 'face_id']],
                 on=['session_name', 'instance_index'],
                 how='inner'
             )
+            # original_face_id = the clustering-assigned ID, never overwritten.
+            # face_id          = the reviewer's final corrected ID (may differ after corrections).
+            base_df['original_face_id'] = base_df['face_id']
 
-            self.df_full = base_df
-            self.df = self.df_full.copy()
+            # ── Step 4: resolve reviewer annotations ──────────────────────────
+            corrected_path = registry.get_face_ids_corrected_path(self.reviewer_id, participant)
+            summary_path   = registry.get_face_id_summary_path(self.reviewer_id, participant)
+            merges_path    = registry.get_merges_path(self.reviewer_id, participant)
 
-            # Get available sessions
-            self.available_sessions = sorted(self.df['session_name'].unique())
-            
-            # Initialize merge tracking for ALL IDs
-            all_face_ids = self.df['face_id'].unique()
-            self.face_id_to_merged = {fid: fid for fid in all_face_ids}
             self.merged_id_to_media = set()
-            # Load saved merges and media if present
-            merges_path = registry.get_merges_path(self.reviewer_id, participant)
-            if merges_path.exists():
+            use_corrected_file = False
+
+            if corrected_path.exists():
+                # ── NEW PATH: instance-level corrected file ────────────────────
+                use_corrected_file = True
+                corr_df = pd.read_csv(corrected_path)
+                corr_df['instance_index'] = corr_df['instance_index'].astype(int)
+                # Build fast lookup: (session_name, instance_index) → corrected face_id
+                corr_map = {
+                    (r['session_name'], int(r['instance_index'])): str(r['face_id'])
+                    for _, r in corr_df.iterrows()
+                }
+                base_df['face_id'] = base_df.apply(
+                    lambda row: corr_map.get(
+                        (row['session_name'], int(row['instance_index'])),
+                        str(row['original_face_id'])
+                    ),
+                    axis=1
+                )
+                # face_id_to_merged: identity for all corrected IDs;
+                # updated in-session by Merge / Unmerge operations.
+                all_corrected_ids = base_df['face_id'].unique()
+                self.face_id_to_merged = {str(fid): str(fid) for fid in all_corrected_ids}
+
+                # Load media flags from summary
+                if summary_path.exists():
+                    try:
+                        summ_df = pd.read_csv(summary_path)
+                        for _, r in summ_df.iterrows():
+                            if r.get('is_media') in (True, 'True', 1, '1'):
+                                self.merged_id_to_media.add(str(r['face_id']))
+                    except Exception:
+                        pass
+
+            elif merges_path.exists():
+                # ── OLD PATH: group-level merges.csv (backward compat) ─────────
+                all_orig_ids = base_df['face_id'].unique()
+                self.face_id_to_merged = {str(fid): str(fid) for fid in all_orig_ids}
                 try:
                     merges_df = pd.read_csv(merges_path)
                     for _, r in merges_df.iterrows():
@@ -621,67 +660,87 @@ class ManualReviewTab(ctk.CTkFrame):
                                 self.merged_id_to_media.add(str(r['merged_face_id']))
                 except Exception:
                     pass
-            
-            # Create session filter UI
+            else:
+                all_orig_ids = base_df['face_id'].unique()
+                self.face_id_to_merged = {str(fid): str(fid) for fid in all_orig_ids}
+
+            # ── Step 5: finalise dataframes ───────────────────────────────────
+            self.df_full = base_df
+            self.df = self.df_full.copy()
+            self.available_sessions = sorted(self.df['session_name'].unique())
+
+            # ── Step 6: session filter UI ─────────────────────────────────────
             self.after(0, self._create_session_checkboxes)
-            
-            # Apply min_instances from Tab 4 settings
-            min_instances_load = int(self.settings.get("stage3.min_instances", 1))
-            df_for_build = self.df.copy()
-            face_counts = df_for_build['face_id'].value_counts()
-            eligible_ids = face_counts[face_counts >= min_instances_load].index.tolist()
-            
-            # Compute per-session bbox extents (use full df)
+
+            # ── Step 7: per-session bbox extents ──────────────────────────────
             self.session_bbox_stats = {}
-            for session_name, session_df in self.df.groupby('session_name'):
-                max_x2 = float((session_df['x'] + session_df['w']).max())
-                max_y2 = float((session_df['y'] + session_df['h']).max())
-                self.session_bbox_stats[session_name] = {
-                    'max_x2': max_x2,
-                    'max_y2': max_y2,
+            for sname, sdf in self.df.groupby('session_name'):
+                self.session_bbox_stats[sname] = {
+                    'max_x2': float((sdf['x'] + sdf['w']).max()),
+                    'max_y2': float((sdf['y'] + sdf['h']).max()),
                 }
-            
-            # Build face groups (all face IDs).
-            # Do NOT overwrite face_id_to_merged here — the loaded merge mappings
-            # were already applied above and must be preserved for _reconstruct_saved_merges.
+
+            # ── Step 8: build face_groups_all from ORIGINAL clustering IDs ────
+            # Used by Unmerge to restore groups to the clustering baseline.
+            min_inst = int(self.settings.get("stage3.min_instances", 1))
+            orig_counts = self.df['original_face_id'].value_counts()
+            orig_eligible = orig_counts[orig_counts >= min_inst].index.tolist()
+
+            self.face_groups_all = {}
+            for fid in orig_eligible:
+                inst = self.df[self.df['original_face_id'] == fid]
+                rep = self._find_representative_face(inst)
+                thumb = self._extract_face_crop(rep) if rep else None
+                self.face_groups_all[str(fid)] = {
+                    'count': len(inst),
+                    'representative': rep,
+                    'thumbnail': thumb,
+                    'original_ids': [str(fid)],
+                }
+
+            # ── Step 9: build face_groups from CORRECTED face_ids ─────────────
+            corr_counts = self.df['face_id'].value_counts()
+            corr_eligible = corr_counts[corr_counts >= min_inst].index.tolist()
+
             self.face_groups = {}
-            for face_id in eligible_ids:
-                face_instances = df_for_build[df_for_build['face_id'] == face_id]
-                count = len(face_instances)
-                representative = self._find_representative_face(face_instances)
-                thumbnail = self._extract_face_crop(representative) if representative else None
-                self.face_groups[face_id] = {
-                    'count': count,
-                    'representative': representative,
-                    'thumbnail': thumbnail,
-                    'original_ids': [face_id]
+            for fid in corr_eligible:
+                inst = self.df[self.df['face_id'] == fid]
+                rep = self._find_representative_face(inst)
+                thumb = self._extract_face_crop(rep) if rep else None
+                # original_ids: which clustering IDs contribute to this corrected group
+                original_ids = sorted(inst['original_face_id'].astype(str).unique().tolist())
+                self.face_groups[str(fid)] = {
+                    'count': len(inst),
+                    'representative': rep,
+                    'thumbnail': thumb,
+                    'original_ids': original_ids,
                 }
 
             self.face_groups = dict(
                 sorted(self.face_groups.items(), key=lambda x: x[1]['count'], reverse=True)
             )
-            self.face_groups_all = self.face_groups.copy()
 
-            # Restore previously saved merge state so Tab 5 reflects the reviewer's last save
-            self._reconstruct_saved_merges()
+            # For the old (merges.csv) path, rebuild merged groups from face_id_to_merged.
+            if not use_corrected_file and merges_path.exists():
+                self._reconstruct_saved_merges()
 
-            # Load reviewed status for the checkbox
+            # ── Step 10: restore reviewed checkbox state ───────────────────────
             review_status = self._load_participant_review_status(participant)
 
-            # Display results
+            # ── Display ───────────────────────────────────────────────────────
             self.after(0, self._display_face_list)
             self.after(0, lambda: self.load_status_label.configure(text=""))
             self.after(0, lambda: self.save_btn.configure(state="normal", fg_color="#28a745"))
             self.after(0, lambda: self.load_participant_btn.configure(state="normal"))
             self.after(0, lambda: self.reviewed_var.set(review_status.get("reviewed", False)))
             self.after(0, lambda: self.reviewed_checkbox.configure(state="normal"))
-            
+
         except Exception as e:
             import traceback
             error_details = traceback.format_exc()
             print(f"\n[ERROR] Error during data loading:")
             print(error_details)
-            
+
             self.after(0, lambda: self.load_status_label.configure(text=""))
             self.after(0, lambda: self.load_participant_btn.configure(state="normal"))
             self.after(0, lambda: messagebox.showerror(
@@ -1093,21 +1152,20 @@ class ManualReviewTab(ctk.CTkFrame):
         """Unmerge a merged group back into separate IDs."""
         if merged_id not in self.face_groups:
             return
-        
+
         merged_info = self.face_groups[merged_id]
         original_ids = merged_info.get('original_ids', [])
-        
+
         if len(original_ids) <= 1:
             return
-        
+
         # Capture media status before removing the merged group
         was_media = merged_id in self.merged_id_to_media
 
-        if merged_id in self.face_groups:
-            del self.face_groups[merged_id]
+        del self.face_groups[merged_id]
         self.merged_id_to_media.discard(merged_id)
 
-        # Restore individual groups and propagate the merged group's media status
+        # Restore individual groups and propagate media status
         for orig_id in original_ids:
             if orig_id in self.face_groups_all:
                 self.face_groups[orig_id] = self.face_groups_all[orig_id].copy()
@@ -1116,15 +1174,25 @@ class ManualReviewTab(ctk.CTkFrame):
                 self.merged_id_to_media.add(orig_id)
             else:
                 self.merged_id_to_media.discard(orig_id)
-        
+
+        # Update self.df so the save step sees the un-merged face_ids.
+        # We restore each instance to its original clustering face_id using the
+        # original_face_id column (set at load time and never overwritten).
+        if 'original_face_id' in self.df.columns:
+            for orig_id in original_ids:
+                mask = self.df['original_face_id'] == orig_id
+                self.df.loc[mask, 'face_id'] = orig_id
+                if self.df_full is not None:
+                    self.df_full.loc[self.df_full['original_face_id'] == orig_id, 'face_id'] = orig_id
+
         # Re-sort
         self.face_groups = dict(
             sorted(self.face_groups.items(), key=lambda x: x[1]['count'], reverse=True)
         )
-        
+
         # Refresh display
         self._display_face_list()
-        
+
         messagebox.showinfo(
             "Unmerged",
             f"Unmerged {merged_id} into {len(original_ids)} separate IDs"
@@ -1873,7 +1941,7 @@ class ManualReviewTab(ctk.CTkFrame):
         )
     
     def _save_results(self):
-        """Save merged results to reviewer overlay annotation file."""
+        """Save reviewer annotations: instance-level corrected IDs + ID-level summary."""
         if self.df_full is None:
             return
 
@@ -1881,7 +1949,7 @@ class ManualReviewTab(ctk.CTkFrame):
 
         response = messagebox.askyesno(
             "Confirm Save",
-            f"Save face ID merge annotations for reviewer '{self.reviewer_id}'?\n\n"
+            f"Save face ID annotations for reviewer '{self.reviewer_id}'?\n\n"
             f"The base data files will NOT be modified.\n"
             f"Continue?"
         )
@@ -1890,45 +1958,100 @@ class ManualReviewTab(ctk.CTkFrame):
 
         try:
             registry = ReviewerRegistry(self.derivatives_dir or self.project_dir)
-            annotation_file = registry.get_merges_path(
-                self.reviewer_id, self.selected_participant
-            )
-            annotation_file.parent.mkdir(parents=True, exist_ok=True)
-
+            participant = self.selected_participant
             timestamp = datetime.now().isoformat()
-            annotation_records = [
+
+            corrected_path = registry.get_face_ids_corrected_path(self.reviewer_id, participant)
+            summary_path   = registry.get_face_id_summary_path(self.reviewer_id, participant)
+            corrected_path.parent.mkdir(parents=True, exist_ok=True)
+
+            # ── 1. Compute the final (corrected) face_id for every instance ────
+            # face_id_to_merged captures group-level merges done via the Merge button;
+            # self.df['face_id'] captures instance-level changes from gallery ops.
+            # The composition of both gives the true final assignment.
+            def _resolve(fid: str) -> str:
+                return self.face_id_to_merged.get(str(fid), str(fid))
+
+            corrected_records = [
                 {
-                    'face_id': face_id,
-                    'merged_face_id': merged_id,
-                    'is_media': merged_id in self.merged_id_to_media,
-                    'reviewed_at': timestamp,
+                    'session_name':   row['session_name'],
+                    'instance_index': int(row['instance_index']),
+                    'face_id':        _resolve(row['face_id']),
+                    'reviewed_at':    timestamp,
                 }
-                for face_id, merged_id in self.face_id_to_merged.items()
+                for _, row in self.df.iterrows()
             ]
+            corr_df = pd.DataFrame(corrected_records)
+            corr_df.to_csv(corrected_path, index=False)
 
-            ann_df = pd.DataFrame(annotation_records)
-            ann_df.to_csv(annotation_file, index=False)
+            # ── 2. Build the ID-level summary ─────────────────────────────────
+            # Use the resolved face_id column for grouping.
+            self.df['_final_face_id'] = self.df['face_id'].apply(_resolve)
 
-            # Persist last_save timestamp (keep the user's current reviewed toggle)
+            summary_records = []
+            for fid, group_info in self.face_groups.items():
+                canonical_id = _resolve(str(fid))
+                # Instances belonging to this canonical group in the full dataframe
+                inst = self.df[self.df['_final_face_id'] == canonical_id]
+
+                avg_age, gender = None, None
+                if 'age' in inst.columns:
+                    ages = pd.to_numeric(inst['age'], errors='coerce').dropna()
+                    if len(ages) > 0:
+                        avg_age = round(float(ages.mean()), 1)
+                if 'gender' in inst.columns:
+                    genders = inst['gender'].dropna()
+                    if len(genders) > 0:
+                        gender = str(genders.mode().iloc[0])
+
+                original_ids = group_info.get('original_ids', [canonical_id])
+                summary_records.append({
+                    'face_id':      canonical_id,
+                    'n_instances':  int(group_info['count']),
+                    'is_media':     canonical_id in self.merged_id_to_media,
+                    'avg_age':      avg_age,
+                    'gender':       gender,
+                    'original_ids': ','.join(sorted(str(x) for x in original_ids)),
+                })
+
+            # Drop helper column
+            self.df.drop(columns=['_final_face_id'], inplace=True)
+
+            summ_df = pd.DataFrame(summary_records)
+            summ_df.to_csv(summary_path, index=False)
+
+            # ── 3. Backward-compat: keep merges.csv in sync ───────────────────
+            merges_path = registry.get_merges_path(self.reviewer_id, participant)
+            merges_records = [
+                {
+                    'face_id':        orig_id,
+                    'merged_face_id': merged_id,
+                    'is_media':       merged_id in self.merged_id_to_media,
+                    'reviewed_at':    timestamp,
+                }
+                for orig_id, merged_id in self.face_id_to_merged.items()
+            ]
+            pd.DataFrame(merges_records).to_csv(merges_path, index=False)
+
+            # ── 4. Persist review status ──────────────────────────────────────
             self._save_participant_review_status(
-                self.selected_participant,
+                participant,
                 reviewed=self.reviewed_var.get(),
                 last_save=timestamp,
             )
-
-            # Refresh participant dropdown to show updated last-save label
             self._refresh_participant_dropdown()
 
-            unique_original_ids = len(set(self.face_id_to_merged.keys()))
-            unique_merged_ids = len(set(self.face_id_to_merged.values()))
+            n_orig = len(set(r['face_id'] for r in corrected_records))
+            n_final = len(set(r['face_id'] for r in summary_records))
 
             messagebox.showinfo(
                 "Saved",
-                f"Merges and media flags saved.\n\n"
-                f"File: {annotation_file}\n"
-                f"Original unique IDs: {unique_original_ids}\n"
-                f"Merged unique IDs: {unique_merged_ids}\n"
-                f"Reduction: {unique_original_ids - unique_merged_ids} IDs"
+                f"Annotations saved.\n\n"
+                f"Instance file : {corrected_path.name}  ({len(corrected_records)} rows)\n"
+                f"Summary file  : {summary_path.name}  ({len(summary_records)} IDs)\n\n"
+                f"Original clustering IDs in use : {n_orig}\n"
+                f"Reviewer-corrected unique IDs  : {n_final}\n"
+                f"Reduction                      : {n_orig - n_final} IDs"
             )
 
         except Exception as e:

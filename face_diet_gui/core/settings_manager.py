@@ -144,6 +144,24 @@ class ReviewerRegistry:
         """
         return self.get_reviewer_dir(reviewer_id) / participant / "face-id-review-status.json"
 
+    def get_face_ids_corrected_path(self, reviewer_id: str, participant: str) -> Path:
+        """
+        Instance-level reviewer annotation for Tab 5:
+        {derivatives_dir}/annotations/{reviewer_id}/{participant}/face-ids-corrected.csv
+
+        Columns: session_name, instance_index, face_id, reviewed_at
+        """
+        return self.get_reviewer_dir(reviewer_id) / participant / "face-ids-corrected.csv"
+
+    def get_face_id_summary_path(self, reviewer_id: str, participant: str) -> Path:
+        """
+        ID-level summary for Tab 5:
+        {derivatives_dir}/annotations/{reviewer_id}/{participant}/face-id-summary.csv
+
+        Columns: face_id, n_instances, is_media, avg_age, gender, original_ids
+        """
+        return self.get_reviewer_dir(reviewer_id) / participant / "face-id-summary.csv"
+
     def get_face_ids_path(self, participant: str) -> Path:
         """
         {derivatives_dir}/{participant}/{participant}_face-ids.csv
