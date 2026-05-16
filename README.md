@@ -265,6 +265,12 @@ Paths are relative to **derivatives**. `{p}` = participant ID, `{s}` = session I
 
 Face-detections CSV is the shared base for review tabs. Reviewer-specific files live under `annotations/{reviewer}/`. Stage scripts still accept legacy names (`face_detections.csv`, etc.) where noted in their CLI help.
 
+### Linking derivative files back to detections
+
+All derivative files (`is-face.csv`, `consensus-is-face.csv`, `face-ids.csv`) reference detections via an **`instance_index`** column. This value is the **zero-based row position** in the corresponding session's `face-detections.csv` — row 0 is the first data row, not the header. The header line (column names) is not counted.
+
+To retrieve a detection from a derivative record, read the detections CSV with pandas and use `detections_df.loc[instance_index]`. For `face-ids.csv`, which spans all sessions for a participant, first filter by `session_name` before using `instance_index`.
+
 ---
 
 ## 👥 Multi-Reviewer Workflow
