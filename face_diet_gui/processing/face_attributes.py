@@ -340,31 +340,119 @@ def extract_age_gender_race_emotion_batch(
     return all_results
 
 
-def estimate_distance(bbox: Tuple[int, int, int, int], reference_height: float = 150.0) -> float:
+# ---------------------------------------------------------------------------
+# PPD-based distance estimation
+# ---------------------------------------------------------------------------
+
+# Hardcoded pixel-per-degree polynomial mapping (2nd-order, full basis).
+# Coefficients derived from the wide-angle lens calibration.
+_PPD_MAPPING: Dict = {
+    "center_x":        959.5,
+    "center_y":        539.5,
+    "exponents":       [[0,0],[0,1],[0,2],[1,0],[1,1],[2,0]],
+    "coefficients_x":  [
+        14.05476210542249,
+        -0.0876786050844629,
+        -0.27582551113140186,
+        -0.3989892392520565,
+         0.8074276506823053,
+        11.044886529750261,
+    ],
+    "coefficients_y":  [
+        15.210399867098543,
+         0.4202796457210294,
+         2.076840035068318,
+        -0.35104979073345033,
+         0.6885119864666166,
+         5.952656667352058,
+    ],
+}
+
+# Physical bounding-box dimensions (metres) that InsightFace captures.
+_FACE_WIDTH_M_FEMALE  = 0.1364
+_FACE_HEIGHT_M_FEMALE = 0.1758
+_FACE_WIDTH_M_MALE    = 0.1448
+_FACE_HEIGHT_M_MALE   = 0.1908
+
+
+def _ppd_at(x: float, y: float):
+    """Return (ppd_x, ppd_y) at pixel position (x, y) using the hardcoded mapping."""
+    cx, cy = _PPD_MAPPING["center_x"], _PPD_MAPPING["center_y"]
+    xn, yn = (x - cx) / cx, (y - cy) / cy
+    exps = _PPD_MAPPING["exponents"]
+    row = [(xn ** ei) * (yn ** ej) for ei, ej in exps]
+    ppd_x = sum(c * r for c, r in zip(_PPD_MAPPING["coefficients_x"], row))
+    ppd_y = sum(c * r for c, r in zip(_PPD_MAPPING["coefficients_y"], row))
+    return ppd_x, ppd_y
+
+
+def _integrate_deg(a: float, b: float, fixed: float, axis: str, n: int = 60):
+    """Trapezoidal integral of 1/ppd from a to b (returns degrees, or None)."""
+    samples = np.linspace(a, b, n)
+    inv_ppd = np.empty(n)
+    for i, s in enumerate(samples):
+        px, py = _ppd_at(s, fixed) if axis == "x" else _ppd_at(fixed, s)
+        pv = px if axis == "x" else py
+        if pv <= 0:
+            return None
+        inv_ppd[i] = 1.0 / pv
+    result = float(np.trapz(inv_ppd, samples))
+    return result if result > 0 else None
+
+
+def estimate_distance(bbox: Tuple[int, int, int, int], gender: Optional[str] = None) -> float:
     """
-    Estimate relative distance to face based on bounding box height.
-    
-    Uses simple inverse relationship: distance ∝ 1 / bbox_height
-    Normalized so that a face with height=reference_height has distance=1.0
-    
+    Estimate viewing distance to a face in metres using the PPD polynomial mapping.
+
+    Converts the bounding-box pixel span to angular size via numerical
+    integration of 1/ppd along each axis, applies the thin-lens formula to
+    get per-axis distances, then returns the corrected geometric mean:
+        sqrt(dist_w * dist_h) + 0.25 * ln(sqrt(dist_w * dist_h))
+
     Parameters
     ----------
     bbox : tuple
-        (x, y, w, h) bounding box of the face
-    reference_height : float
-        Reference face height in pixels (default 150px = distance 1.0)
-    
+        (x, y, w, h) bounding box in pixels.
+    gender : str or None
+        ``"M"`` / ``"Man"`` / ``"Male"`` selects male face dimensions;
+        anything else (including ``None``) uses female defaults.
+
     Returns
     -------
     float
-        Estimated relative distance
+        Estimated distance in metres, or ``float('inf')`` for degenerate inputs.
     """
-    _, _, _, h = bbox
-    if h <= 0:
-        return float('inf')
-    
-    distance = reference_height / h
-    return float(distance)
+    import math as _math
+
+    x, y, w, h = bbox
+    if w <= 0 or h <= 0:
+        return float("inf")
+
+    is_male = isinstance(gender, str) and gender.strip().upper() in {"M", "MAN", "MALE"}
+    fw = _FACE_WIDTH_M_MALE  if is_male else _FACE_WIDTH_M_FEMALE
+    fh = _FACE_HEIGHT_M_MALE if is_male else _FACE_HEIGHT_M_FEMALE
+
+    cx, cy = x + w / 2.0, y + h / 2.0
+    theta_w = _integrate_deg(x, x + w, cy, "x")
+    theta_h = _integrate_deg(y, y + h, cx, "y")
+
+    def _to_dist(deg, physical_m):
+        if deg is None or deg <= 0:
+            return None
+        return (physical_m / 2.0) / _math.tan(_math.radians(deg) / 2.0)
+
+    dist_w = _to_dist(theta_w, fw)
+    dist_h = _to_dist(theta_h, fh)
+
+    if dist_w is not None and dist_h is not None:
+        combined = _math.sqrt(dist_w * dist_h)
+    else:
+        combined = dist_w or dist_h
+
+    if combined is None or combined <= 0:
+        return float("inf")
+
+    return float(combined + 0.25 * _math.log(combined))
 
 
 def extract_all_attributes(
