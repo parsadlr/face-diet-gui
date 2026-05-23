@@ -565,25 +565,29 @@ class FaceInstanceReviewTab(ctk.CTkFrame):
                 ))
                 return
             
-            # Clear annotations so we don't carry over the previous session's flags (index-based)
+            # Clear annotations so we don't carry over the previous session's flags
             self.annotations.clear()
-            
+
             # Load CSV
             self.df = pd.read_csv(csv_path)
-            
+
+            # Pin instance_index to file row BEFORE any sort so it is never renumbered.
+            self.df['instance_index'] = np.arange(len(self.df))
+
             # Load existing annotations if they exist (for this session only)
             self._load_existing_annotations()
-            
-            # Canonical in-memory order is chronological (time/frame), matching default UI sort.
+
+            # Sort for display only — stable mergesort keeps tie order deterministic.
+            # instance_index column is unaffected; we never reset_index.
             if 'time_seconds' in self.df.columns:
-                self.df = self.df.sort_values('time_seconds', ascending=True).reset_index(drop=True)
+                self.df = self.df.sort_values('time_seconds', ascending=True, kind='mergesort')
             elif 'frame_number' in self.df.columns:
-                self.df = self.df.sort_values('frame_number', ascending=True).reset_index(drop=True)
-            
+                self.df = self.df.sort_values('frame_number', ascending=True, kind='mergesort')
+
             # Initialize annotations for all instances (default: is_face=True)
-            for idx in self.df.index:
-                if idx not in self.annotations:
-                    self.annotations[idx] = {'is_face': True, 'reviewed_at': None}
+            for ii in self.df['instance_index']:
+                if int(ii) not in self.annotations:
+                    self.annotations[int(ii)] = {'is_face': True, 'reviewed_at': None}
             
             # Update UI and enable session-dependent controls
             self.after(0, self._update_stats)
@@ -701,11 +705,11 @@ class FaceInstanceReviewTab(ctk.CTkFrame):
         else:
             df_filtered = self.df.copy()
 
-        # Display order toggle: confidence-based or by instance ID (which is already time order).
+        # Display order toggle: confidence-based or by file row (instance_index).
         if self.sort_by_conf_var.get() and 'confidence' in df_filtered.columns:
             df_filtered = df_filtered.sort_values('confidence', ascending=True)
         else:
-            df_filtered = df_filtered.sort_index()
+            df_filtered = df_filtered.sort_values('instance_index')
         
         # Calculate pagination
         total_items = len(df_filtered)
@@ -748,11 +752,12 @@ class FaceInstanceReviewTab(ctk.CTkFrame):
         try:
             # Load all images first
             images_data = []
-            for idx, row in page_df.iterrows():
+            for _, row in page_df.iterrows():
+                instance_idx = int(row['instance_index'])
                 crop = self._extract_face_crop(row.to_dict())
                 if crop:
-                    self.image_cache[idx] = crop
-                    images_data.append((idx, row, crop))
+                    self.image_cache[instance_idx] = crop
+                    images_data.append((instance_idx, row, crop))
             
             # Create gallery UI in main thread (will clear first)
             self.after(0, lambda: self._create_gallery_grid(images_data))
@@ -1122,10 +1127,11 @@ class FaceInstanceReviewTab(ctk.CTkFrame):
             annotation_file.parent.mkdir(parents=True, exist_ok=True)
 
             annotation_records = []
-            for idx in self.df.index:
-                ann = self.annotations.get(idx, {'is_face': True, 'reviewed_at': None})
-                row = {
-                    'instance_index': idx,
+            for _, df_row in self.df.iterrows():
+                ii = int(df_row['instance_index'])
+                ann = self.annotations.get(ii, {'is_face': True, 'reviewed_at': None})
+                rec = {
+                    'instance_index': ii,
                     'is_face': ann['is_face'],
                     'reviewed_at': ann['reviewed_at'] if ann['reviewed_at'] else '',
                 }
@@ -1133,11 +1139,13 @@ class FaceInstanceReviewTab(ctk.CTkFrame):
                 for col in ('frame_number', 'x', 'y', 'w', 'h'):
                     if col in self.df.columns:
                         try:
-                            row[col] = int(self.df.at[idx, col])
+                            rec[col] = int(df_row[col])
                         except (ValueError, KeyError):
-                            row[col] = None
-                annotation_records.append(row)
+                            rec[col] = None
+                annotation_records.append(rec)
 
+            # Write in file order (ascending instance_index)
+            annotation_records.sort(key=lambda r: r['instance_index'])
             ann_df = pd.DataFrame(annotation_records)
             ann_df.to_csv(annotation_file, index=False)
 

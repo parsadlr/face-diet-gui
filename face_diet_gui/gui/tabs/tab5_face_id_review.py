@@ -318,18 +318,7 @@ class ManualReviewTab(ctk.CTkFrame):
                 }
             except Exception:
                 pass
-        # Fall back to merges.csv mtime if no status file
-        registry = self._get_registry()
-        merges_path = registry.get_merges_path(self.reviewer_id, participant)
-        last_save = None
-        if merges_path.exists():
-            try:
-                from datetime import datetime as _dt
-                mtime = merges_path.stat().st_mtime
-                last_save = _dt.fromtimestamp(mtime).isoformat()
-            except Exception:
-                pass
-        return {"reviewed": False, "last_save": last_save}
+        return {"reviewed": False, "last_save": None}
 
     def _save_participant_review_status(self, participant: str, reviewed: bool,
                                          last_save: Optional[str] = None):
@@ -609,14 +598,10 @@ class ManualReviewTab(ctk.CTkFrame):
             # ── Step 4: resolve reviewer annotations ──────────────────────────
             corrected_path = registry.get_face_ids_corrected_path(self.reviewer_id, participant)
             summary_path   = registry.get_face_id_summary_path(self.reviewer_id, participant)
-            merges_path    = registry.get_merges_path(self.reviewer_id, participant)
 
             self.merged_id_to_media = set()
-            use_corrected_file = False
 
             if corrected_path.exists():
-                # ── NEW PATH: instance-level corrected file ────────────────────
-                use_corrected_file = True
                 corr_df = pd.read_csv(corrected_path)
                 corr_df['instance_index'] = corr_df['instance_index'].astype(int)
                 # Build fast lookup: (session_name, instance_index) → corrected face_id
@@ -645,21 +630,6 @@ class ManualReviewTab(ctk.CTkFrame):
                                 self.merged_id_to_media.add(str(r['face_id']))
                     except Exception:
                         pass
-
-            elif merges_path.exists():
-                # ── OLD PATH: group-level merges.csv (backward compat) ─────────
-                all_orig_ids = base_df['face_id'].unique()
-                self.face_id_to_merged = {str(fid): str(fid) for fid in all_orig_ids}
-                try:
-                    merges_df = pd.read_csv(merges_path)
-                    for _, r in merges_df.iterrows():
-                        self.face_id_to_merged[str(r['face_id'])] = str(r['merged_face_id'])
-                    if 'is_media' in merges_df.columns:
-                        for _, r in merges_df.iterrows():
-                            if r.get('is_media') in (True, 'True', 1, '1'):
-                                self.merged_id_to_media.add(str(r['merged_face_id']))
-                except Exception:
-                    pass
             else:
                 all_orig_ids = base_df['face_id'].unique()
                 self.face_id_to_merged = {str(fid): str(fid) for fid in all_orig_ids}
@@ -719,10 +689,6 @@ class ManualReviewTab(ctk.CTkFrame):
             self.face_groups = dict(
                 sorted(self.face_groups.items(), key=lambda x: x[1]['count'], reverse=True)
             )
-
-            # For the old (merges.csv) path, rebuild merged groups from face_id_to_merged.
-            if not use_corrected_file and merges_path.exists():
-                self._reconstruct_saved_merges()
 
             # ── Step 10: restore reviewed checkbox state ───────────────────────
             review_status = self._load_participant_review_status(participant)
@@ -1377,6 +1343,47 @@ class ManualReviewTab(ctk.CTkFrame):
         self._update_gallery_page_numbers(popup, page_numbers_frame, gallery_frame, loading_label, load_btn)
         self._gallery_load_page(popup, gallery_frame, loading_label, batch_size_entry, load_btn, page_numbers_frame)
     
+    def _bind_hover_tooltip(self, widget, text: str) -> None:
+        """Show a small tooltip when the mouse enters *widget*."""
+        tooltip_win = [None]
+
+        def show(_event=None):
+            if tooltip_win[0] is not None:
+                return
+            tw = tkinter.Toplevel(widget)
+            tw.wm_overrideredirect(True)
+            tw.wm_attributes("-topmost", True)
+            x = widget.winfo_rootx() + 10
+            y = widget.winfo_rooty() + widget.winfo_height() + 4
+            tw.wm_geometry(f"+{x}+{y}")
+            lbl = tkinter.Label(
+                tw,
+                text=text,
+                background="#2b2b2b",
+                foreground="white",
+                relief="solid",
+                borderwidth=1,
+                font=("Segoe UI", 10),
+                padx=6,
+                pady=3,
+            )
+            lbl.pack()
+            tooltip_win[0] = tw
+
+        def hide(_event=None):
+            if tooltip_win[0] is not None:
+                tooltip_win[0].destroy()
+                tooltip_win[0] = None
+
+        widget.bind("<Enter>", show)
+        widget.bind("<Leave>", hide)
+
+    def _gallery_instance_tooltip_text(self, row_data: dict) -> str:
+        """Tooltip text for a gallery face instance."""
+        session = row_data.get("session_name", "?")
+        idx = row_data.get("instance_index", "?")
+        return f"{session}  ·  #{idx}"
+
     def _calculate_images_per_row(self, gallery_frame):
         """Calculate number of images per row based on gallery frame width."""
         try:
@@ -1475,6 +1482,9 @@ class ManualReviewTab(ctk.CTkFrame):
                         row_data = pi.iloc[idx].to_dict()
                         _video_base = self.data_participant_dir if self.data_participant_dir else self.participant_dir
                         session_dir = _video_base / row_data.get("session_name", "")
+                        tooltip_text = self._gallery_instance_tooltip_text(row_data)
+                        self._bind_hover_tooltip(img_label, tooltip_text)
+                        self._bind_hover_tooltip(img_container, tooltip_text)
 
                         def on_double(event, rd=row_data, sd=session_dir, pw=popup_window):
                             if sd.exists():
@@ -1486,6 +1496,7 @@ class ManualReviewTab(ctk.CTkFrame):
 
                     gallery_frame.images_per_row = ipr
                     gallery_frame.images = imgs
+                    gallery_frame.page_instances = pi
                     gallery_frame.image_tk_objects = []
                     for img in imgs:
                         img_tk = ImageTk.PhotoImage(img)
@@ -1496,6 +1507,7 @@ class ManualReviewTab(ctk.CTkFrame):
                             return
                         new_images_per_row = self._calculate_images_per_row(gallery_frame)
                         if new_images_per_row != gallery_frame.images_per_row:
+                            pi_resize = getattr(gallery_frame, "page_instances", None)
                             self._clear_gallery_frame(gallery_frame)
                             for idx, img_tk in enumerate(gallery_frame.image_tk_objects):
                                 row_idx = idx // new_images_per_row
@@ -1505,6 +1517,12 @@ class ManualReviewTab(ctk.CTkFrame):
                                 img_label = ctk.CTkLabel(img_frame, image=img_tk, text="")
                                 img_label.image = img_tk
                                 img_label.pack(padx=5, pady=5)
+                                if pi_resize is not None and idx < len(pi_resize):
+                                    tip = self._gallery_instance_tooltip_text(
+                                        pi_resize.iloc[idx].to_dict()
+                                    )
+                                    self._bind_hover_tooltip(img_label, tip)
+                                    self._bind_hover_tooltip(img_frame, tip)
                             gallery_frame.images_per_row = new_images_per_row
 
                     if not hasattr(popup_window, '_gallery_resize_bound'):
@@ -2020,20 +2038,7 @@ class ManualReviewTab(ctk.CTkFrame):
             summ_df = pd.DataFrame(summary_records)
             summ_df.to_csv(summary_path, index=False)
 
-            # ── 3. Backward-compat: keep merges.csv in sync ───────────────────
-            merges_path = registry.get_merges_path(self.reviewer_id, participant)
-            merges_records = [
-                {
-                    'face_id':        orig_id,
-                    'merged_face_id': merged_id,
-                    'is_media':       merged_id in self.merged_id_to_media,
-                    'reviewed_at':    timestamp,
-                }
-                for orig_id, merged_id in self.face_id_to_merged.items()
-            ]
-            pd.DataFrame(merges_records).to_csv(merges_path, index=False)
-
-            # ── 4. Persist review status ──────────────────────────────────────
+            # ── 3. Persist review status ──────────────────────────────────────
             self._save_participant_review_status(
                 participant,
                 reviewed=self.reviewed_var.get(),

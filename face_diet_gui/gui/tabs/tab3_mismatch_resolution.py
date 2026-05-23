@@ -280,13 +280,13 @@ class MismatchResolutionTab(ctk.CTkFrame):
                 self.after(0, lambda: self.mismatch_stats_label.configure(text="Face detections CSV not found."))
                 return
             df = pd.read_csv(csv_path)
-            # Match Tab 2: instance_index is assigned after sorting chronologically by time/frame.
+            # Pin instance_index to file row BEFORE any sort so it is never renumbered.
+            df['instance_index'] = np.arange(len(df))
+            # Sort for display only — stable mergesort; no reset_index.
             if "time_seconds" in df.columns:
-                df = df.sort_values("time_seconds", ascending=True).reset_index(drop=True)
+                df = df.sort_values("time_seconds", ascending=True, kind="mergesort")
             elif "frame_number" in df.columns:
-                df = df.sort_values("frame_number", ascending=True).reset_index(drop=True)
-            else:
-                df = df.reset_index(drop=True)
+                df = df.sort_values("frame_number", ascending=True, kind="mergesort")
             reviewer_ids_all = self.registry.get_reviewer_ids()
             with_tab2 = [r for r in reviewer_ids_all if self.registry.get_is_face_annotation_path(r, self.selected_participant, self.selected_session).exists()]
             reviewers_with_tab2 = [r for r in with_tab2 if _load_review_status_for_session(self.registry, r, self.selected_participant, self.selected_session).get("reviewed", False)]
@@ -308,31 +308,31 @@ class MismatchResolutionTab(ctk.CTkFrame):
                     consensus = dict(zip(cons_df["instance_index"].astype(int), cons_df["is_face"].astype(bool)))
                     post_consensus = [r for r in reviewers_with_tab2
                                       if self.registry.get_is_face_annotation_path(r, self.selected_participant, self.selected_session).stat().st_mtime > consensus_mtime]
-                    for idx in df.index:
-                        idx_int = int(idx)
-                        cons_val = consensus.get(idx_int, True)
+                    for ii in df['instance_index']:
+                        ii = int(ii)
+                        cons_val = consensus.get(ii, True)
                         for r in post_consensus:
-                            if per_reviewer[r].get(idx_int, True) != cons_val:
-                                mismatch_indices.append(idx_int)
-                                reviewer_labels[idx_int] = {r: per_reviewer[r].get(idx_int, True) for r in reviewers_with_tab2}
+                            if per_reviewer[r].get(ii, True) != cons_val:
+                                mismatch_indices.append(ii)
+                                reviewer_labels[ii] = {r: per_reviewer[r].get(ii, True) for r in reviewers_with_tab2}
                                 break
                 except Exception:
                     pass  # consensus unreadable – show no mismatches (treat as resolved)
             else:
                 # No consensus: pairwise disagreement across all reviewers
-                for idx in df.index:
-                    idx_int = int(idx)
-                    vals = [per_reviewer[r].get(idx_int, True) for r in reviewers_with_tab2]
+                for ii in df['instance_index']:
+                    ii = int(ii)
+                    vals = [per_reviewer[r].get(ii, True) for r in reviewers_with_tab2]
                     if len(set(vals)) > 1:
-                        mismatch_indices.append(idx_int)
-                        reviewer_labels[idx_int] = {r: per_reviewer[r].get(idx_int, True) for r in reviewers_with_tab2}
+                        mismatch_indices.append(ii)
+                        reviewer_labels[ii] = {r: per_reviewer[r].get(ii, True) for r in reviewers_with_tab2}
             # Build agreed_labels: for all non-mismatch instances, record the unanimous reviewer label.
             mismatch_set = set(mismatch_indices)
             first_reviewer_map = next(iter(per_reviewer.values())) if per_reviewer else {}
             agreed_labels = {
-                int(idx): first_reviewer_map.get(int(idx), True)
-                for idx in df.index
-                if int(idx) not in mismatch_set
+                int(ii): first_reviewer_map.get(int(ii), True)
+                for ii in df['instance_index']
+                if int(ii) not in mismatch_set
             }
             self.df = df
             self.mismatch_indices = mismatch_indices
@@ -601,20 +601,23 @@ class MismatchResolutionTab(ctk.CTkFrame):
             consensus_path.parent.mkdir(parents=True, exist_ok=True)
             mismatch_set = set(self.mismatch_indices)
             records = []
-            for idx in self.df.index:
-                if idx in mismatch_set:
-                    is_face = self.annotations.get(idx, True)
+            for _, df_row in self.df.iterrows():
+                ii = int(df_row['instance_index'])
+                if ii in mismatch_set:
+                    is_face = self.annotations.get(ii, True)
                 else:
-                    is_face = self.agreed_labels.get(idx, True)
-                row = {"instance_index": idx, "is_face": is_face}
+                    is_face = self.agreed_labels.get(ii, True)
+                rec = {"instance_index": ii, "is_face": is_face}
                 # Enrich with bbox and frame_number for stable identification
                 for col in ('frame_number', 'x', 'y', 'w', 'h'):
                     if col in self.df.columns:
                         try:
-                            row[col] = int(self.df.at[idx, col])
+                            rec[col] = int(df_row[col])
                         except (ValueError, KeyError):
-                            row[col] = None
-                records.append(row)
+                            rec[col] = None
+                records.append(rec)
+            # Write in file order (ascending instance_index)
+            records.sort(key=lambda r: r['instance_index'])
             df_out = pd.DataFrame(records)
             with open(consensus_path, "w", newline="", encoding="utf-8") as f:
                 df_out.to_csv(f, index=False)
