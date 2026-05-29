@@ -13,8 +13,23 @@ Output: Same CSV updated in-place with attribute columns
 Can be run in parallel for multiple sessions!
 """
 
-import argparse
+import os
 import sys
+
+# Force UTF-8 stdio so third-party loggers (e.g. DeepFace download emoji) work on Windows cp1252 consoles.
+if sys.platform == "win32":
+    os.environ.setdefault("PYTHONUTF8", "1")
+    os.environ.setdefault("PYTHONIOENCODING", "utf-8:replace")
+
+for _stream in (sys.stdout, sys.stderr):
+    _reconfigure = getattr(_stream, "reconfigure", None)
+    if _reconfigure is not None:
+        try:
+            _reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError, OSError):
+            pass
+
+import argparse
 from pathlib import Path
 
 from face_diet_gui.processing.video_processor import process_video_stage2
